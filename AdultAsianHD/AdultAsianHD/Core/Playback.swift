@@ -2,7 +2,36 @@ import Foundation
 
 /// 播放快路径：番号 → memojav 静态播单直拼，不抓帖页、不验播单。
 /// 点封面的一瞬间就能拼出播单 URL，直接交给 AVPlayer。
+/// 线路竞速决出的首选线（按模块 id 存内存，进模块时重算）。
+/// memojav：静态 m3u8，可直拼快路径；nmcorp：签名 MP4，必须走 loadResource 现解。
+/// nil（没竞速 / 没分出胜负 / 两条都死 / 无固定验线）= 按现有逻辑（快路径 + 备线）。
+enum PreferredLine: Equatable {
+    case memojav
+    case nmcorp
+}
+
 enum PlaybackEngine {
+
+    /// 按 URL / 名字判断一条播放线路属于哪种线。
+    /// memojav：host 含 memojav 或名字含 MemoJav；
+    /// nmcorp：host 含 nmcorp / pvvstream、名字含 NMCorp，或签名 MP4（secure=）。
+    /// 认不出的返回 nil（竞速里不算它，播放时按现有逻辑）。
+    static func preferredLineKind(of line: PlayLine) -> PreferredLine? {
+        guard let url = URL(string: line.url) else { return nil }
+        let host = (url.host ?? "").lowercased()
+        let name = line.name.lowercased()
+        let urlString = line.url.lowercased()
+        if host.contains("memojav") || name.contains("memojav") {
+            return .memojav
+        }
+        if host.contains("nmcorp") || host.contains("pvvstream") || name.contains("nmcorp") {
+            return .nmcorp
+        }
+        if urlString.contains("secure=") && url.pathExtension.lowercased() == "mp4" {
+            return .nmcorp
+        }
+        return nil
+    }
 
     private static let codeRegex: NSRegularExpression? = {
         try? NSRegularExpression(pattern: "\\b([A-Za-z]{2,6}-\\d{2,5})\\b")
@@ -99,7 +128,13 @@ final class PlayerViewModel: ObservableObject {
     }
 
     /// 点封面即播：快路径立刻设 currentURL，后台拿备线。
+    /// 首选线（进模块时竞速定，本次有效）：
+    /// - 首选 nmcorp：先解线，挑 nmcorp 线先播（memojav 在竞速里输了，不先拼它）；
+    ///   没 nmcorp 线才退回快路径，已解出的线留作备线，不再跑一次 loadResource。
+    /// - 首选 memojav / 无胜负 / 没竞速：现有逻辑（快路径先上，后台拿备线）。
     func play(item: VideoItem, host: WidgetHost) async {
+        // 开始播放：后台自动自检立刻停（让路），下次断点续跑。
+        SourceStore.shared.cancelAutoCheck()
         let generation = UUID()
         playGeneration = generation
         failedURLs = []
@@ -108,6 +143,28 @@ final class PlayerViewModel: ObservableObject {
         currentHeaders = nil
         currentItemLink = item.link
         status = .loading
+
+        if host.preferredLine == .nmcorp {
+            let resolved = (try? await host.loadResource(link: item.link, title: item.title)) ?? []
+            guard playGeneration == generation else { return } // 已播别的片，丢弃
+            lines = resolved
+            if let nmcorpLine = resolved.first(where: { PlaybackEngine.preferredLineKind(of: $0) == .nmcorp }) {
+                setCurrent(nmcorpLine)
+                return
+            }
+            // 没 nmcorp 线：退回快路径（memojav 直拼），已解出的线留作备线
+            if let fastURL = PlaybackEngine.fastPathURL(for: item) {
+                let fastLine = PlayLine(name: "快速线", url: fastURL.absoluteString, description: "番号直拼，秒播")
+                if !lines.contains(where: { $0.url == fastLine.url }) {
+                    lines.insert(fastLine, at: 0)
+                }
+                if setCurrent(fastLine) { return }
+            }
+            if let first = resolved.first, setCurrent(first) { return }
+            status = .failed("没有可用的播放线路")
+            failureReason = "这个视频没有可用的播放线路"
+            return
+        }
 
         // 快路径：标题抠番号，直拼播单，立刻交给播放器
         if let fastURL = PlaybackEngine.fastPathURL(for: item) {

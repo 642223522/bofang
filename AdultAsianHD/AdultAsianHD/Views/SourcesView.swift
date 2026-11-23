@@ -41,6 +41,10 @@ struct SourcesView: View {
     @State private var showSyncSheet = false
     @State private var giteeToken = ""
 
+    /// “仅 Wi-Fi 时自动自检”开关（默认关）。只影响后台自动自检；
+    /// 手动自检和下载不受影响（下载仍可走流量）。
+    @AppStorage(SourceStore.wifiOnlyAutoCheckDefaultsKey) private var wifiOnlyAutoCheck = false
+
     /// 当前源 id（同步后首个源自动设为当前）。
     @AppStorage("currentSourceId") private var currentSourceId = ""
 
@@ -55,6 +59,10 @@ struct SourcesView: View {
                     .padding(.bottom, 8)
 
                 checkRow
+                    .padding(.horizontal)
+                    .padding(.bottom, 8)
+
+                wifiToggleRow
                     .padding(.horizontal)
                     .padding(.bottom, 8)
 
@@ -167,13 +175,30 @@ struct SourcesView: View {
         }
     }
 
+    /// “仅 Wi-Fi 时自动自检”开关行（默认关，只影响后台自动自检）。
+    private var wifiToggleRow: some View {
+        Toggle(isOn: $wifiOnlyAutoCheck) {
+            HStack(spacing: 6) {
+                Image(systemName: "wifi")
+                Text("仅 Wi-Fi 时自动自检")
+                Text("（后台自检，12 小时一轮）")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            .font(.footnote)
+        }
+        .toggleStyle(.switch)
+    }
+
     private func checkAll() {
         isReading = true
         readingLabel = "正在自检全部源…"
         Task {
-            let (ok, failed) = await store.runCheckAll()
+            let (ok, failed, skipped) = await store.runCheckAll()
             isReading = false
-            showResultAlert("自检完成：\(ok) 个正常，\(failed) 个失败")
+            var text = "自检完成：\(ok) 个正常，\(failed) 个失败"
+            if skipped > 0 { text += "，\(skipped) 个重复跳过" }
+            showResultAlert(text)
         }
     }
 
@@ -193,27 +218,52 @@ struct SourcesView: View {
         }
     }
 
-    /// 列表行里的自检状态：正常（绿）/ 失败（红，带第一条原因）/ 未自检（灰）。
+    /// 列表行里的自检状态：正常（绿）/ 失败（红，死在哪步）/ 跳过（灰，重复）/ 未自检（灰）。
+    /// 深探针坏了在下面另起一行标出来。
     @ViewBuilder
     private func checkStatusLine(for source: SourceRecord) -> some View {
         if let result = store.checkResults[source.id] {
             switch result.status {
             case .ok:
-                Text("自检正常" + (result.checkedAt.map { " · \($0.formatted(date: .numeric, time: .short))" } ?? ""))
-                    .font(.caption)
-                    .foregroundColor(.green)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("自检正常" + (result.checkedAt.map { " · \($0.formatted(date: .numeric, time: .short))" } ?? ""))
+                        .font(.caption)
+                        .foregroundColor(.green)
+                    if let probe = result.deepProbe, !probe.passed {
+                        Text("深探针：坏了（\(probe.failedStep ?? "首片")）· \(probe.checkedAt.formatted(date: .numeric, time: .short))")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    }
+                }
             case .failed:
-                let first = result.failedLines.sorted(by: { $0.key < $1.key }).first
-                Text("自检失败：" + (first.map { "\($0.key)：\($0.value)" } ?? ""))
+                VStack(alignment: .leading, spacing: 2) {
+                    let step = result.failedStep.map { "死在\($0)步" } ?? "自检失败"
+                    Text(step + "：" + (result.failedReason ?? result.failedLines.sorted(by: { $0.key < $1.key }).first.map { "\($0.key)：\($0.value)" } ?? "") + (result.checkedAt.map { " · \($0.formatted(date: .numeric, time: .short))" } ?? ""))
+                        .font(.caption)
+                        .foregroundColor(.red)
+                        .lineLimit(1)
+                    if let probe = result.deepProbe, !probe.passed {
+                        Text("深探针：坏了（\(probe.failedStep ?? "首片")）· \(probe.checkedAt.formatted(date: .numeric, time: .short))")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    }
+                }
+            case .skipped:
+                Text("与 \(duplicateTitle(for: result.duplicateOf)) 重复，跳过")
                     .font(.caption)
-                    .foregroundColor(.red)
-                    .lineLimit(1)
+                    .foregroundColor(.secondary)
             }
         } else {
             Text("未自检")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
+    }
+
+    /// 重复的那个源的标题（duplicateOf 是源 id；找不到显示 id）。
+    private func duplicateTitle(for duplicateOf: String?) -> String {
+        guard let id = duplicateOf else { return "其他源" }
+        return store.sources.first(where: { $0.id == id })?.title ?? id
     }
 
     // MARK: - 源列表

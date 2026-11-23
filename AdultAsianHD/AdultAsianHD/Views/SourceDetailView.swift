@@ -36,7 +36,11 @@ struct SourceDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .task {
             do {
-                host = try store.loadHost(for: source)
+                let loaded = try store.loadHost(for: source)
+                host = loaded
+                // 点进模块：后台竞速固定验线，定本次首选线（只跑一次；
+                // 播放器点视频时读 host.preferredLine，快路径不再写死 memojav）。
+                loaded.raceLinesIfNeeded()
             } catch {
                 errorMessage = "加载源失败：\(error.localizedDescription)"
             }
@@ -136,14 +140,77 @@ struct SourceDetailView: View {
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
+                // 五步验真明细（每步 + 耗时）
+                if let steps = result.steps, !steps.isEmpty {
+                    ForEach(steps, id: \.name) { step in
+                        HStack {
+                            Text(step.name)
+                            Spacer()
+                            Text(step.passed ? "通过" : "失败")
+                                .foregroundColor(step.passed ? .green : .red)
+                            Text("\(step.milliseconds)ms")
+                                .foregroundColor(.secondary)
+                        }
+                        .font(.footnote)
+                    }
+                }
+                // 深探针（第二层）
+                if let probe = result.deepProbe {
+                    if probe.passed {
+                        Text("深探针：通过 · \(dateText(probe.checkedAt))")
+                            .font(.footnote)
+                            .foregroundColor(.green)
+                    } else {
+                        Text("深探针：坏了（\(probe.failedStep ?? "首片")：\(probe.reason ?? "")）· \(dateText(probe.checkedAt))")
+                            .font(.footnote)
+                            .foregroundColor(.orange)
+                    }
+                }
             case .failed:
                 Label("失败", systemImage: "xmark.circle.fill")
                     .foregroundColor(.red)
+                // 死在哪步 + 原因
+                if let step = result.failedStep {
+                    Text("死在\(step)步：\(result.failedReason ?? "")")
+                        .font(.footnote)
+                        .foregroundColor(.red)
+                }
                 ForEach(result.failedLines.sorted(by: { $0.key < $1.key }), id: \.key) { sample, reason in
                     Text("\(sample)：\(reason)")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
+                // 五步验真明细（每步 + 耗时）
+                if let steps = result.steps, !steps.isEmpty {
+                    ForEach(steps, id: \.name) { step in
+                        HStack {
+                            Text(step.name)
+                            Spacer()
+                            Text(step.passed ? "通过" : "失败")
+                                .foregroundColor(step.passed ? .green : .red)
+                            Text("\(step.milliseconds)ms")
+                                .foregroundColor(.secondary)
+                        }
+                        .font(.footnote)
+                    }
+                }
+                if let at = result.checkedAt {
+                    Text("检查时间：\(dateText(at))")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+                // 深探针（第二层）
+                if let probe = result.deepProbe, !probe.passed {
+                    Text("深探针：坏了（\(probe.failedStep ?? "首片")：\(probe.reason ?? "")）· \(dateText(probe.checkedAt))")
+                        .font(.footnote)
+                        .foregroundColor(.orange)
+                }
+            case .skipped:
+                Label("跳过", systemImage: "minus.circle.fill")
+                    .foregroundColor(.secondary)
+                Text("与 \(duplicateTitle(for: result.duplicateOf)) 重复，跳过")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
                 if let at = result.checkedAt {
                     Text("检查时间：\(dateText(at))")
                         .font(.footnote)
@@ -154,6 +221,12 @@ struct SourceDetailView: View {
             Text("未自检")
                 .foregroundColor(.secondary)
         }
+    }
+
+    /// 重复的那个源的标题（duplicateOf 是源 id；找不到显示 id）。
+    private func duplicateTitle(for duplicateOf: String?) -> String {
+        guard let id = duplicateOf else { return "其他源" }
+        return store.sources.first(where: { $0.id == id })?.title ?? id
     }
 
     private func infoRow(_ label: String, _ value: String) -> some View {

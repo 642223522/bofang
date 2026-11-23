@@ -1,5 +1,7 @@
 import Foundation
 import Security
+import Network
+import AVFoundation
 
 /// 源管理：导入 / 删除 / 导出 / 码云同步。
 /// 源文件：Documents/Sources/<fileName>（一个模块一个 .js 文件）；
@@ -28,6 +30,25 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     /// 码云仓库与坏模块分支：上传只动 broken 分支，绝不动 js 分支。
     private let giteeRepo = "individual-freedom/ziyong-ziliao-beifang"
     private let brokenBranch = "broken"
+
+    // MARK: - 自检后台任务（让路 + 断点续跑）
+
+    /// 正在跑的后台自动自检 Task（轻检或深探针）。用户一点屏幕/切页/开始播放，
+    /// 或 App 进后台，立刻 cancel；下次从断点接着跑（增量逻辑跳过已测过的）。
+    private var autoCheckTask: Task<Void, Never>?
+    /// 后台自动自检的轮次间隔：轻检 12 小时一轮；深探针 7 天一轮（分开轮次）。
+    private let autoCheckInterval: TimeInterval = 12 * 3600
+    private let deepProbeInterval: TimeInterval = 7 * 24 * 3600
+    /// 上次自动轻检 / 上次深探针轮次的时间（UserDefaults）。
+    private let lastAutoCheckDefaultsKey = "selfcheck.lastAutoCheckAt"
+    private let lastDeepProbeDefaultsKey = "selfcheck.lastDeepProbeAt"
+    /// “仅 Wi-Fi 时自动自检”开关（UserDefaults，默认关）。
+    /// 只影响后台自动自检；手动自检和下载不受影响（下载仍可走流量）。
+    static let wifiOnlyAutoCheckDefaultsKey = "selfcheck.wifiOnlyAutoCheck"
+    /// 快扫每步超时（毫秒）：超时即判该步失败，不让一个慢源卡住整轮。
+    static let stepTimeoutMilliseconds = 6000
+    /// 深探针超时（秒）：静音真播 15 秒不出画即失败。
+    private static let deepProbeTimeoutSeconds: TimeInterval = 15
 
     init() {
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -71,6 +92,10 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         let validation = WidgetHost.validate(jsSource: text)
         guard validation.ok, let meta = validation.meta else {
             return .failure(.notModule(validation.error ?? "这个脚本不是 ForwardWidget 模块格式"))
+        }
+        // 去重：同模块 id 或同站点域名已存在，不重复添加（提示已存在相同源并跳过）
+        if let duplicate = await existingDuplicate(for: meta, jsSource: text) {
+            return .failure(.duplicate(duplicate.title))
         }
         let finalName = uniqueFileName(sanitizedFileName(fileName, fallback: meta.id))
         let fileURL = sourcesDirectory.appendingPathComponent(finalName)
@@ -121,6 +146,69 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             name = ""
         }
         return await importData(data, fileName: name, origin: "外部导入")
+    }
+
+    // MARK: - 去重（导入时 + 自检时）
+
+    /// 从 JS 源码提取站点域名：优先 WidgetMetadata.site；其次 SITE / BASE_URL 变量；
+    /// 再其次含 /wp-json/ 的 URL 的 host。归一化：小写、去 www. 前缀。
+    /// 提不出返回 nil（该模块只按模块 id 去重）。
+    static func siteDomain(fromJS js: String, metaSite: String? = nil) -> String? {
+        if let site = metaSite, let host = URL(string: site)?.host, !host.isEmpty {
+            return normalizedDomain(host)
+        }
+        // SITE / BASE_URL 变量，如 var SITE = "https://pornjav.tv";
+        if let urlString = firstMatch(in: js, pattern: "(?:var|let|const)\\s+(?:SITE|site|BASE_URL|baseUrl|HOST|host|DOMAIN|domain)\\s*=\\s*[\"'](https?://[^\"'\\s]+)"),
+           let host = URL(string: urlString)?.host, !host.isEmpty {
+            return normalizedDomain(host)
+        }
+        // 含 /wp-json/ 的 URL（如 WP API 地址），取它的 host
+        if let urlString = firstMatch(in: js, pattern: "https?://[A-Za-z0-9.-]+[^\"'\\s]*?/wp-json/"),
+           let host = URL(string: urlString)?.host, !host.isEmpty {
+            return normalizedDomain(host)
+        }
+        return nil
+    }
+
+    /// 某源的站点域名（读它的 JS 文件提取；提不出为 nil）。
+    func siteDomain(for source: SourceRecord) -> String? {
+        guard let js = jsSource(for: source) else { return nil }
+        return Self.siteDomain(fromJS: js)
+    }
+
+    /// 找已存在的重复源：同模块 id，或同站点域名（读对方 JS 文件算域名）。
+    /// 返回重复的那个源（没有返回 nil）。同 id 优先于同域名。
+    /// 同一站点/内容池被不同域名或不同模块重复收录时，只留一个。
+    func existingDuplicate(for meta: WidgetMeta, jsSource: String) async -> SourceRecord? {
+        let all = await MainActor.run { self.sources }
+        if let sameId = all.first(where: { $0.id == meta.id }) {
+            return sameId
+        }
+        guard let domain = Self.siteDomain(fromJS: jsSource, metaSite: meta.site) else { return nil }
+        for source in all {
+            guard let js = jsSource(for: source),
+                  Self.siteDomain(fromJS: js) == domain else { continue }
+            return source
+        }
+        return nil
+    }
+
+    /// 正则取第一个匹配的第 1 个捕获组（没有捕获组取整个匹配）；没有返回 nil。
+    private static func firstMatch(in text: String, pattern: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: text, options: [], range: NSRange(text.startIndex..., in: text)) else {
+            return nil
+        }
+        let groupIndex = match.numberOfRanges > 1 ? 1 : 0
+        let range = match.range(at: groupIndex)
+        guard range.location != NSNotFound, let swiftRange = Range(range, in: text) else { return nil }
+        return String(text[swiftRange])
+    }
+
+    /// 域名归一化：小写、去 www. 前缀（pornjav.tv 与 www.pornjav.tv 算同一个站）。
+    private static func normalizedDomain(_ host: String) -> String {
+        let lower = host.lowercased()
+        return lower.hasPrefix("www.") ? String(lower.dropFirst(4)) : lower
     }
 
     // MARK: - 删除 / 导出 / 取用
@@ -249,7 +337,12 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
                 case .success:
                     imported += 1
                 case .failure(let error):
-                    if firstError == nil { firstError = error.localizedDescription }
+                    // 已存在相同源：跳过，不算失败（同步不重复加）
+                    if case .duplicate = error {
+                        // 什么都不做，继续下一个文件
+                    } else if firstError == nil {
+                        firstError = error.localizedDescription
+                    }
                 }
             } catch {
                 if firstError == nil { firstError = friendlyNetworkError(error) }
@@ -273,7 +366,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         KeychainHelper.load(forKey: giteeTokenKey)
     }
 
-    // MARK: - 自检（固定验线探针）
+    // MARK: - 自检（固定验线探针：五步验真 + 增量 + 去重 + 让路 + 深探针）
 
     /// 自检结果持久化：Documents/check-results.json。
     private func loadCheckResults() {
@@ -297,90 +390,589 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         }
     }
 
-    /// 固定验线模块：params 里 kind 常量为 "fixed" 的那个；
-    /// 兜底：id 或标题含 "fixed" / "固定验线"。
-    /// pornjav.js 里就是 id "pornjav-fixed"、kind 常量 "fixed"，
-    /// 返回两个固定样本 JUQ-984（nmcorp 线）＋ ATID-686（memojav 线）。
-    private func fixedProbeModule(in host: WidgetHost) -> ModuleDescriptor? {
-        host.modules.first { module in
-            module.params.contains { param in
-                (param["name"] as? String) == "kind"
-                && (param["type"] as? String) == "constant"
-                && (param["value"] as? String) == "fixed"
+    /// JS 内容指纹（FNV-1a 64 位哈希转十六进制）：增量自检用。
+    /// 内容没变指纹就不变，没动过的源跳过不重测。
+    static func fingerprint(of jsSource: String) -> String {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in jsSource.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x100000001b3
+        }
+        return String(format: "%016llx", hash)
+    }
+
+    /// 某源当前 JS 的指纹（读文件算；读不到为 nil）。
+    func fingerprint(for source: SourceRecord) -> String? {
+        guard let js = jsSource(for: source) else { return nil }
+        return Self.fingerprint(of: js)
+    }
+
+    /// 若已取消则抛 CancellationError（不把“取消”记成失败结果，
+    /// 断点续跑时这个源重测）。
+    private func throwIfCancelled() throws {
+        if Task.isCancelled { throw CancellationError() }
+    }
+
+    /// 带超时的操作：超时即 throw CheckStepError.timeout。
+    /// 快扫每步默认 6000ms，超时判该步失败，不让一个慢源卡住整轮。
+    private func withStepTimeout<T>(_ milliseconds: Int = stepTimeoutMilliseconds, operation: @escaping () async throws -> T) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000)
+                throw CheckStepError.timeout(milliseconds)
             }
-        } ?? host.modules.first { module in
-            module.id.lowercased().contains("fixed")
-            || module.title.contains("固定验线")
+            guard let result = try await group.next() else {
+                throw CheckStepError.timeout(milliseconds)
+            }
+            group.cancelAll()
+            return result
         }
     }
 
-    /// 对单个源跑自检：固定验线取样本，各调 loadResource 看能否解出可播 URL
-    /// （.m3u8 或 .mp4）。结果写入 checkResults 并持久化。
-    func runCheck(for source: SourceRecord) async -> SourceCheckResult {
-        let result: SourceCheckResult
+    /// 把一步的 error 翻成人话原因：超时 / HTTP 状态 / 其他。
+    private func checkReason(for error: Error) -> String {
+        if let stepError = error as? CheckStepError {
+            switch stepError {
+            case .timeout(let ms): return "\(ms)ms 超时"
+            case .http(let code): return "HTTP \(code)"
+            case .badURL: return "URL 非法"
+            }
+        }
+        if error is CancellationError { return "已取消" }
+        return error.localizedDescription
+    }
+
+    /// GET 一个 URL 的 HTTP 状态码（详情步用）。iPhone UA。
+    private static func httpStatus(of urlString: String) async throws -> Int {
+        guard let url = URL(string: urlString) else { throw CheckStepError.badURL }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 10
+        let (_, response) = try await URLSession.shared.data(for: request)
+        return (response as? HTTPURLResponse)?.statusCode ?? 0
+    }
+
+    /// GET 一个 URL 的全文（播单步用，取 m3u8 文本）。referer 传帖子链接（nmcorp 这类防盗链的线要它）。
+    private static func httpBody(of urlString: String, referer: String? = nil) async throws -> String {
+        guard let url = URL(string: urlString) else { throw CheckStepError.badURL }
+        var request = URLRequest(url: url)
+        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        if let referer { request.setValue(referer, forHTTPHeaderField: "Referer") }
+        request.timeoutInterval = 10
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            throw CheckStepError.http((response as? HTTPURLResponse)?.statusCode ?? 0)
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Range 取一个 URL 的前 length 字节（首片步用；MP4 也用它取首字节）。
+    private static func httpRangeData(of urlString: String, length: Int, referer: String? = nil) async throws -> Data {
+        guard let url = URL(string: urlString) else { throw CheckStepError.badURL }
+        var request = URLRequest(url: url)
+        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        if let referer { request.setValue(referer, forHTTPHeaderField: "Referer") }
+        request.setValue("bytes=0-\(length - 1)", forHTTPHeaderField: "Range")
+        request.timeoutInterval = 10
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) || http.statusCode == 206 else {
+            throw CheckStepError.http((response as? HTTPURLResponse)?.statusCode ?? 0)
+        }
+        return data
+    }
+
+    /// m3u8 文本里第一个媒体引用（变体播单或分片 URL），按 baseURL 解析相对地址。
+    /// 跳过 # 开头的行与空行；取第一个非 # 行。
+    private static func firstMediaURL(in playlistText: String, baseURL: String) -> String? {
+        guard let base = URL(string: baseURL) else { return nil }
+        for line in playlistText.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
+            if let resolved = URL(string: trimmed, relativeTo: base)?.absoluteString {
+                return resolved
+            }
+            return trimmed
+        }
+        return nil
+    }
+
+    /// Data 前段是否含 "ftyp"（MP4 签名）。
+    private static func dataContainsFTYP(_ data: Data) -> Bool {
+        data.range(of: Data("ftyp".utf8)) != nil
+    }
+
+    /// 五步验真（对一个源）：列表→详情→解析→播单→首片，每步 6000ms 超时。
+    /// 固定验线取样本；每个样本顺次跑详情→解析→播单→首片（列表步只做一次）。
+    /// 全部样本走完五步才算 ok；任一样本死在某步即 failed，记死在哪步 + 原因。
+    /// 返回 SourceCheckResult（steps = 决定本次结果的那个样本的五步；fingerprint = 当前 JS 指纹）。
+    /// 深探针不由这里填（单独轮次，由 runDeepProbeRound 写）。
+    /// 取消时抛 CancellationError（不记失败结果，断点续跑时重测）。
+    private func runFiveStepCheck(host: WidgetHost, source: SourceRecord) async throws -> SourceCheckResult {
+        let fingerprint = self.fingerprint(for: source)
+        // 1. 列表：固定验线取样本
+        let listStart = Date()
+        let listElapsed = { Int(Date().timeIntervalSince(listStart) * 1000) }
+        guard let probe = host.fixedProbeModule() else {
+            let step = CheckStepResult(name: "列表", passed: false, reason: "这个源没有固定验线模块", milliseconds: listElapsed())
+            return SourceCheckResult(status: .failed, failedLines: ["固定验线": "这个源没有固定验线模块"], checkedAt: Date(), steps: [step], failedStep: "列表", failedReason: "这个源没有固定验线模块", sourceFingerprint: fingerprint)
+        }
+        let samples: [VideoItem]
         do {
-            let host = try loadHost(for: source)
-            guard let probe = fixedProbeModule(in: host) else {
-                result = SourceCheckResult(
-                    status: .failed,
-                    failedLines: ["固定验线": "这个源没有固定验线模块"],
-                    checkedAt: Date()
-                )
-                await storeCheckResult(result, for: source.id)
-                return result
-            }
-            let samples = try await host.loadList(moduleId: probe.id, page: 1)
-            guard !samples.isEmpty else {
-                result = SourceCheckResult(
-                    status: .failed,
-                    failedLines: ["固定验线": "固定验线没有返回样本"],
-                    checkedAt: Date()
-                )
-                await storeCheckResult(result, for: source.id)
-                return result
-            }
-            var failedLines: [String: String] = [:]
-            for item in samples {
-                do {
-                    let lines = try await host.loadResource(link: item.link, title: item.title)
-                    let playable = lines.contains { line in
-                        let lower = line.url.lowercased()
-                        return lower.contains(".m3u8") || lower.contains(".mp4")
-                    }
-                    if !playable {
-                        failedLines[item.title] = "没解出可播地址"
-                    }
-                } catch {
-                    failedLines[item.title] = error.localizedDescription
+            samples = try await withStepTimeout { try await host.loadList(moduleId: probe.id, page: 1) }
+        } catch {
+            try throwIfCancelled()
+            let reason = checkReason(for: error)
+            let step = CheckStepResult(name: "列表", passed: false, reason: reason, milliseconds: listElapsed())
+            return SourceCheckResult(status: .failed, failedLines: ["固定验线": reason], checkedAt: Date(), steps: [step], failedStep: "列表", failedReason: reason, sourceFingerprint: fingerprint)
+        }
+        guard !samples.isEmpty else {
+            let step = CheckStepResult(name: "列表", passed: false, reason: "固定验线没有返回样本", milliseconds: listElapsed())
+            return SourceCheckResult(status: .failed, failedLines: ["固定验线": "固定验线没有返回样本"], checkedAt: Date(), steps: [step], failedStep: "列表", failedReason: "固定验线没有返回样本", sourceFingerprint: fingerprint)
+        }
+        let listStep = CheckStepResult(name: "列表", passed: true, reason: nil, milliseconds: listElapsed())
+
+        // 每个样本顺次跑详情→解析→播单→首片
+        var failedLines: [String: String] = [:]
+        var decidingSteps: [CheckStepResult] = [listStep]
+        var firstFailure: (step: String, reason: String)?
+        for (index, sample) in samples.enumerated() {
+            try throwIfCancelled()
+            let steps = try await runSampleSteps(host: host, sample: sample)
+            if index == 0 { decidingSteps = [listStep] + steps }
+            if let failed = steps.first(where: { !$0.passed }) {
+                failedLines[sample.title] = "死在\(failed.name)步：\(failed.reason ?? "")"
+                if firstFailure == nil {
+                    firstFailure = (failed.name, failed.reason ?? "")
+                    decidingSteps = [listStep] + steps
                 }
             }
-            result = SourceCheckResult(
-                status: failedLines.isEmpty ? .ok : .failed,
-                failedLines: failedLines,
-                checkedAt: Date()
-            )
-        } catch {
-            result = SourceCheckResult(
-                status: .failed,
-                failedLines: ["加载源": error.localizedDescription],
-                checkedAt: Date()
-            )
         }
-        await storeCheckResult(result, for: source.id)
-        return result
+        if let failure = firstFailure {
+            return SourceCheckResult(status: .failed, failedLines: failedLines, checkedAt: Date(), steps: decidingSteps, failedStep: failure.step, failedReason: failure.reason, sourceFingerprint: fingerprint)
+        }
+        return SourceCheckResult(status: .ok, failedLines: [:], checkedAt: Date(), steps: decidingSteps, failedStep: nil, failedReason: nil, sourceFingerprint: fingerprint)
     }
 
-    /// 逐个自检全部源（串行：JSContext 与网络都怕并发冲；
-    /// 单个源最慢约两条线各 30 秒超时）。返回（正常数，失败数）。
-    func runCheckAll() async -> (ok: Int, failed: Int) {
+    /// 一个样本的详情→解析→播单→首片（四步顺次，每步 6000ms 超时，某步失败即停）。
+    /// 详情：GET 帖子链接（详情页）要 200。
+    /// 解析：loadResource 解出可播 URL（.m3u8/.mp4）。
+    /// 播单：m3u8 取回并含 #EXTM3U；mp4 首字节可取。
+    /// 首片：m3u8 取第一个引用（变体播单或分片）并确认可取；mp4 前 64KB 含 ftyp。
+    /// 取消时抛 CancellationError。
+    private func runSampleSteps(host: WidgetHost, sample: VideoItem) async throws -> [CheckStepResult] {
+        var steps: [CheckStepResult] = []
+
+        // 2. 详情
+        let detailStart = Date()
+        do {
+            let status = try await withStepTimeout { try await Self.httpStatus(of: sample.link) }
+            guard status == 200 else {
+                steps.append(CheckStepResult(name: "详情", passed: false, reason: "HTTP \(status)", milliseconds: Int(Date().timeIntervalSince(detailStart) * 1000)))
+                return steps
+            }
+            steps.append(CheckStepResult(name: "详情", passed: true, reason: nil, milliseconds: Int(Date().timeIntervalSince(detailStart) * 1000)))
+        } catch {
+            try throwIfCancelled()
+            steps.append(CheckStepResult(name: "详情", passed: false, reason: checkReason(for: error), milliseconds: Int(Date().timeIntervalSince(detailStart) * 1000)))
+            return steps
+        }
+
+        // 3. 解析
+        let parseStart = Date()
+        let playableURL: String
+        do {
+            let lines = try await withStepTimeout { try await host.loadResource(link: sample.link, title: sample.title) }
+            guard let first = lines.first(where: { line in
+                let lower = line.url.lowercased()
+                return lower.contains(".m3u8") || lower.contains(".mp4")
+            }) else {
+                steps.append(CheckStepResult(name: "解析", passed: false, reason: "解不出可播链接", milliseconds: Int(Date().timeIntervalSince(parseStart) * 1000)))
+                return steps
+            }
+            playableURL = first.url
+            steps.append(CheckStepResult(name: "解析", passed: true, reason: nil, milliseconds: Int(Date().timeIntervalSince(parseStart) * 1000)))
+        } catch {
+            try throwIfCancelled()
+            steps.append(CheckStepResult(name: "解析", passed: false, reason: checkReason(for: error), milliseconds: Int(Date().timeIntervalSince(parseStart) * 1000)))
+            return steps
+        }
+
+        // 4. 播单 + 5. 首片（按 URL 类型分流）
+        let isM3U8 = playableURL.lowercased().contains(".m3u8")
+        if isM3U8 {
+            // 播单：取回 m3u8，含 #EXTM3U
+            let playlistStart = Date()
+            let playlistText: String
+            do {
+                playlistText = try await withStepTimeout { try await Self.httpBody(of: playableURL, referer: sample.link) }
+                guard playlistText.contains("#EXTM3U") else {
+                    steps.append(CheckStepResult(name: "播单", passed: false, reason: "不是有效的 m3u8 播单", milliseconds: Int(Date().timeIntervalSince(playlistStart) * 1000)))
+                    return steps
+                }
+                steps.append(CheckStepResult(name: "播单", passed: true, reason: nil, milliseconds: Int(Date().timeIntervalSince(playlistStart) * 1000)))
+            } catch {
+                try throwIfCancelled()
+                steps.append(CheckStepResult(name: "播单", passed: false, reason: checkReason(for: error), milliseconds: Int(Date().timeIntervalSince(playlistStart) * 1000)))
+                return steps
+            }
+            // 首片：取第一个引用（变体播单或分片）并确认可取
+            let firstFrameStart = Date()
+            do {
+                guard let firstRef = Self.firstMediaURL(in: playlistText, baseURL: playableURL) else {
+                    steps.append(CheckStepResult(name: "首片", passed: false, reason: "播单里没有分片", milliseconds: Int(Date().timeIntervalSince(firstFrameStart) * 1000)))
+                    return steps
+                }
+                if firstRef.lowercased().contains(".m3u8") {
+                    let variant = try await withStepTimeout { try await Self.httpBody(of: firstRef, referer: sample.link) }
+                    guard variant.contains("#EXTM3U") else {
+                        steps.append(CheckStepResult(name: "首片", passed: false, reason: "变体播单无效", milliseconds: Int(Date().timeIntervalSince(firstFrameStart) * 1000)))
+                        return steps
+                    }
+                } else {
+                    let data = try await withStepTimeout { try await Self.httpRangeData(of: firstRef, length: 32768, referer: sample.link) }
+                    guard !data.isEmpty else {
+                        steps.append(CheckStepResult(name: "首片", passed: false, reason: "首片分片取不到数据", milliseconds: Int(Date().timeIntervalSince(firstFrameStart) * 1000)))
+                        return steps
+                    }
+                }
+                steps.append(CheckStepResult(name: "首片", passed: true, reason: nil, milliseconds: Int(Date().timeIntervalSince(firstFrameStart) * 1000)))
+            } catch {
+                try throwIfCancelled()
+                steps.append(CheckStepResult(name: "首片", passed: false, reason: checkReason(for: error), milliseconds: Int(Date().timeIntervalSince(firstFrameStart) * 1000)))
+                return steps
+            }
+        } else {
+            // mp4：播单 = 首字节可取（Range 取前 1KB）；首片 = 前 64KB 含 ftyp
+            let playlistStart = Date()
+            do {
+                let data = try await withStepTimeout { try await Self.httpRangeData(of: playableURL, length: 1024, referer: sample.link) }
+                guard !data.isEmpty else {
+                    steps.append(CheckStepResult(name: "播单", passed: false, reason: "MP4 首字节取不到", milliseconds: Int(Date().timeIntervalSince(playlistStart) * 1000)))
+                    return steps
+                }
+                steps.append(CheckStepResult(name: "播单", passed: true, reason: nil, milliseconds: Int(Date().timeIntervalSince(playlistStart) * 1000)))
+            } catch {
+                try throwIfCancelled()
+                steps.append(CheckStepResult(name: "播单", passed: false, reason: checkReason(for: error), milliseconds: Int(Date().timeIntervalSince(playlistStart) * 1000)))
+                return steps
+            }
+            let firstFrameStart = Date()
+            do {
+                let data = try await withStepTimeout { try await Self.httpRangeData(of: playableURL, length: 65536, referer: sample.link) }
+                guard Self.dataContainsFTYP(data) else {
+                    steps.append(CheckStepResult(name: "首片", passed: false, reason: "MP4 首字节不是有效视频", milliseconds: Int(Date().timeIntervalSince(firstFrameStart) * 1000)))
+                    return steps
+                }
+                steps.append(CheckStepResult(name: "首片", passed: true, reason: nil, milliseconds: Int(Date().timeIntervalSince(firstFrameStart) * 1000)))
+            } catch {
+                try throwIfCancelled()
+                steps.append(CheckStepResult(name: "首片", passed: false, reason: checkReason(for: error), milliseconds: Int(Date().timeIntervalSince(firstFrameStart) * 1000)))
+                return steps
+            }
+        }
+        return steps
+    }
+
+    /// 对单个源跑自检（强制跑，不论指纹；源详情页“立即自检”用）。
+    /// 五步验真；结果写入 checkResults 并持久化。
+    /// 深探针结果保留：指纹没变沿用旧的深探针，变了（模块更新）则清掉（等深探针轮次重测）。
+    /// 取消时返回 nil（不存结果，断点续跑时重测）。
+    func runCheck(for source: SourceRecord) async -> SourceCheckResult? {
+        let previous = await MainActor.run { self.checkResults[source.id] }
+        do {
+            let host = try loadHost(for: source)
+            var fiveStep = try await runFiveStepCheck(host: host, source: source)
+            if Task.isCancelled { return nil }
+            if fiveStep.sourceFingerprint == previous?.sourceFingerprint {
+                fiveStep.deepProbe = previous?.deepProbe
+            }
+            await storeCheckResult(fiveStep, for: source.id)
+            return fiveStep
+        } catch {
+            if error is CancellationError { return nil }
+            if Task.isCancelled { return nil }
+            let result = SourceCheckResult(
+                status: .failed,
+                failedLines: ["加载源": error.localizedDescription],
+                checkedAt: Date(),
+                failedStep: "列表",
+                failedReason: error.localizedDescription,
+                sourceFingerprint: fingerprint(for: source)
+            )
+            await storeCheckResult(result, for: source.id)
+            return result
+        }
+    }
+
+    /// 自检分组（去重）：按模块 id / 站点域名分组，同一组只跑一次固定验线。
+    /// 并查集：同 id 或同域名（任一相同）即同一组。
+    /// 返回 [[源]]，每组第一个为代表（跑自检），其余标记跳过；组按第一个源的原顺序排。
+    private func checkGroups(for all: [SourceRecord]) -> [[SourceRecord]] {
+        var parent: [String: String] = [:]
+        for source in all { parent[source.id] = source.id }
+        func find(_ x: String) -> String {
+            var root = x
+            while let p = parent[root], p != root { root = p }
+            var node = x
+            while let p = parent[node], p != root {
+                parent[node] = root
+                node = p
+            }
+            return root
+        }
+        func union(_ a: String, _ b: String) {
+            let ra = find(a), rb = find(b)
+            if ra != rb { parent[rb] = ra }
+        }
+        var domainOwner: [String: String] = [:]
+        for source in all {
+            if let domain = siteDomain(for: source) {
+                if let owner = domainOwner[domain] {
+                    union(owner, source.id)
+                } else {
+                    domainOwner[domain] = source.id
+                }
+            }
+        }
+        var groups: [String: [SourceRecord]] = [:]
+        for source in all { groups[find(source.id), default: []].append(source) }
+        var ordered: [[SourceRecord]] = []
+        var seenRoots = Set<String>()
+        for source in all {
+            let root = find(source.id)
+            guard !seenRoots.contains(root) else { continue }
+            seenRoots.insert(root)
+            if let group = groups[root] { ordered.append(group) }
+        }
+        return ordered
+    }
+
+    /// 自检全部源：增量 + 去重 + 让路。
+    /// - 增量：只跑新增/改过（JS 指纹变了）或没测过的源；没动过的跳过，显示上次结果。
+    /// - 去重：同一组（同模块 id 或同站点域名）只跑代表一次，其余标记 skipped（与 X 重复，跳过）。
+    /// - 让路：每测完一个源检查 Task.isCancelled（用户点屏/切页/播放/进后台即停）；
+    ///   下次从断点接着跑（已测过且指纹没变的源跳过，不重跑）。
+    /// 返回（正常数，失败数，跳过数）。取消时返回已统计到的数（未测的源下次接着跑）。
+    func runCheckAll() async -> (ok: Int, failed: Int, skipped: Int) {
         var ok = 0
         var failed = 0
+        var skipped = 0
+        let all = await MainActor.run { self.sources }
+        let groups = checkGroups(for: all)
+        for group in groups {
+            if Task.isCancelled { break }
+            guard let representative = group.first else { continue }
+            // 代表：增量——指纹没变且有上次结果（非跳过），跳过不重测（显示上次结果）
+            let currentFingerprint = fingerprint(for: representative)
+            let previous = await MainActor.run { self.checkResults[representative.id] }
+            let needsCheck: Bool
+            if let prev = previous, prev.status != .skipped {
+                needsCheck = prev.sourceFingerprint != currentFingerprint
+            } else {
+                needsCheck = true
+            }
+            if needsCheck {
+                guard let result = await runCheck(for: representative) else { break }
+                switch result.status {
+                case .ok: ok += 1
+                case .failed: failed += 1
+                case .skipped: skipped += 1
+                }
+            } else if let prev = previous {
+                switch prev.status {
+                case .ok: ok += 1
+                case .failed: failed += 1
+                case .skipped: skipped += 1
+                }
+            }
+            // 同组其余源：标记为与代表重复，跳过
+            for duplicate in group.dropFirst() {
+                if Task.isCancelled { break }
+                let skippedResult = SourceCheckResult(
+                    status: .skipped,
+                    failedLines: [:],
+                    checkedAt: Date(),
+                    duplicateOf: representative.id,
+                    sourceFingerprint: fingerprint(for: duplicate)
+                )
+                await storeCheckResult(skippedResult, for: duplicate.id)
+                skipped += 1
+            }
+        }
+        return (ok, failed, skipped)
+    }
+
+    // MARK: - 深探针（第二层：静音真播到出画）
+
+    /// 深探针轮次（第二层，单独轮次，不跟轻检同一轮跑）：
+    /// 轻检通过（status .ok）的源，轮流静音真播到出画（真的起 AVPlayer、静音、确认出首帧）。
+    /// 7 天一轮；深探针坏了写进该源的 deepProbe，源条目下标出来。
+    /// 让路：每测完一个源检查 Task.isCancelled。
+    func runDeepProbeRound() async {
         let all = await MainActor.run { self.sources }
         for source in all {
-            let result = await runCheck(for: source)
-            if result.status == .ok { ok += 1 } else { failed += 1 }
+            if Task.isCancelled { break }
+            let light = await MainActor.run { self.checkResults[source.id] }
+            guard light?.status == .ok else { continue }
+            // 7 天内做过且模块没变的不重做
+            if let probe = light?.deepProbe,
+               Date().timeIntervalSince(probe.checkedAt) < deepProbeInterval,
+               light?.sourceFingerprint == fingerprint(for: source) {
+                continue
+            }
+            guard let playableURL = await firstPlayableURL(for: source) else { continue }
+            let probe = await Self.deepProbe(urlString: playableURL)
+            await MainActor.run {
+                if var current = self.checkResults[source.id] {
+                    current.deepProbe = probe
+                    self.checkResults[source.id] = current
+                    self.saveCheckResults()
+                }
+            }
         }
-        return (ok, failed)
+        UserDefaults.standard.set(Date(), forKey: lastDeepProbeDefaultsKey)
+    }
+
+    /// 取一个源第一条可播 URL（固定验线第一个样本的解析结果；深探针用）。
+    /// 解析失败返回 nil（该源跳过深探针）。
+    private func firstPlayableURL(for source: SourceRecord) async -> String? {
+        guard let host = try? loadHost(for: source),
+              let probe = host.fixedProbeModule(),
+              let samples = try? await host.loadList(moduleId: probe.id, page: 1),
+              let first = samples.first,
+              let lines = try? await host.loadResource(link: first.link, title: first.title) else {
+            return nil
+        }
+        return lines.first { line in
+            let lower = line.url.lowercased()
+            return lower.contains(".m3u8") || lower.contains(".mp4")
+        }?.url
+    }
+
+    /// 深探针：静音真播到出画（真的起 AVPlayer、静音、确认出首帧画面）。
+    /// 15 秒不出画即失败。返回 DeepProbeResult。
+    static func deepProbe(urlString: String) async -> DeepProbeResult {
+        guard let url = URL(string: urlString) else {
+            return DeepProbeResult(passed: false, failedStep: "解析", reason: "URL 非法", checkedAt: Date())
+        }
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                let item = AVPlayerItem(url: url)
+                let output = AVPlayerItemVideoOutput(pixelBufferAttributes: nil)
+                item.add(output)
+                let player = AVPlayer(playerItem: item)
+                player.isMuted = true
+                player.volume = 0
+                // 盒子：保活 player/timer，防 continuation 多次 resume
+                // 只在主队列上用（建播放器、轮询、超时都在主队列），不用 Sendable。
+                final class ProbeBox {
+                    var done = false
+                    var player: AVPlayer?
+                    var timer: DispatchSourceTimer?
+                }
+                let box = ProbeBox()
+                box.player = player
+                func finish(_ passed: Bool, _ step: String?, _ reason: String?) {
+                    guard !box.done else { return }
+                    box.done = true
+                    box.timer?.cancel()
+                    box.timer = nil
+                    player.pause()
+                    box.player = nil
+                    continuation.resume(returning: DeepProbeResult(passed: passed, failedStep: step, reason: reason, checkedAt: Date()))
+                }
+                let timer = DispatchSource.makeTimerSource(queue: .main)
+                box.timer = timer
+                timer.schedule(deadline: .now(), repeating: .milliseconds(100))
+                timer.setEventHandler {
+                    if item.status == .failed {
+                        finish(false, "首片", item.error?.localizedDescription ?? "播放器失败")
+                        return
+                    }
+                    guard item.status == .readyToPlay else { return }
+                    // 有新像素帧 = 出画；或正在播且时间在前进（兜底）
+                    if output.hasNewPixelBuffer(forItemTime: item.currentTime()) {
+                        finish(true, nil, nil)
+                        return
+                    }
+                    if player.timeControlStatus == .playing && item.currentTime().seconds > 0 {
+                        finish(true, nil, nil)
+                        return
+                    }
+                }
+                timer.resume()
+                player.play()
+                DispatchQueue.main.asyncAfter(deadline: .now() + deepProbeTimeoutSeconds) {
+                    finish(false, "首片", "深探针 15s 未出画")
+                }
+            }
+        }
+    }
+
+    // MARK: - 后台自动自检（闲置 12 小时一轮轻检，7 天一轮深探针）
+
+    /// 闲置时自动自检（App 切回前台 / 启动时调）：12 小时一轮轻检，7 天一轮深探针，分开轮次。
+    /// “仅 Wi-Fi 自动自检”开时，先确认当前是 Wi-Fi 再跑（默认关 = 任何网络都跑）。
+    /// 后台跑；用户一点屏幕/切页/播放/进后台即 cancelAutoCheck() 停下，下次断点续跑。
+    func maybeRunAutoCheck() {
+        guard autoCheckTask == nil else { return }
+        let now = Date()
+        let lastLight = UserDefaults.standard.object(forKey: lastAutoCheckDefaultsKey) as? Date
+        let lightDue = lastLight.map { now.timeIntervalSince($0) >= autoCheckInterval } ?? true
+        let lastDeep = UserDefaults.standard.object(forKey: lastDeepProbeDefaultsKey) as? Date
+        let deepDue = lastDeep.map { now.timeIntervalSince($0) >= deepProbeInterval } ?? true
+        guard lightDue || deepDue else { return }
+        autoCheckTask = Task { [weak self] in
+            guard let self else { return }
+            defer { Task { @MainActor [weak self] in self?.autoCheckTask = nil } }
+            if UserDefaults.standard.bool(forKey: Self.wifiOnlyAutoCheckDefaultsKey) {
+                guard await Self.isOnWiFi() else { return }
+            }
+            if lightDue {
+                _ = await self.runCheckAll()
+                UserDefaults.standard.set(Date(), forKey: self.lastAutoCheckDefaultsKey)
+            }
+            if deepDue, !Task.isCancelled {
+                await self.runDeepProbeRound()
+            }
+        }
+    }
+
+    /// 停掉正在跑的后台自动自检（用户点屏/切页/开始播放/进后台时调）。
+    /// 下次自动自检从断点接着跑（增量逻辑跳过已测过的源）。
+    func cancelAutoCheck() {
+        autoCheckTask?.cancel()
+        autoCheckTask = nil
+    }
+
+    /// 当前是否 Wi-Fi（一次性检查，供“仅 Wi-Fi 自动自检”用）。
+    /// NWPathMonitor 取当前路径，最多等 2 秒；拿不到当不是 Wi-Fi（不自动跑，安全起见）。
+    static func isOnWiFi() async -> Bool {
+        await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                    let monitor = NWPathMonitor()
+                    let queue = DispatchQueue(label: "wifi-check")
+                    var resumed = false
+                    monitor.pathUpdateHandler = { path in
+                        guard !resumed else { return }
+                        resumed = true
+                        monitor.cancel()
+                        continuation.resume(returning: path.status == .satisfied && path.usesInterfaceType(.wifi))
+                    }
+                    monitor.start(queue: queue)
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 2 * 1_000_000_000)
+                return false
+            }
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
+        }
     }
 
     // MARK: - 上传坏的模块（broken 分支）
@@ -639,19 +1231,67 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     }
 }
 
+/// 五步验真里一步失败的原因（内部用，转成人话靠 checkReason）。
+enum CheckStepError: Error {
+    /// 超时（毫秒）
+    case timeout(Int)
+    /// HTTP 状态码
+    case http(Int)
+    /// URL 非法
+    case badURL
+}
+
 // MARK: - 自检结果（单独持久化在 check-results.json，不动 SourceRecord）
 
-/// 一次自检的结果：固定验线两条线各解没解出可播 URL。
-/// ok = 样本全部解出可播 URL；failed = 至少一条线失败，
-/// failedLines 记每条样本的失败原因（key 是样本标题，如 "JUQ-984"）。
+/// 五步验真的一步结果。
+/// 步名固定五步：列表 / 详情 / 解析 / 播单 / 首片。
+struct CheckStepResult: Codable {
+    /// 步名：列表 / 详情 / 解析 / 播单 / 首片
+    let name: String
+    let passed: Bool
+    /// 失败原因（如 "HTTP 404"、"6000ms 超时"、"解不出可播链接"）；通过时 nil
+    let reason: String?
+    /// 耗时（毫秒）
+    let milliseconds: Int
+}
+
+/// 深探针结果（第二层）：轻检（五步）通过的源，轮流静音真播到出画。
+/// 单独轮次（不跟轻检同一轮跑），7 天一轮。
+struct DeepProbeResult: Codable {
+    let passed: Bool
+    /// 死在哪步（通过时 nil，如 "首片"）
+    let failedStep: String?
+    let reason: String?
+    let checkedAt: Date
+}
+
+/// 一次自检的结果：固定验线样本跑五步验真（列表→详情→解析→播单→首片）。
+/// ok = 样本全部走完五步；failed = 至少一个样本死在某步，
+/// failedStep/failedReason 写清死在哪步 + 原因（如 "解析" / "首片 6000ms 超时"）。
+/// failedLines 记每条样本的失败原因（key 是样本标题，如 "JUQ-984"，旧版字段保留兼容）。
+/// skipped = 去重跳过（与另一个源重复，同模块 id 或同站点域名），duplicateOf 记重复的那个源 id。
 struct SourceCheckResult: Codable {
     enum Status: String, Codable {
         case ok
         case failed
+        /// 去重跳过：与另一个源重复（同模块 id 或同站点域名），没跑
+        case skipped
     }
     var status: Status
     var failedLines: [String: String]
     var checkedAt: Date?
+    /// 跳过时：重复的那个源的 id
+    var duplicateOf: String?
+    /// 五步验真（决定本次结果的那个样本的五步；旧数据为 nil）
+    var steps: [CheckStepResult]?
+    /// 死在哪步（如 "解析"）；通过时 nil
+    var failedStep: String?
+    /// 失败原因（如 "首片 6000ms 超时"、"HTTP 404"）
+    var failedReason: String?
+    /// 深探针结果（第二层，单独轮次；轻检没过的不做）
+    var deepProbe: DeepProbeResult?
+    /// 导入时该源 JS 的内容指纹（增量自检用）：指纹没变说明源没改过，跳过不重测
+    var sourceFingerprint: String?
 }
 
 // MARK: - 导入错误（全部中文人话）
@@ -661,10 +1301,10 @@ enum ImportError: Error, LocalizedError {
     case unreadable
     /// 不是 ForwardWidget 模块格式（带具体原因）
     case notModule(String)
-    /// 这个源已经导入过了（预留；目前文件名冲突走自动改名，一般不返回这个）
-    case duplicate
     /// 网络问题（带具体原因）
     case network(String)
+    /// 已存在相同源（同模块 id 或同站点域名），不重复添加；关联值是已存在那个源的标题
+    case duplicate(String)
 
     var errorDescription: String? {
         switch self {
@@ -672,8 +1312,8 @@ enum ImportError: Error, LocalizedError {
             return "这个文件读不出来（不是有效的文本文件）"
         case .notModule(let reason):
             return reason
-        case .duplicate:
-            return "这个源已经导入过了"
+        case .duplicate(let existingTitle):
+            return "已存在相同源：\(existingTitle)，跳过导入"
         case .network(let reason):
             return reason
         }

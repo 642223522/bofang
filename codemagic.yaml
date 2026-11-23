@@ -59,6 +59,34 @@ workflows:
           echo "Bundle ID: $BUNDLE_ID"
           /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$INFO_PLIST"
           /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$INFO_PLIST"
+      - name: Generate AppIcon PNGs from source（base64 还原 + sips 切 12 个尺寸）
+        script: |
+          set -eo pipefail
+          # 图标源图只以 base64 文本进仓（icon-source.jpg.b64），12 张 PNG 在构建机上现切，
+          # 不进 GitHub。源图：兔子+熊猫骑小摩托、红字“老司机带带我”（v2.1.1/v2.1.5 用过的图标）。
+          ICONSET="AdultAsianHD/AdultAsianHD/Assets.xcassets/AppIcon.appiconset"
+          B64="$ICONSET/icon-source.jpg.b64"
+          JPG="$ICONSET/icon-source.jpg"
+          if [ ! -f "$B64" ]; then
+            echo "❌ 找不到图标 base64 源：$B64"
+            exit 1
+          fi
+          openssl base64 -d -in "$B64" -out "$JPG"
+          echo "--- 源图已还原 ---"
+          sips -g pixelWidth -g pixelHeight "$JPG"
+          # Contents.json 里的 12 个尺寸（17 条目共用这 12 个文件）
+          for SIZE in 20 29 40 58 60 80 87 120 152 167 180 1024; do
+            sips -z "$SIZE" "$SIZE" "$JPG" --out "$ICONSET/icon-$SIZE.png" >/dev/null
+          done
+          echo "--- 生成的图标 PNG ---"
+          ls -lh "$ICONSET"/icon-*.png
+          for SIZE in 20 29 40 58 60 80 87 120 152 167 180 1024; do
+            if [ ! -f "$ICONSET/icon-$SIZE.png" ]; then
+              echo "❌ 缺少图标 PNG：icon-$SIZE.png"
+              exit 1
+            fi
+          done
+          echo "OK：12 个尺寸图标 PNG 已生成。"
       - name: Generate Xcode project (xcodegen)
         script: |
           set -eo pipefail
@@ -177,6 +205,14 @@ workflows:
             echo "⚠️ 注意：.app 带签名（预期是未签名），继续打包。"
           else
             echo "OK：.app 未签名，符合预期（安装时由侧载工具重签）。"
+          fi
+          echo "--- AppIcon 检查（Assets.car 应在 .app 里，否则桌面图标空白） ---"
+          if [ -f "$APP_PATH/Assets.car" ]; then
+            echo "OK：Assets.car 在包里（AppIcon 已编入）。"
+            ls -lh "$APP_PATH/Assets.car"
+          else
+            echo "❌ .app 里没有 Assets.car，AppIcon 没编进去，桌面图标会是空白。"
+            exit 1
           fi
           rm -rf Payload "$IPA_NAME"
           mkdir -p Payload

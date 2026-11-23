@@ -18,6 +18,19 @@ final class WidgetHost: @unchecked Sendable {
     private let exceptionBox: ExceptionBox
     /// 分类请求拦截器（一个 host 一个，跟着它自己的 JSContext 走）。
     private let requestInterceptor: CategoryRequestInterceptor
+    /// 线路竞速（进模块时跑一次）：本次该模块的首选线。
+    /// 内存里，进模块时重算；离开不保留（host 释放即丢弃）。
+    /// nil = 没竞速 / 没分出胜负 / 两条都死 / 无固定验线 → 按现有逻辑。
+    /// 锁保护：竞速在后台 Task 写，播放器在主线程读。
+    private let raceLock = NSLock()
+    private var _preferredLine: PreferredLine?
+    var preferredLine: PreferredLine? {
+        raceLock.lock()
+        defer { raceLock.unlock() }
+        return _preferredLine
+    }
+    /// 是否已跑过竞速（一个 host 只跑一次，进模块时触发）。
+    private var didRaceLines = false
 
     enum WidgetHostError: Error, LocalizedError {
         case invalidFormat(String)
@@ -298,6 +311,86 @@ final class WidgetHost: @unchecked Sendable {
     /// 宿主侧打分判断：这项是不是分类（跳转桩），而不是视频。
     func isCategoryItem(_ item: VideoItem) -> Bool {
         item.isCategory(under: categoryRule)
+    }
+
+    // MARK: - 线路竞速（进模块时跑一次，定本次首选线）
+
+    /// 固定验线模块：params 里 kind 常量为 "fixed" 的那个；
+    /// 兜底：id 或标题含 "fixed" / "固定验线"。
+    /// pornjav.js 里就是 id "pornjav-fixed"、kind 常量 "fixed"，
+    /// 返回两个固定样本 JUQ-984（nmcorp 线）＋ ATID-686（memojav 线）。
+    /// 自检（SourceStore）也用这个找探针入口。
+    func fixedProbeModule() -> ModuleDescriptor? {
+        modules.first { module in
+            module.params.contains { param in
+                (param["name"] as? String) == "kind"
+                && (param["type"] as? String) == "constant"
+                && (param["value"] as? String) == "fixed"
+            }
+        } ?? modules.first { module in
+            module.id.lowercased().contains("fixed")
+            || module.title.contains("固定验线")
+        }
+    }
+
+    /// 进模块时后台竞速（只跑一次）：调固定验线拿样本，各调 loadResource 解线计时，
+    /// 最快且能播的线记为本次首选线（preferredLine，内存里，进模块时重算）。
+    /// 没分出胜负 / 两条都死 / 无固定验线 → preferredLine 保持 nil，按现有逻辑。
+    /// 不抛错、不阻塞调用方；后台跑，跑完写 preferredLine。
+    /// 播放器读 preferredLine：首选 memojav 走快路径直拼；首选 nmcorp 先走 loadResource 拿 nmcorp 线。
+    func raceLinesIfNeeded() {
+        guard !didRaceLines else { return }
+        didRaceLines = true
+        Task.detached { [weak self] in
+            guard let self else { return }
+            let winner = await self.runLineRace()
+            self.raceLock.lock()
+            self._preferredLine = winner
+            self.raceLock.unlock()
+        }
+    }
+
+    /// 真正跑竞速：固定验线取样本，并发调 loadResource 解线计时。
+    /// 每样本取第一条能播的线（.m3u8 或 .mp4）定种类；最快的那种线获胜。
+    /// 没样本 / 都解不出 / 种类认不出 → nil（按现有逻辑）。
+    /// 并发跑：两条线同时解，总耗时取最慢的一条，不叠加。
+    private func runLineRace() async -> PreferredLine? {
+        guard let probe = fixedProbeModule() else { return nil }
+        let samples: [VideoItem]
+        do {
+            samples = try await loadList(moduleId: probe.id, page: 1)
+        } catch {
+            return nil
+        }
+        guard !samples.isEmpty else { return nil }
+        var best: (kind: PreferredLine, elapsed: TimeInterval)?
+        await withTaskGroup(of: (PreferredLine, TimeInterval)?.self) { group in
+            for sample in samples {
+                group.addTask {
+                    let start = Date()
+                    let lines = (try? await self.loadResource(link: sample.link, title: sample.title)) ?? []
+                    let elapsed = Date().timeIntervalSince(start)
+                    // 该样本第一条能播的线定种类；种类认不出则这个样本不算
+                    for line in lines {
+                        let lower = line.url.lowercased()
+                        guard !line.url.isEmpty,
+                              lower.contains(".m3u8") || lower.contains(".mp4") else { continue }
+                        if let kind = PlaybackEngine.preferredLineKind(of: line) {
+                            return (kind, elapsed)
+                        }
+                        break
+                    }
+                    return nil
+                }
+            }
+            for await result in group {
+                guard let result else { continue }
+                if best == nil || result.1 < best!.elapsed {
+                    best = result
+                }
+            }
+        }
+        return best?.kind
     }
 
     /// 调指定模块的列表函数，返回视频列表。

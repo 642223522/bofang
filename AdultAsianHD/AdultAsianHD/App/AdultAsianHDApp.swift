@@ -19,6 +19,8 @@ struct AdultAsianHDApp: App {
     /// 外观：0 跟随系统 / 1 浅色 / 2 深色（SettingsView 写入同一 key）。
     @AppStorage("appearanceMode") private var appearanceMode = 0
 
+    @Environment(\.scenePhase) private var scenePhase
+
     var body: some Scene {
         WindowGroup {
             TabView(selection: $tabRouter.selectedTab) {
@@ -55,6 +57,23 @@ struct AdultAsianHDApp: App {
                 : appearanceMode == 2 ? .dark
                 : nil
             )
+            .onAppear {
+                // 启动时：闲置 12 小时一轮轻检 / 7 天一轮深探针（到期才跑）。
+                store.maybeRunAutoCheck()
+            }
+            .onChange(of: scenePhase) { _, newPhase in
+                if newPhase == .active {
+                    // 切回前台：到期就后台自检（闲置时自己跑）。
+                    store.maybeRunAutoCheck()
+                } else if newPhase == .background {
+                    // 进后台：后台自检立刻停，下次断点续跑。
+                    store.cancelAutoCheck()
+                }
+            }
+            .onChange(of: tabRouter.selectedTab) { _, _ in
+                // 切页面：后台自检立刻停（让路），下次断点续跑。
+                store.cancelAutoCheck()
+            }
         }
     }
 }
