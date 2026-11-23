@@ -102,12 +102,20 @@ workflows:
           # 直接在已编好的 .app 上用 PlistBuddy 改最终产物，不依赖构建配置
           # 是否采纳了源码 Info.plist / project.yml 的 INFOPLIST_KEY_*。
           # App 未签名，改 plist 不会破坏签名（安装时由侧载工具重签）。
+          # 版本号只从 project.yml 的 MARKETING_VERSION / CURRENT_PROJECT_VERSION 读，不写死，防漂移。
+          VERSION="$(grep "MARKETING_VERSION" AdultAsianHD/project.yml | grep -oE '1\.[0-9]*\.[0-9]*' | head -1)"
+          BUILD_NUM="$(grep "CURRENT_PROJECT_VERSION" AdultAsianHD/project.yml | grep -oE '[0-9]+' | head -1)"
+          if [ -z "$VERSION" ] || [ -z "$BUILD_NUM" ]; then
+            echo "❌ project.yml 里没找到 MARKETING_VERSION 或 CURRENT_PROJECT_VERSION。"
+            exit 1
+          fi
+          echo "写入版本：$VERSION ($BUILD_NUM)"
           APP_PATH="$CM_BUILD_DIR/build/AdultAsianHD.xcarchive/Products/Applications/$APP_NAME.app"
           PLIST="$APP_PATH/Info.plist"
           /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string 我的私人影院" "$PLIST" 2>/dev/null || \
             /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 我的私人影院" "$PLIST"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 1.0.0" "$PLIST"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion 1" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUM" "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" "$PLIST" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" "$PLIST" 2>/dev/null || \
             /usr/libexec/PlistBuddy -c "Set :NSAppTransportSecurity:NSAllowsArbitraryLoads true" "$PLIST"
@@ -149,13 +157,18 @@ workflows:
             exit 1
           fi
           echo "源码版本（MARKETING_VERSION）：$EXPECTED_VERSION"
-          BIN_VERSIONS="$(grep -a -oE '1\.[0-9]*\.[0-9]*' "$APP_PATH/$APP_NAME" | sort | uniq | tr '\n' ' ')"
-          echo "二进制里的版本串：$BIN_VERSIONS"
-          if ! grep -a -q "$EXPECTED_VERSION" "$APP_PATH/$APP_NAME"; then
-            echo "❌ 二进制里没有源码的版本号 $EXPECTED_VERSION，构建编的是旧代码，停止打包。"
+          # 包里版本号以 Info.plist 为准（上一步 Fix 已按源码版本写好），不再 grep 二进制作门禁：
+          # 版本串只存在 Info.plist 里，不一定出现在二进制中，grep 二进制不可靠；
+          # 且 set -eo pipefail 下 grep 无匹配会直接杀掉脚本、连报错都不打印（构建 #31 就是这么死的）。
+          PLIST_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_PATH/Info.plist" 2>/dev/null || echo MISSING)"
+          echo "包里版本号（Info.plist）：$PLIST_VERSION"
+          if [ "$PLIST_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "❌ 包里版本号 $PLIST_VERSION 与源码 $EXPECTED_VERSION 不一致，停止打包。"
             exit 1
           fi
-          echo "OK：二进制版本与源码一致。"
+          echo "OK：包里版本与源码一致。"
+          echo "--- 二进制里的版本串（仅供参考，不作门禁） ---"
+          grep -a -oE '1\.[0-9]*\.[0-9]*' "$APP_PATH/$APP_NAME" | sort | uniq | tr '\n' ' ' || true
           echo "--- codesign check (expect: not signed) ---"
           if codesign --verify "$APP_PATH" 2>/dev/null; then
             echo "⚠️ 注意：.app 带签名（预期是未签名），继续打包。"
