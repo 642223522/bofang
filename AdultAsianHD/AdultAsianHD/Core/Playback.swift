@@ -97,7 +97,7 @@ final class PlayerViewModel: ObservableObject {
                     return
                 }
                 // 快路径已经失败过了、备线刚到：有没试过的备线就立刻续上
-                if self.status == .failed,
+                if case .failed = self.status,
                    let next = merged.first(where: { !self.failedURLs.contains($0.url) }),
                    let url = URL(string: next.url) {
                     self.currentURL = url
@@ -135,9 +135,8 @@ final class PlayerViewModel: ObservableObject {
 
     /// 播放器出首帧后调（Views 层监听 AVPlayerItem status / 开始播放）。
     func markPlaying() {
-        if status != .failed {
-            status = .playing
-        }
+        if case .failed = status { return }
+        status = .playing
     }
 
     /// 离开详情页即停播：清 URL 与线路，旧的后台备线任务回来也会被 generation 拦住。

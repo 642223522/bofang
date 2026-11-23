@@ -59,7 +59,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return .failure(.unreadable)
         }
-        let validation = WidgetHost.validate(text)
+        let validation = WidgetHost.validate(jsSource: text)
         guard validation.ok, let meta = validation.meta else {
             return .failure(.notModule(validation.error ?? "这个脚本不是 ForwardWidget 模块格式"))
         }

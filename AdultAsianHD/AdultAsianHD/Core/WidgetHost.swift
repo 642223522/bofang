@@ -68,7 +68,9 @@ final class WidgetHost: @unchecked Sendable {
     }
 
     private static func build(jsSource: String) throws -> BuiltHost {
-        let context = JSContext()
+        guard let context = JSContext() else {
+            throw WidgetHostError.invalidFormat("创建 JS 环境失败")
+        }
         let box = ExceptionBox()
         context.exceptionHandler = { _, exception in
             box.message = exception?.toString()
@@ -230,7 +232,9 @@ final class WidgetHost: @unchecked Sendable {
         var headers: [String: String] = ["User-Agent": NetConstants.iPhoneUserAgent]
         if let dict = options?.objectForKeyedSubscript("headers")?.toDictionary() {
             for (key, value) in dict {
-                headers[key] = "\(value)"
+                if let keyString = key as? String {
+                    headers[keyString] = "\(value)"
+                }
             }
         }
         return headers
@@ -475,7 +479,13 @@ final class WidgetHost: @unchecked Sendable {
         if let array = value.toArray() {
             dicts = array.compactMap { $0 as? [String: Any] }
         } else if let single = value.toDictionary() {
-            dicts = [single]
+            var stringDict: [String: Any] = [:]
+            for (key, value) in single {
+                if let keyString = key as? String {
+                    stringDict[keyString] = value
+                }
+            }
+            dicts = [stringDict]
         }
         var lines: [PlayLine] = []
         for dict in dicts {
