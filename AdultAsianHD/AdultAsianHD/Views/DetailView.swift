@@ -3,7 +3,10 @@
 // 点封面进来 onAppear 即调 PlayerViewModel.play(item, host) 自动起播，从 0:00 开始，
 // 不自动续播（新 AVPlayerItem 本来就从 0:00 起）。currentURL 变化由 PlayerView
 // 在 update 时换 item 并 play。播放/暂停、线路切换都直接作用于同一个 AVPlayer。
-// 离开页面 onDisappear 停播（pause + replaceCurrentItem(nil)）。
+// “正在解析播放线路…”只在 status == .loading 时显示，PlayerView 的 coordinator
+// 真监听到出帧（timeControlStatus == .playing）才调 markPlaying() 让它消失，
+// 不再等后台 loadResource。离开页面 onDisappear 停播（pause + replaceCurrentItem(nil)
+// + playerVM.stop()，迟到的备线也被 generation 拦住）。
 // 失败时红字显示 failureReason。下载：m3u8 走 downloadHLS，mp4 走 downloadMP4。
 
 import AVKit
@@ -18,7 +21,12 @@ struct DetailView: View {
     @EnvironmentObject private var downloader: Downloader
 
     @StateObject private var playerVM = PlayerViewModel()
-    @State private var player = AVPlayer()
+    @State private var player: AVPlayer = {
+        let player = AVPlayer()
+        // 起播不等攒缓冲：有首帧就播，不等 forward buffer 攒满（慢首帧的主因之一）。
+        player.automaticallyWaitsToMinimizeStalling = false
+        return player
+    }()
     @State private var isPlaying = false
     @State private var downloadAlertMessage: String?
     @State private var showDownloadAlert = false
@@ -26,7 +34,7 @@ struct DetailView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                PlayerView(player: player, url: playerVM.currentURL)
+                PlayerView(player: player, url: playerVM.currentURL, headers: playerVM.currentHeaders, viewModel: playerVM)
                     .aspectRatio(16.0 / 9.0, contentMode: .fit)
                     .background(Color.black)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -109,6 +117,7 @@ struct DetailView: View {
         .onDisappear {
             player.pause()
             player.replaceCurrentItem(with: nil)
+            playerVM.stop()
             isPlaying = false
         }
         .alert("下载", isPresented: $showDownloadAlert) {

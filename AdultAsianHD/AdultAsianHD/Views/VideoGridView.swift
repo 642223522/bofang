@@ -10,8 +10,10 @@ struct VideoGridView: View {
     enum LoadMode {
         /// 模块列表：调 host.loadList(moduleId:page:)。
         case module(id: String)
-        /// 分类：调 host.loadCategoryVideos(categoryId:categoryName:page:)。
-        case category(id: String, name: String)
+        /// 分类：调 host.loadCategoryVideos(categoryId:categoryName:page:siteHost:categorySlug:)。
+        /// 直接带分类项（打分、取编号、取域名、取 slug 都从它身上取），
+        /// 分类链接绝不送进 loadResource。
+        case category(item: VideoItem)
     }
 
     let host: WidgetHost
@@ -43,7 +45,7 @@ struct VideoGridView: View {
                             LazyVGrid(columns: columns(for: geometry.size.width), spacing: 16) {
                                 ForEach(items) { item in
                                     NavigationLink {
-                                        DetailView(item: item, host: host, sourceId: sourceId)
+                                        destination(for: item)
                                     } label: {
                                         VideoCard(item: item, sourceId: sourceId)
                                     }
@@ -83,6 +85,19 @@ struct VideoGridView: View {
             if items.isEmpty {
                 await reload()
             }
+        }
+    }
+
+    // MARK: - 跳转：分类项进分类列表页，视频项进详情页
+
+    /// 分类项只是个跳转桩：点它进 CategoryListView 加载该分类的视频，
+    /// 绝不把分类链接送进 loadResource（模块会返回“无可用播放源”）。
+    @ViewBuilder
+    private func destination(for item: VideoItem) -> some View {
+        if host.isCategoryItem(item) {
+            CategoryListView(categoryItem: item, host: host, sourceId: sourceId)
+        } else {
+            DetailView(item: item, host: host, sourceId: sourceId)
         }
     }
 
@@ -153,8 +168,14 @@ struct VideoGridView: View {
                 switch mode {
                 case .module(let id):
                     fetched = try await host.loadList(moduleId: id, page: page)
-                case .category(let id, let name):
-                    fetched = try await host.loadCategoryVideos(categoryId: id, categoryName: name, page: page)
+                case .category(let item):
+                    fetched = try await host.loadCategoryVideos(
+                        categoryId: item.categoryNumericId ?? item.id,
+                        categoryName: item.categoryNameWithoutCount,
+                        page: page,
+                        siteHost: item.siteHost,
+                        categorySlug: item.categorySlug
+                    )
                 }
             }
             if append {
@@ -168,5 +189,25 @@ struct VideoGridView: View {
             errorMessage = "加载失败：\(error.localizedDescription)"
         }
         isLoading = false
+    }
+}
+
+// MARK: - 分类列表页
+
+/// 分类列表页：点分类项进来，只加载该分类下的视频。
+/// 复用 VideoGridView（分页 / 下拉刷新 / 滚动恢复都一样），
+/// 取列表走 host.loadCategoryVideos（先请求拦截，不行再直调 WP REST）。
+struct CategoryListView: View {
+    let categoryItem: VideoItem
+    let host: WidgetHost
+    let sourceId: String
+
+    var body: some View {
+        VideoGridView(
+            host: host,
+            mode: .category(item: categoryItem),
+            title: categoryItem.title,
+            sourceId: sourceId
+        )
     }
 }

@@ -16,6 +16,8 @@ final class WidgetHost: @unchecked Sendable {
 
     private let context: JSContext
     private let exceptionBox: ExceptionBox
+    /// 分类请求拦截器（一个 host 一个，跟着它自己的 JSContext 走）。
+    private let requestInterceptor: CategoryRequestInterceptor
 
     enum WidgetHostError: Error, LocalizedError {
         case invalidFormat(String)
@@ -45,6 +47,7 @@ final class WidgetHost: @unchecked Sendable {
         self.meta = built.meta
         self.modules = built.modules
         self.exceptionBox = built.exceptionBox
+        self.requestInterceptor = built.requestInterceptor
     }
 
     private struct BuiltHost {
@@ -52,6 +55,7 @@ final class WidgetHost: @unchecked Sendable {
         let meta: WidgetMeta
         let modules: [ModuleDescriptor]
         let exceptionBox: ExceptionBox
+        let requestInterceptor: CategoryRequestInterceptor
     }
 
     private static func buildOnMainThread(jsSource: String) throws -> BuiltHost {
@@ -76,7 +80,8 @@ final class WidgetHost: @unchecked Sendable {
             box.message = exception?.toString()
         }
 
-        installWidgetBridge(in: context)
+        let interceptor = CategoryRequestInterceptor()
+        installWidgetBridge(in: context, interceptor: interceptor)
 
         context.evaluateScript(jsSource)
         if let message = box.message, !message.isEmpty {
@@ -100,7 +105,9 @@ final class WidgetHost: @unchecked Sendable {
             title: metaTitle,
             description: metaDict["description"] as? String ?? "",
             version: metaDict["version"] as? String ?? "1.0.0",
-            searchFunctionName: searchDict?["functionName"] as? String
+            searchFunctionName: searchDict?["functionName"] as? String,
+            author: (metaDict["author"] as? String)?.nilIfEmpty,
+            site: siteString(from: metaDict)
         )
 
         // 取 JS_MODULES
@@ -130,14 +137,24 @@ final class WidgetHost: @unchecked Sendable {
             throw WidgetHostError.invalidFormat("这个脚本的模块清单是空的，没有可用的功能")
         }
 
-        return BuiltHost(context: context, meta: meta, modules: modules, exceptionBox: box)
+        return BuiltHost(context: context, meta: meta, modules: modules, exceptionBox: box, requestInterceptor: interceptor)
+    }
+
+    /// 站点字段有多个叫法（site / siteUrl / homepage），哪个有取哪个；都没有或为空就 nil。
+    private static func siteString(from metaDict: [String: Any]) -> String? {
+        for key in ["site", "siteUrl", "homepage"] {
+            if let value = metaDict[key] as? String, !value.isEmpty {
+                return value
+            }
+        }
+        return nil
     }
 
     // MARK: - Widget 桥接
 
     /// 注入全局 Widget 对象：Widget.http.get / Widget.storage.get / set，
     /// 再加一个空的 console.log（有的模块会 log，没它会报异常）。
-    private static func installWidgetBridge(in context: JSContext) {
+    private static func installWidgetBridge(in context: JSContext, interceptor: CategoryRequestInterceptor) {
         let widget = JSValue(newObjectIn: context)!
         let http = JSValue(newObjectIn: context)!
         let storage = JSValue(newObjectIn: context)!
@@ -151,7 +168,7 @@ final class WidgetHost: @unchecked Sendable {
                 // JS 正在执行时 context 不可能已释放；这行理论上走不到。
                 fatalError("WidgetHost: JSContext 已释放，无法发起请求")
             }
-            return makeHttpGetPromise(in: context, urlString: urlString, options: options)
+            return makeHttpGetPromise(in: context, urlString: urlString, options: options, interceptor: interceptor)
         }
         http.setValue(httpGet, forProperty: "get")
         widget.setValue(http, forProperty: "http")
@@ -189,7 +206,7 @@ final class WidgetHost: @unchecked Sendable {
     /// 从 context 取 Promise 构造器，用 executor block 造一个 JS Promise。
     /// executor 被 Promise 构造器同步调用，交出 resolve/reject；
     /// Swift 拿着它们去后台发请求，完事回主线程结算。
-    private static func makeHttpGetPromise(in context: JSContext, urlString: String, options: JSValue?) -> JSValue {
+    private static func makeHttpGetPromise(in context: JSContext, urlString: String, options: JSValue?, interceptor: CategoryRequestInterceptor) -> JSValue {
         guard let promiseConstructor = context.objectForKeyedSubscript("Promise"),
               !promiseConstructor.isUndefined else {
             fatalError("WidgetHost: JS 环境里没有 Promise")
@@ -197,11 +214,14 @@ final class WidgetHost: @unchecked Sendable {
         // headers 在 executor 里同步抠出来（当时还在主线程），Task 只带纯 Swift 值走，
         // resolve/reject 装进 Sendable 盒子带进 Task（JSValue 本身不是 Sendable）。
         let headers = headers(from: options)
+        // 分类拦截：武装窗口内、且是同源 WP 帖子请求时，改成带 categories=<id> 的 URL；
+        // 不命中返回原 URL。改写在发请求前同步完成（JS 调 http.get 时还在主线程）。
+        let effectiveURL = interceptor.rewrittenURL(for: urlString) ?? urlString
         let executor: @convention(block) (JSValue, JSValue) -> Void = { resolve, reject in
             let box = JSCallbackBox(resolve: resolve, reject: reject)
             Task {
                 do {
-                    let (status, data) = try await Self.fetchHTTP(urlString: urlString, headers: headers)
+                    let (status, data) = try await Self.fetchHTTP(urlString: effectiveURL, headers: headers)
                     await MainActor.run {
                         guard let ctx = box.resolve.context else { return }
                         let result = JSValue(newObjectIn: ctx)!
@@ -270,6 +290,16 @@ final class WidgetHost: @unchecked Sendable {
 
     // MARK: - 对外接口
 
+    /// 当前模块的分类识别规则（按 WidgetMeta.id 配，没配的用默认）。
+    var categoryRule: CategoryDetectionRule {
+        CategoryDetectionRules.rule(forModuleId: meta.id)
+    }
+
+    /// 宿主侧打分判断：这项是不是分类（跳转桩），而不是视频。
+    func isCategoryItem(_ item: VideoItem) -> Bool {
+        item.isCategory(under: categoryRule)
+    }
+
     /// 调指定模块的列表函数，返回视频列表。
     func loadList(moduleId: String, page: Int) async throws -> [VideoItem] {
         guard let module = modules.first(where: { $0.id == moduleId }) else {
@@ -304,19 +334,51 @@ final class WidgetHost: @unchecked Sendable {
         return try parseVideoItems(result)
     }
 
-    /// 尽力而为：模块全局有 fetchPosts 就直接调它
-    /// `fetchPosts("categories=<id>&page=<page>", "cat", <name>)`（pornjav.js 有这个函数）；
-    /// 没有就 throw，调用方显示“该分类暂不支持浏览”。
-    func loadCategoryVideos(categoryId: String, categoryName: String, page: Int) async throws -> [VideoItem] {
-        let hasFetchPosts = await MainActor.run {
-            guard let fn = context.objectForKeyedSubscript("fetchPosts") else { return false }
-            return !fn.isUndefined && !fn.isNull
+    /// 取某分类下的视频。模块零改动，宿主侧两条路（按顺序）：
+    /// (1) 请求拦截：调模块的 latest 列表，桥里把模块发出的同源 /wp-json/wp/v2/posts
+    ///     请求改成带 &categories=<id>，模块照原样返回视频；只作用于这一次调用，
+    ///     调用完立即撤掉；拦截没命中（模块没发这类请求）或没返回视频就走 (2)。
+    /// (2) 直调 WP REST：GET /wp-json/wp/v2/posts?categories=<id>&per_page=20&page=<n>&_embed=1，
+    ///     映射成 VideoItem；点视频时把帖子链接交回现有的 loadResource 解析播放。
+    /// 分类链接绝不送进 loadResource。
+    /// categoryId 是数字编号或 "pornjav-cat-33" 这类原始 id；siteHost / categorySlug
+    /// 没有时对应路径自动跳过（拦截要求同源、直调要求域名）。
+    func loadCategoryVideos(categoryId: String, categoryName: String, page: Int, siteHost: String? = nil, categorySlug: String? = nil) async throws -> [VideoItem] {
+        let numericId = VideoItem.numericId(from: categoryId)
+        let apiHost = siteHost.map { Self.stripWWWPrefix($0) }
+
+        // (1) 请求拦截：调模块 latest，桥里改写它发出的 WP 帖子请求
+        if let numericId, let apiHost, let latest = latestListModule() {
+            let token = requestInterceptor.arm(siteHost: apiHost, categoryId: numericId)
+            do {
+                let result = try await callFunction(latest.functionName, params: buildParams(for: latest, page: page, inputs: [:]))
+                let items = try parseVideoItems(result)
+                let hit = requestInterceptor.didRewrite(token: token)
+                requestInterceptor.disarm(token: token)
+                if hit && !items.isEmpty {
+                    return items
+                }
+                // 拦截命中但返回空，或没命中：都继续走直调 WP REST（真空还是假空由它判定）
+            } catch is CancellationError {
+                requestInterceptor.disarm(token: token)
+                throw
+            } catch {
+                requestInterceptor.disarm(token: token)
+                // 模块这条路抛错也继续走直调；直调再失败才报
+            }
         }
-        guard hasFetchPosts else {
-            throw WidgetHostError.functionMissing("该分类暂不支持浏览")
+
+        // (2) 直调 WP REST：有数字编号直接查帖子
+        if let numericId, let apiHost {
+            return try await fetchCategoryPostsDirect(siteHost: apiHost, categoryId: numericId, categoryName: categoryName, page: page)
         }
-        let result = try await callFunction("fetchPosts", args: ["categories=\(categoryId)&page=\(page)", "cat", categoryName])
-        return try parseVideoItems(result)
+        // 没数字编号时按 slug 查分类拿 id 再查帖子
+        if let apiHost, let slug = categorySlug, !slug.isEmpty,
+           let resolved = try? await resolveWordPressCategoryId(siteHost: apiHost, slug: slug) {
+            return try await fetchCategoryPostsDirect(siteHost: apiHost, categoryId: resolved, categoryName: categoryName, page: page)
+        }
+
+        throw WidgetHostError.functionMissing("该分类暂不支持浏览")
     }
 
     /// 导入时做格式校验：新建一个临时 WidgetHost（只 evaluate + 取元数据，不发请求）。
@@ -328,6 +390,167 @@ final class WidgetHost: @unchecked Sendable {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             return (false, nil, message)
         }
+    }
+
+    // MARK: - 内部：分类取列表（拦截 + 直调 WP REST）
+
+    /// 找“最新”列表模块：params 里 kind 常量是 "latest" 的那个。
+    /// 拦截路径调它（loadList kind=latest），桥里改写它发出的 WP 帖子请求。
+    private func latestListModule() -> ModuleDescriptor? {
+        modules.first { module in
+            module.params.contains { param in
+                (param["name"] as? String) == "kind"
+                && (param["type"] as? String) == "constant"
+                && (param["value"] as? String) == "latest"
+            }
+        }
+    }
+
+    /// 直调 WP REST 取某分类的帖子，映射成 VideoItem。
+    /// 标题 HTML 解码、链接用帖子原链接、封面用 _embedded wp:featuredmedia[0].source_url、
+    /// category 字段用分类名；点视频时把帖子链接交回现有的 loadResource 解析播放。
+    private func fetchCategoryPostsDirect(siteHost: String, categoryId: String, categoryName: String, page: Int) async throws -> [VideoItem] {
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = siteHost
+        components.path = "/wp-json/wp/v2/posts"
+        components.queryItems = [
+            URLQueryItem(name: "categories", value: categoryId),
+            URLQueryItem(name: "per_page", value: "20"),
+            URLQueryItem(name: "page", value: "\(page)"),
+            URLQueryItem(name: "_embed", value: "1"),
+        ]
+        guard let url = components.url else {
+            throw WidgetHostError.callFailed("分类地址拼不出来")
+        }
+        let (status, items) = try await fetchWordPressArray(url: url)
+        guard status == 200 else {
+            if status == 400 { return [] } // 页码超出总页数：WP 用 400 表示没更多了
+            throw WidgetHostError.callFailed("分类加载失败（HTTP \(status)）")
+        }
+        guard let items else {
+            throw WidgetHostError.unexpectedResult("分类返回的不是帖子列表")
+        }
+        return items.compactMap { wordpressPostToVideoItem($0, categoryName: categoryName) }
+    }
+
+    /// 直调 WP REST 时没有数字编号：先按 slug 查分类拿 id。
+    private func resolveWordPressCategoryId(siteHost: String, slug: String) async throws -> String? {
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = siteHost
+        components.path = "/wp-json/wp/v2/categories"
+        components.queryItems = [URLQueryItem(name: "slug", value: slug)]
+        guard let url = components.url else { return nil }
+        let (status, items) = try await fetchWordPressArray(url: url)
+        guard status == 200, let first = items?.first else { return nil }
+        if let id = first["id"] as? Int { return "\(id)" }
+        if let idString = first["id"] as? String, !idString.isEmpty { return idString }
+        return nil
+    }
+
+    /// 直调 WP REST 的通用 GET：返回 (status, JSON 数组或 nil)。
+    /// 传输失败时 throw；HTTP 状态码原样返回，由调用方判定。
+    private func fetchWordPressArray(url: URL) async throws -> (status: Int, items: [[String: Any]]?) {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 30
+        request.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (raw, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let items = try? JSONSerialization.jsonObject(with: raw) as? [[String: Any]]
+        return (status, items)
+    }
+
+    /// 一篇 WP 帖子 → VideoItem（直调路径用）。标题为空或链接为空的帖子跳过。
+    private func wordpressPostToVideoItem(_ post: [String: Any], categoryName: String) -> VideoItem? {
+        guard let link = post["link"] as? String, !link.isEmpty else { return nil }
+        let rawTitle = (post["title"] as? [String: Any])?["rendered"] as? String ?? ""
+        let title = Self.htmlDecoded(rawTitle).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return nil }
+        var cover: String? = nil
+        if let embedded = post["_embedded"] as? [String: Any],
+           let media = embedded["wp:featuredmedia"] as? [[String: Any]],
+           let first = media.first,
+           let source = first["source_url"] as? String, !source.isEmpty {
+            cover = source
+        }
+        return VideoItem(
+            id: link,
+            title: title,
+            link: link,
+            coverURL: cover,
+            description: "",
+            category: categoryName
+        )
+    }
+
+    /// WP 标题里的 HTML 实体解码（&amp; &#123; &#x1F; 这类），顺手去掉残留标签。
+    private static func htmlDecoded(_ raw: String) -> String {
+        var out = ""
+        out.reserveCapacity(raw.count)
+        var i = raw.startIndex
+        while i < raw.endIndex {
+            let ch = raw[i]
+            if ch == "<" {
+                if let gt = raw[i...].firstIndex(of: ">") {
+                    i = raw.index(after: gt)
+                    continue
+                }
+                out.append(ch)
+                i = raw.index(after: i)
+                continue
+            }
+            if ch == "&" {
+                let tail = raw[i...]
+                if let semi = tail.firstIndex(of: ";"),
+                   tail.distance(from: tail.startIndex, to: semi) <= 9 {
+                    let body = String(tail[tail.index(after: tail.startIndex)..<semi])
+                    if let decoded = decodeHTMLEntity(body) {
+                        out.append(decoded)
+                        i = raw.index(after: semi)
+                        continue
+                    }
+                }
+                out.append(ch)
+                i = raw.index(after: i)
+                continue
+            }
+            out.append(ch)
+            i = raw.index(after: i)
+        }
+        return out
+    }
+
+    /// 单个 HTML 实体 → 字符；不认识的返回 nil（调用方原样保留 "&..."）。
+    private static func decodeHTMLEntity(_ body: String) -> String? {
+        switch body {
+        case "amp": return "&"
+        case "quot": return "\""
+        case "apos", "#39": return "'"
+        case "lt": return "<"
+        case "gt": return ">"
+        case "nbsp": return " "
+        default:
+            if body.hasPrefix("#x") || body.hasPrefix("#X") {
+                if let code = UInt32(String(body.dropFirst(2)), radix: 16),
+                   let scalar = Unicode.Scalar(code) {
+                    return String(Character(scalar))
+                }
+            } else if body.hasPrefix("#") {
+                if let code = UInt32(String(body.dropFirst())),
+                   let scalar = Unicode.Scalar(code) {
+                    return String(Character(scalar))
+                }
+            }
+            return nil
+        }
+    }
+
+    /// 去掉 host 前的 www.（pornjav 的 API 在 apex 域名，分类链接可能是 www）。
+    private static func stripWWWPrefix(_ host: String) -> String {
+        host.lowercased().hasPrefix("www.") ? String(host.dropFirst(4)) : host
     }
 
     // MARK: - 内部：调函数与 Promise 桥接
@@ -548,6 +771,62 @@ private final class PromiseCallbacks: @unchecked Sendable {
          rejected: @escaping @convention(block) (JSValue) -> Void) {
         self.fulfilled = fulfilled
         self.rejected = rejected
+    }
+}
+
+/// 分类请求拦截：一次性的 URL 改写。
+/// 点分类时武装（arm），调模块 latest 期间，桥里把模块发出的同源
+/// /wp-json/wp/v2/posts 请求改成带 categories=<id>；调用完立即撤掉（disarm）。
+/// 只改这一次调用、只匹配帖子列表路径、只同源（模块站点域名，www. 前缀不计）。
+/// 线程安全（NSLock）；token 防止并发调用互相撤掉对方的武装。
+private final class CategoryRequestInterceptor: @unchecked Sendable {
+    private let lock = NSLock()
+    private var armed: (token: UUID, siteHost: String, categoryId: String)?
+    private var rewroteTokens: Set<UUID> = []
+
+    func arm(siteHost: String, categoryId: String) -> UUID {
+        let token = UUID()
+        lock.lock()
+        armed = (token, siteHost, categoryId)
+        lock.unlock()
+        return token
+    }
+
+    func disarm(token: UUID) {
+        lock.lock()
+        if armed?.token == token { armed = nil }
+        lock.unlock()
+    }
+
+    /// 本次武装窗口内是否改写过至少一个请求（判断拦截是否命中）；读一次即清掉记录。
+    func didRewrite(token: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return rewroteTokens.remove(token) != nil
+    }
+
+    /// 命中返回改写后的 URL，不命中返回 nil（调用方用原 URL）。
+    func rewrittenURL(for urlString: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let armed else { return nil }
+        guard let url = URL(string: urlString),
+              let host = url.host,
+              Self.sameSite(host, armed.siteHost),
+              url.path == "/wp-json/wp/v2/posts",
+              !urlString.contains("categories=") else { return nil }
+        let separator = urlString.contains("?") ? "&" : "?"
+        let rewritten = urlString + separator + "categories=" + armed.categoryId
+        rewroteTokens.insert(armed.token)
+        return rewritten
+    }
+
+    private static func sameSite(_ host: String, _ siteHost: String) -> Bool {
+        stripWWW(host.lowercased()) == stripWWW(siteHost.lowercased())
+    }
+
+    private static func stripWWW(_ host: String) -> String {
+        host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
     }
 }
 

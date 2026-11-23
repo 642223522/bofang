@@ -1,7 +1,8 @@
 // HomeView.swift — 主页（v2 重建，照 LAYOUT.md）
 // 按国家分框：每国一个圆角框（圆角 12，浅底 + 细边框），框内上下滑动；
-// 框内每行 2 个源（折叠屏按宽度算列：宽 < 500 用 2 列，否则 4 列，最少 2 列），
-// 行高 56pt，源名单行截断，初显 3 排，框高 216pt，超出框内滚动。
+// 框内源名排成格子：窄屏（宽 < 500）2 列、宽屏 4 列，GeometryReader 取实际宽度，
+// 折叠/展开时立即重排；每个源名是一个圆角芯片（圆角 10，自适应底色 + 细边框），
+// 文字居中、单行截断，行高 56pt，初显 3 排，框高 216pt，超出框内滚动。
 // 无轮播、无最新/热门行、无「亚洲高清无码」标题。
 // 点源名 → SourceDetailView。无源时空态：「还没有源」+「去导入源」跳源 Tab。
 
@@ -75,9 +76,15 @@ struct HomeView: View {
                                 .font(.subheadline)
                                 .lineLimit(1)
                                 .truncationMode(.tail)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .frame(height: 56)
-                                .padding(.horizontal, 4)
+                                .multilineTextAlignment(.center)
+                                .frame(maxWidth: .infinity, minHeight: 56, alignment: .center)
+                                .padding(.horizontal, 8)
+                                .background(Color(.tertiarySystemBackground))
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10)
+                                        .stroke(Color(.separator), lineWidth: 0.5)
+                                )
                         }
                         .buttonStyle(.plain)
                     }

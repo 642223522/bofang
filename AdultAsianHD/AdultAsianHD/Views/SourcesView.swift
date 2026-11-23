@@ -41,10 +41,6 @@ struct SourcesView: View {
     @State private var showSyncSheet = false
     @State private var giteeToken = ""
 
-    /// 上次码云同步时间（存时间戳；0 = 从未同步）。
-    @AppStorage("giteeLastSyncInterval") private var lastSyncInterval: Double = 0
-    /// 上次码云同步的源数量。
-    @AppStorage("giteeLastSyncCount") private var lastSyncCount: Int = 0
     /// 当前源 id（同步后首个源自动设为当前）。
     @AppStorage("currentSourceId") private var currentSourceId = ""
 
@@ -55,6 +51,10 @@ struct SourcesView: View {
                     .padding()
 
                 syncInfoRow
+                    .padding(.horizontal)
+                    .padding(.bottom, 8)
+
+                checkRow
                     .padding(.horizontal)
                     .padding(.bottom, 8)
 
@@ -76,7 +76,7 @@ struct SourcesView: View {
         }
         .navigationTitle("源")
         .navigationBarTitleDisplayMode(.inline)
-        .alert("导入", isPresented: $showAlert) {
+        .alert("提示", isPresented: $showAlert) {
             Button("好", role: .cancel) {}
         } message: {
             Text(alertMessage)
@@ -109,7 +109,8 @@ struct SourcesView: View {
             .buttonStyle(.bordered)
 
             Button {
-                giteeToken = ""
+                // 打开同步表单时把 Keychain 里存过的 Token 预填进密文框。
+                giteeToken = store.loadSavedGiteeToken() ?? ""
                 showSyncSheet = true
             } label: {
                 Label("码云同步", systemImage: "arrow.triangle.2.circlepath")
@@ -129,13 +130,90 @@ struct SourcesView: View {
     }
 
     private var lastSyncText: String {
-        guard lastSyncInterval > 0 else { return "从未同步" }
-        let date = Date(timeIntervalSince1970: lastSyncInterval)
+        guard let date = store.lastSyncAt else { return "从未同步" }
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
         formatter.locale = Locale(identifier: "zh_CN")
         return formatter.string(from: date)
+    }
+
+    /// 自检失败的源个数（上传按钮角标与可用状态用）。
+    private var failedCheckCount: Int {
+        store.checkResults.values.filter { $0.status == .failed }.count
+    }
+
+    // MARK: - 自检 / 上传坏模块操作行
+
+    private var checkRow: some View {
+        HStack(spacing: 12) {
+            Button {
+                checkAll()
+            } label: {
+                Label("自检全部", systemImage: "stethoscope")
+            }
+            .buttonStyle(.bordered)
+            .disabled(store.sources.isEmpty)
+
+            Button {
+                uploadBroken()
+            } label: {
+                Label("上传坏的模块\(failedCheckCount > 0 ? "（\(failedCheckCount)）" : "")", systemImage: "arrow.up.doc")
+            }
+            .buttonStyle(.bordered)
+            .disabled(failedCheckCount == 0)
+
+            Spacer()
+        }
+    }
+
+    private func checkAll() {
+        isReading = true
+        readingLabel = "正在自检全部源…"
+        Task {
+            let (ok, failed) = await store.runCheckAll()
+            isReading = false
+            showResultAlert("自检完成：\(ok) 个正常，\(failed) 个失败")
+        }
+    }
+
+    private func uploadBroken() {
+        isReading = true
+        readingLabel = "正在上传坏的模块…"
+        Task {
+            // 传空串：store 里先用 Keychain 存过的 Token，没有才报错。
+            let result = await store.uploadBrokenSources(token: giteeToken)
+            isReading = false
+            switch result {
+            case .success(let count):
+                showResultAlert("已上传 \(count) 个坏的模块到码云 broken 分支")
+            case .failure(let error):
+                showResultAlert(error.localizedDescription)
+            }
+        }
+    }
+
+    /// 列表行里的自检状态：正常（绿）/ 失败（红，带第一条原因）/ 未自检（灰）。
+    @ViewBuilder
+    private func checkStatusLine(for source: SourceRecord) -> some View {
+        if let result = store.checkResults[source.id] {
+            switch result.status {
+            case .ok:
+                Text("自检正常" + (result.checkedAt.map { " · \($0.formatted(date: .numeric, time: .short))" } ?? ""))
+                    .font(.caption)
+                    .foregroundColor(.green)
+            case .failed:
+                let first = result.failedLines.sorted(by: { $0.key < $1.key }).first
+                Text("自检失败：" + (first.map { "\($0.key)：\($0.value)" } ?? ""))
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .lineLimit(1)
+            }
+        } else {
+            Text("未自检")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
     }
 
     // MARK: - 源列表
@@ -176,6 +254,7 @@ struct SourcesView: View {
                                                 .foregroundColor(.accentColor)
                                         }
                                     }
+                                    checkStatusLine(for: source)
                                 }
                             }
                             .buttonStyle(.plain)
@@ -364,11 +443,8 @@ struct SourcesView: View {
     }
 
     private func syncFromGitee() {
+        // Token 为空也照常调：store 里先用 Keychain 存过的，两个都没有才报错。
         let token = giteeToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !token.isEmpty else {
-            showResultAlert("请先输入 Gitee token。")
-            return
-        }
         showSyncSheet = false
         isReading = true
         readingLabel = "正在从码云同步…"
@@ -377,8 +453,6 @@ struct SourcesView: View {
             isReading = false
             switch result {
             case .success(let count):
-                lastSyncInterval = Date().timeIntervalSince1970
-                lastSyncCount = count
                 if let first = store.sources.first {
                     currentSourceId = first.id
                 }

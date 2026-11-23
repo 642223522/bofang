@@ -14,23 +14,32 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     @Published private(set) var sources: [SourceRecord] = []
     /// 上次码云同步成功的时间（存 UserDefaults，源页显示用）
     @Published private(set) var lastSyncAt: Date?
+    /// 自检结果：[源 id: 结果]，持久化在 Documents/check-results.json
+    /// （与 sources.json 分开，不动 SourceRecord）。
+    @Published private(set) var checkResults: [String: SourceCheckResult] = []
 
     private let fileManager = FileManager.default
     private let sourcesDirectory: URL
     private let manifestURL: URL
+    private let checkResultsURL: URL
 
     private let giteeTokenKey = "gitee.token"
     private let lastSyncDefaultsKey = "gitee.lastSyncAt"
+    /// 码云仓库与坏模块分支：上传只动 broken 分支，绝不动 js 分支。
+    private let giteeRepo = "individual-freedom/ziyong-ziliao-beifang"
+    private let brokenBranch = "broken"
 
     init() {
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         self.sourcesDirectory = documents.appendingPathComponent("Sources", isDirectory: true)
         self.manifestURL = documents.appendingPathComponent("sources.json")
+        self.checkResultsURL = documents.appendingPathComponent("check-results.json")
         try? fileManager.createDirectory(at: sourcesDirectory, withIntermediateDirectories: true)
         if let timestamp = UserDefaults.standard.object(forKey: lastSyncDefaultsKey) as? TimeInterval {
             self.lastSyncAt = Date(timeIntervalSince1970: timestamp)
         }
         loadManifest()
+        loadCheckResults()
     }
 
     // MARK: - 清单读写
@@ -116,12 +125,14 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
 
     // MARK: - 删除 / 导出 / 取用
 
-    /// 删文件 + 清单。文件删不掉也不报错，清单照样清。
+    /// 删文件 + 清单 + 该源的自检记录。文件删不掉也不报错，清单照样清。
     func delete(_ source: SourceRecord) {
         try? fileManager.removeItem(at: sourcesDirectory.appendingPathComponent(source.fileName))
         let update = {
             self.sources.removeAll { $0.fileName == source.fileName }
             self.saveManifest()
+            self.checkResults.removeValue(forKey: source.id)
+            self.saveCheckResults()
         }
         if Thread.isMainThread {
             update()
@@ -257,6 +268,334 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         return .success(imported)
     }
 
+    /// 读 Keychain 里存过的 Gitee Token（同步表单预填 / 上传坏模块用）。
+    func loadSavedGiteeToken() -> String? {
+        KeychainHelper.load(forKey: giteeTokenKey)
+    }
+
+    // MARK: - 自检（固定验线探针）
+
+    /// 自检结果持久化：Documents/check-results.json。
+    private func loadCheckResults() {
+        guard let data = try? Data(contentsOf: checkResultsURL),
+              let decoded = try? JSONDecoder().decode([String: SourceCheckResult].self, from: data) else {
+            self.checkResults = [:]
+            return
+        }
+        self.checkResults = decoded
+    }
+
+    private func saveCheckResults() {
+        guard let data = try? JSONEncoder().encode(checkResults) else { return }
+        try? data.write(to: checkResultsURL, options: .atomic)
+    }
+
+    private func storeCheckResult(_ result: SourceCheckResult, for sourceId: String) async {
+        await MainActor.run {
+            self.checkResults[sourceId] = result
+            self.saveCheckResults()
+        }
+    }
+
+    /// 固定验线模块：params 里 kind 常量为 "fixed" 的那个；
+    /// 兜底：id 或标题含 "fixed" / "固定验线"。
+    /// pornjav.js 里就是 id "pornjav-fixed"、kind 常量 "fixed"，
+    /// 返回两个固定样本 JUQ-984（nmcorp 线）＋ ATID-686（memojav 线）。
+    private func fixedProbeModule(in host: WidgetHost) -> ModuleDescriptor? {
+        host.modules.first { module in
+            module.params.contains { param in
+                (param["name"] as? String) == "kind"
+                && (param["type"] as? String) == "constant"
+                && (param["value"] as? String) == "fixed"
+            }
+        } ?? host.modules.first { module in
+            module.id.lowercased().contains("fixed")
+            || module.title.contains("固定验线")
+        }
+    }
+
+    /// 对单个源跑自检：固定验线取样本，各调 loadResource 看能否解出可播 URL
+    /// （.m3u8 或 .mp4）。结果写入 checkResults 并持久化。
+    func runCheck(for source: SourceRecord) async -> SourceCheckResult {
+        let result: SourceCheckResult
+        do {
+            let host = try loadHost(for: source)
+            guard let probe = fixedProbeModule(in: host) else {
+                result = SourceCheckResult(
+                    status: .failed,
+                    failedLines: ["固定验线": "这个源没有固定验线模块"],
+                    checkedAt: Date()
+                )
+                await storeCheckResult(result, for: source.id)
+                return result
+            }
+            let samples = try await host.loadList(moduleId: probe.id, page: 1)
+            guard !samples.isEmpty else {
+                result = SourceCheckResult(
+                    status: .failed,
+                    failedLines: ["固定验线": "固定验线没有返回样本"],
+                    checkedAt: Date()
+                )
+                await storeCheckResult(result, for: source.id)
+                return result
+            }
+            var failedLines: [String: String] = [:]
+            for item in samples {
+                do {
+                    let lines = try await host.loadResource(link: item.link, title: item.title)
+                    let playable = lines.contains { line in
+                        let lower = line.url.lowercased()
+                        return lower.contains(".m3u8") || lower.contains(".mp4")
+                    }
+                    if !playable {
+                        failedLines[item.title] = "没解出可播地址"
+                    }
+                } catch {
+                    failedLines[item.title] = error.localizedDescription
+                }
+            }
+            result = SourceCheckResult(
+                status: failedLines.isEmpty ? .ok : .failed,
+                failedLines: failedLines,
+                checkedAt: Date()
+            )
+        } catch {
+            result = SourceCheckResult(
+                status: .failed,
+                failedLines: ["加载源": error.localizedDescription],
+                checkedAt: Date()
+            )
+        }
+        await storeCheckResult(result, for: source.id)
+        return result
+    }
+
+    /// 逐个自检全部源（串行：JSContext 与网络都怕并发冲；
+    /// 单个源最慢约两条线各 30 秒超时）。返回（正常数，失败数）。
+    func runCheckAll() async -> (ok: Int, failed: Int) {
+        var ok = 0
+        var failed = 0
+        let all = await MainActor.run { self.sources }
+        for source in all {
+            let result = await runCheck(for: source)
+            if result.status == .ok { ok += 1 } else { failed += 1 }
+        }
+        return (ok, failed)
+    }
+
+    // MARK: - 上传坏的模块（broken 分支）
+
+    /// 自检失败的源：把 .js 与失败报告传到码云 broken 分支。
+    /// 只动 broken 分支，绝不动 js 分支、不删除任何源。
+    /// token 为空时用 Keychain 里存过的；两个都没有就失败。
+    /// 返回成功上传的源个数（一个源算成功要 .js 和报告都传上去）。
+    func uploadBrokenSources(token: String) async -> Result<Int, ImportError> {
+        let effectiveToken = token.isEmpty ? (KeychainHelper.load(forKey: giteeTokenKey) ?? "") : token
+        guard !effectiveToken.isEmpty else {
+            return .failure(.network("请先在源页面填写 Gitee Token，才能上传"))
+        }
+        let failed = await MainActor.run {
+            self.sources.filter { self.checkResults[$0.id]?.status == .failed }
+        }
+        guard !failed.isEmpty else {
+            return .failure(.network("没有自检失败的源，不用上传"))
+        }
+        if case .failure(let error) = await ensureBrokenBranch(token: effectiveToken) {
+            return .failure(error)
+        }
+        var uploaded = 0
+        var firstError: String?
+        for source in failed {
+            guard let jsText = jsSource(for: source) else {
+                if firstError == nil { firstError = "\(source.title) 的文件找不到了" }
+                continue
+            }
+            let check = await MainActor.run { self.checkResults[source.id] }
+            let report = Self.brokenReport(for: source, result: check)
+            let jsResult = await uploadFileToGitee(
+                token: effectiveToken,
+                path: "broken/\(source.id).js",
+                content: jsText,
+                message: "自检失败：上传坏的模块 \(source.id)"
+            )
+            let reportResult = await uploadFileToGitee(
+                token: effectiveToken,
+                path: "broken/\(source.id).report.txt",
+                content: report,
+                message: "自检失败报告 \(source.id)"
+            )
+            switch (jsResult, reportResult) {
+            case (.success, .success):
+                uploaded += 1
+            case (.failure(let error), _), (_, .failure(let error)):
+                if firstError == nil { firstError = error.localizedDescription }
+            }
+        }
+        if uploaded == 0 {
+            return .failure(.network(firstError ?? "上传失败"))
+        }
+        return .success(uploaded)
+    }
+
+    /// 失败报告文本：源 id、哪条线失败、错误信息、时间戳。
+    private static func brokenReport(for source: SourceRecord, result: SourceCheckResult?) -> String {
+        var lines: [String] = [
+            "源 id：\(source.id)",
+            "源标题：\(source.title)",
+            "文件名：\(source.fileName)",
+            "检查时间：\(reportDateString(result?.checkedAt ?? Date()))",
+        ]
+        if let failedLines = result?.failedLines, !failedLines.isEmpty {
+            lines.append("失败的线：")
+            for (sample, reason) in failedLines.sorted(by: { $0.key < $1.key }) {
+                lines.append("- \(sample)：\(reason)")
+            }
+        } else {
+            lines.append("失败原因：无自检记录")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func reportDateString(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        formatter.locale = Locale(identifier: "zh_CN")
+        return formatter.string(from: date)
+    }
+
+    /// broken 分支不存在就建一个（从仓库默认分支拉出来）；已存在直接成功。
+    private func ensureBrokenBranch(token: String) async -> Result<Void, ImportError> {
+        guard let branchURL = URL(string: "https://gitee.com/api/v5/repos/\(giteeRepo)/branches/\(brokenBranch)") else {
+            return .failure(.network("上传地址不对"))
+        }
+        var getRequest = URLRequest(url: branchURL)
+        getRequest.setValue("token \(token)", forHTTPHeaderField: "Authorization")
+        getRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
+        getRequest.timeoutInterval = 30
+        do {
+            let (_, response) = try await URLSession.shared.data(for: getRequest)
+            if let http = response as? HTTPURLResponse {
+                if (200...299).contains(http.statusCode) {
+                    return .success(()) // 分支已在
+                }
+                if http.statusCode == 401 || http.statusCode == 403 {
+                    return .failure(.network("Token 不对或没权限（HTTP \(http.statusCode)），检查一下 Token"))
+                }
+                if http.statusCode != 404 {
+                    return .failure(.network("查 broken 分支失败（HTTP \(http.statusCode)），稍后再试"))
+                }
+                // 404：分支不存在，往下建
+            }
+        } catch {
+            return .failure(.network("连不上码云：\(friendlyNetworkError(error))"))
+        }
+
+        // 查仓库默认分支（master 还是 main），从它建 broken。
+        guard let repoURL = URL(string: "https://gitee.com/api/v5/repos/\(giteeRepo)") else {
+            return .failure(.network("上传地址不对"))
+        }
+        var repoRequest = URLRequest(url: repoURL)
+        repoRequest.setValue("token \(token)", forHTTPHeaderField: "Authorization")
+        repoRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
+        repoRequest.timeoutInterval = 30
+        let defaultBranch: String
+        do {
+            let (data, response) = try await URLSession.shared.data(for: repoRequest)
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let branch = json["default_branch"] as? String, !branch.isEmpty else {
+                return .failure(.network("查不到仓库默认分支，没法建 broken 分支"))
+            }
+            defaultBranch = branch
+        } catch {
+            return .failure(.network("连不上码云：\(friendlyNetworkError(error))"))
+        }
+
+        guard let createURL = URL(string: "https://gitee.com/api/v5/repos/\(giteeRepo)/branches") else {
+            return .failure(.network("上传地址不对"))
+        }
+        var createRequest = URLRequest(url: createURL)
+        createRequest.httpMethod = "POST"
+        createRequest.setValue("token \(token)", forHTTPHeaderField: "Authorization")
+        createRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
+        createRequest.setValue("application/json;charset=UTF-8", forHTTPHeaderField: "Content-Type")
+        createRequest.timeoutInterval = 30
+        let body: [String: Any] = ["branch_name": brokenBranch, "refs": defaultBranch]
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
+            return .failure(.network("建分支失败（请求拼不出来）"))
+        }
+        createRequest.httpBody = bodyData
+        do {
+            let (_, response) = try await URLSession.shared.data(for: createRequest)
+            if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) {
+                return .success(())
+            }
+            // 422：并发时分支可能刚被建好，已存在也算成功
+            if let http = response as? HTTPURLResponse, http.statusCode == 422 {
+                return .success(())
+            }
+            return .failure(.network("建 broken 分支失败（HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)）"))
+        } catch {
+            return .failure(.network("连不上码云：\(friendlyNetworkError(error))"))
+        }
+    }
+
+    /// 用 Gitee contents API 写一个文件到 broken 分支：
+    /// 先 GET 看文件在不在（在就拿 sha 走更新，不在直接新建），内容 base64。
+    /// 路径如 broken/<源id>.js，分支固定 broken。
+    private func uploadFileToGitee(token: String, path: String, content: String, message: String) async -> Result<Void, ImportError> {
+        guard let encodedPath = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+              let fileURL = URL(string: "https://gitee.com/api/v5/repos/\(giteeRepo)/contents/\(encodedPath)?ref=\(brokenBranch)") else {
+            return .failure(.network("上传地址不对"))
+        }
+        var existingSHA: String?
+        do {
+            var getRequest = URLRequest(url: fileURL)
+            getRequest.setValue("token \(token)", forHTTPHeaderField: "Authorization")
+            getRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
+            getRequest.timeoutInterval = 30
+            let (data, response) = try await URLSession.shared.data(for: getRequest)
+            if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                existingSHA = json["sha"] as? String
+            }
+        } catch {
+            return .failure(.network("连不上码云：\(friendlyNetworkError(error))"))
+        }
+
+        guard let putURL = URL(string: "https://gitee.com/api/v5/repos/\(giteeRepo)/contents/\(encodedPath)") else {
+            return .failure(.network("上传地址不对"))
+        }
+        var putRequest = URLRequest(url: putURL)
+        putRequest.httpMethod = "PUT"
+        putRequest.setValue("token \(token)", forHTTPHeaderField: "Authorization")
+        putRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
+        putRequest.setValue("application/json;charset=UTF-8", forHTTPHeaderField: "Content-Type")
+        putRequest.timeoutInterval = 30
+        var body: [String: Any] = [
+            "content": Data(content.utf8).base64EncodedString(),
+            "message": message,
+            "branch": brokenBranch
+        ]
+        if let sha = existingSHA { body["sha"] = sha }
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
+            return .failure(.network("上传失败（请求拼不出来）"))
+        }
+        putRequest.httpBody = bodyData
+        do {
+            let (_, response) = try await URLSession.shared.data(for: putRequest)
+            if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) {
+                return .success(())
+            }
+            if let http = response as? HTTPURLResponse, http.statusCode == 401 || http.statusCode == 403 {
+                return .failure(.network("Token 不对或没权限（HTTP \(http.statusCode)），检查一下 Token"))
+            }
+            return .failure(.network("上传 \(path) 失败（HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)）"))
+        } catch {
+            return .failure(.network("连不上码云：\(friendlyNetworkError(error))"))
+        }
+    }
+
     // MARK: - 文件名
 
     /// 文件名只取最后一段、补 .js 后缀、去掉非法字符；空的用模块 id + .js。
@@ -298,6 +637,21 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         }
         return error.localizedDescription
     }
+}
+
+// MARK: - 自检结果（单独持久化在 check-results.json，不动 SourceRecord）
+
+/// 一次自检的结果：固定验线两条线各解没解出可播 URL。
+/// ok = 样本全部解出可播 URL；failed = 至少一条线失败，
+/// failedLines 记每条样本的失败原因（key 是样本标题，如 "JUQ-984"）。
+struct SourceCheckResult: Codable {
+    enum Status: String, Codable {
+        case ok
+        case failed
+    }
+    var status: Status
+    var failedLines: [String: String]
+    var checkedAt: Date?
 }
 
 // MARK: - 导入错误（全部中文人话）
