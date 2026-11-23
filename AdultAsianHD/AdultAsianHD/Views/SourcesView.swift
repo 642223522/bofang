@@ -1,0 +1,426 @@
+// SourcesView.swift — 源 Tab（v2 重建）
+// 导入是本次验收第一项。重点：从文件导入不许用 SwiftUI 的 .fileImporter
+// （旧 App 就是它回调丢了才坏的），改用 UIDocumentPickerViewController +
+// 自写的 DocumentPicker（NSObject + UIDocumentPickerDelegate）。
+//
+// 防丢回调设计（见文件底部 DocumentPicker 与 presentDocumentPicker）：
+//  1. DocumentPicker 实例由 SourcesView 的 @State 强引用（documentPicker），
+//     delegate 是弱引用，没有这个强引用 picker 会在 present 后被释放、
+//     回调永远不到——这就是旧版「点外部 porn.js 半天没反应」的根因之一。
+//  2. present 时从 keyWindow 的 rootViewController 一路找到最顶层
+//     presentedViewController 再 present，避免被别的 sheet 盖住导致无响应。
+//  3. didPickDocumentsAt / documentPickerWasCancelled 里先把 onPick/onCancel
+//     置 nil 再回调，断开 picker→闭包→View 的引用环；读取在后台线程做
+//     （startAccessingSecurityScopedResource → Data(contentsOf:) →
+//     stopAccessingSecurityScopedResource），读完回主线程调 importData。
+//  4. 全程 UI 给反馈：isReading 时显示「正在读取文件…」遮罩；取消也关掉它；
+//     成功/失败都弹 Alert（成功「已导入 <标题>」，失败用 ImportError 的中文原因）。
+// 从链接导入、码云同步同样给读取中提示与结果 Alert。
+
+import SwiftUI
+import UIKit
+import UniformTypeIdentifiers
+
+struct SourcesView: View {
+    @EnvironmentObject private var store: SourceStore
+
+    // MARK: - 导入器强引用（防回调丢失，见文件底部说明）
+
+    @State private var documentPicker: DocumentPicker?
+
+    // MARK: - UI 状态
+
+    @State private var isReading = false
+    @State private var readingLabel = "正在读取文件…"
+    @State private var alertMessage = ""
+    @State private var showAlert = false
+
+    @State private var showURLSheet = false
+    @State private var urlString = ""
+
+    @State private var showSyncSheet = false
+    @State private var giteeToken = ""
+
+    /// 上次码云同步时间（存时间戳；0 = 从未同步）。
+    @AppStorage("giteeLastSyncInterval") private var lastSyncInterval: Double = 0
+    /// 上次码云同步的源数量。
+    @AppStorage("giteeLastSyncCount") private var lastSyncCount: Int = 0
+    /// 当前源 id（同步后首个源自动设为当前）。
+    @AppStorage("currentSourceId") private var currentSourceId = ""
+
+    var body: some View {
+        ZStack {
+            VStack(spacing: 0) {
+                actionRow
+                    .padding()
+
+                syncInfoRow
+                    .padding(.horizontal)
+                    .padding(.bottom, 8)
+
+                sourceList
+            }
+
+            if isReading {
+                Color.black.opacity(0.3)
+                    .ignoresSafeArea()
+                VStack(spacing: 12) {
+                    ProgressView()
+                    Text(readingLabel)
+                        .font(.subheadline)
+                }
+                .padding(24)
+                .background(Color(.systemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+            }
+        }
+        .navigationTitle("源")
+        .navigationBarTitleDisplayMode(.inline)
+        .alert("导入", isPresented: $showAlert) {
+            Button("好", role: .cancel) {}
+        } message: {
+            Text(alertMessage)
+        }
+        .sheet(isPresented: $showURLSheet) {
+            urlImportSheet
+        }
+        .sheet(isPresented: $showSyncSheet) {
+            giteeSyncSheet
+        }
+    }
+
+    // MARK: - 顶部三个操作
+
+    private var actionRow: some View {
+        HStack(spacing: 12) {
+            Button {
+                presentDocumentPicker()
+            } label: {
+                Label("从文件导入", systemImage: "doc.badge.plus")
+            }
+            .buttonStyle(.bordered)
+
+            Button {
+                urlString = ""
+                showURLSheet = true
+            } label: {
+                Label("从链接导入", systemImage: "link.badge.plus")
+            }
+            .buttonStyle(.bordered)
+
+            Button {
+                giteeToken = ""
+                showSyncSheet = true
+            } label: {
+                Label("码云同步", systemImage: "arrow.triangle.2.circlepath")
+            }
+            .buttonStyle(.bordered)
+        }
+    }
+
+    private var syncInfoRow: some View {
+        HStack {
+            Text("上次同步：\(lastSyncText)")
+            Spacer()
+            Text("源数量：\(store.sources.count)")
+        }
+        .font(.footnote)
+        .foregroundColor(.secondary)
+    }
+
+    private var lastSyncText: String {
+        guard lastSyncInterval > 0 else { return "从未同步" }
+        let date = Date(timeIntervalSince1970: lastSyncInterval)
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        formatter.locale = Locale(identifier: "zh_CN")
+        return formatter.string(from: date)
+    }
+
+    // MARK: - 源列表
+
+    private var sourceList: some View {
+        Group {
+            if store.sources.isEmpty {
+                EmptyState(
+                    title: "还没有源",
+                    message: "从文件或链接导入一个 .js 源，或用码云同步拉取。",
+                    actionTitle: "从文件导入",
+                    action: { presentDocumentPicker() }
+                )
+            } else {
+                List {
+                    ForEach(store.sources) { source in
+                        HStack(spacing: 12) {
+                            NavigationLink {
+                                SourceDetailView(source: source)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(source.title)
+                                        .font(.headline)
+                                        .lineLimit(1)
+                                    HStack(spacing: 8) {
+                                        Text(originLabel(for: source))
+                                            .font(.caption)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Color(.secondarySystemBackground))
+                                            .clipShape(Capsule())
+                                        Text("版本 \(source.version)")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                        if source.id == currentSourceId {
+                                            Text("当前")
+                                                .font(.caption)
+                                                .foregroundColor(.accentColor)
+                                        }
+                                    }
+                                }
+                            }
+                            .buttonStyle(.plain)
+
+                            Spacer()
+
+                            if let url = store.exportURL(for: source) {
+                                ShareLink(item: url) {
+                                    Image(systemName: "square.and.arrow.up")
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            Button(role: .destructive) {
+                                store.delete(source)
+                            } label: {
+                                Label("删除", systemImage: "trash")
+                            }
+                        }
+                    }
+                }
+                .listStyle(.plain)
+            }
+        }
+    }
+
+    /// 来源标记：origin 为 gitee / 含「码云」即码云同步，否则外部导入。
+    /// （契约未规定 origin 的取值；导入时本文件固定传 "外部导入"，同步走 Core 层。）
+    private func originLabel(for source: SourceRecord) -> String {
+        if source.origin == "gitee" || source.origin.contains("码云") || source.origin.contains("Gitee") {
+            return "码云同步"
+        }
+        return "外部导入"
+    }
+
+    // MARK: - 从文件导入（UIDocumentPicker，不用 .fileImporter）
+
+    private func presentDocumentPicker() {
+        let picker = DocumentPicker()
+        picker.onPick = { urls in
+            handlePickedDocuments(urls)
+        }
+        picker.onCancel = {
+            isReading = false
+        }
+        // 强引用：delegate 是弱引用，不留住 picker 实例，回调会在 present 后丢失。
+        documentPicker = picker
+
+        let contentTypes = [UTType(filenameExtension: "js") ?? .plainText]
+        let controller = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: true)
+        controller.delegate = picker
+        controller.allowsMultipleSelection = false
+
+        guard let top = Self.topViewController() else {
+            documentPicker = nil
+            showResultAlert("打不开文件选择器，请重试。")
+            return
+        }
+        top.present(controller, animated: true)
+    }
+
+    /// 从 keyWindow 的 rootViewController 一路找到最顶层 presentedViewController。
+    private static func topViewController() -> UIViewController? {
+        guard let scene = UIApplication.shared.connectedScenes
+            .first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene,
+              let window = scene.windows.first(where: { $0.isKeyWindow }) else {
+            return nil
+        }
+        var top = window.rootViewController
+        while let presented = top?.presentedViewController {
+            top = presented
+        }
+        return top
+    }
+
+    private func handlePickedDocuments(_ urls: [URL]) {
+        documentPicker = nil
+        guard let url = urls.first else { return }
+        isReading = true
+        readingLabel = "正在读取文件…"
+        Task { @MainActor in
+            let data = await Task.detached(priority: .userInitiated) { () -> Data? in
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer {
+                    if scoped { url.stopAccessingSecurityScopedResource() }
+                }
+                return try? Data(contentsOf: url)
+            }.value
+            guard let data else {
+                isReading = false
+                showResultAlert("读取文件失败，请确认文件存在且是 .js 文件。")
+                return
+            }
+            let result = await store.importData(data, fileName: url.lastPathComponent, origin: "外部导入")
+            isReading = false
+            switch result {
+            case .success(let record):
+                showResultAlert("已导入 \(record.title)")
+            case .failure(let error):
+                showResultAlert(error.localizedDescription)
+            }
+        }
+    }
+
+    // MARK: - 从链接导入
+
+    private var urlImportSheet: some View {
+        NavigationStack {
+            Form {
+                Section("输入 .js 直链") {
+                    TextField("https://…/xxx.js", text: $urlString)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                }
+                Section {
+                    Text("粘贴 JS 源的直接下载链接，App 会下载并校验后导入。")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .navigationTitle("从链接导入")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { showURLSheet = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("导入") { importFromURL() }
+                }
+            }
+        }
+    }
+
+    private func importFromURL() {
+        let text = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            showResultAlert("请先输入 .js 直链。")
+            return
+        }
+        showURLSheet = false
+        isReading = true
+        readingLabel = "正在导入链接…"
+        Task {
+            let result = await store.importURL(text)
+            isReading = false
+            switch result {
+            case .success(let record):
+                showResultAlert("已导入 \(record.title)")
+            case .failure(let error):
+                showResultAlert(error.localizedDescription)
+            }
+        }
+    }
+
+    // MARK: - 码云同步
+
+    private var giteeSyncSheet: some View {
+        NavigationStack {
+            Form {
+                Section("Gitee token") {
+                    SecureField("在 App 内输入 Gitee token", text: $giteeToken)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Text("token 只存在本机，不会发给别人；从「自用资料备份」js 分支拉取源。")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+                Section {
+                    Text("上次同步：\(lastSyncText)")
+                    Text("源数量：\(store.sources.count)")
+                }
+            }
+            .navigationTitle("码云同步")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { showSyncSheet = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("同步") { syncFromGitee() }
+                }
+            }
+        }
+    }
+
+    private func syncFromGitee() {
+        let token = giteeToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else {
+            showResultAlert("请先输入 Gitee token。")
+            return
+        }
+        showSyncSheet = false
+        isReading = true
+        readingLabel = "正在从码云同步…"
+        Task {
+            let result = await store.syncFromGitee(token: token)
+            isReading = false
+            switch result {
+            case .success(let count):
+                lastSyncInterval = Date().timeIntervalSince1970
+                lastSyncCount = count
+                if let first = store.sources.first {
+                    currentSourceId = first.id
+                }
+                showResultAlert("同步完成，共 \(count) 个源")
+            case .failure(let error):
+                showResultAlert(error.localizedDescription)
+            }
+        }
+    }
+
+    // MARK: - 结果提示
+
+    private func showResultAlert(_ message: String) {
+        alertMessage = message
+        showAlert = true
+    }
+}
+
+// MARK: - DocumentPicker：UIDocumentPickerDelegate 封装
+//
+// 关键点：UIDocumentPickerViewController.delegate 是弱引用。
+// 旧版 .fileImporter 回调丢失，就是因为没人强引用 coordinator。
+// 这里由 SourcesView 的 @State 强引用本类实例（documentPicker），
+// present 期间实例一直活着；回调触发时先把闭包置 nil 断开引用环，
+// 再把 URL 交出去，View 侧随后把 @State 引用也清掉。
+
+final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
+    var onPick: (([URL]) -> Void)?
+    var onCancel: (() -> Void)?
+
+    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        let callback = onPick
+        onPick = nil
+        onCancel = nil
+        // UIKit 回调不保证在 MainActor 上下文，强制回主线程再碰 UI 状态。
+        DispatchQueue.main.async { callback?(urls) }
+    }
+
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        let callback = onCancel
+        onPick = nil
+        onCancel = nil
+        DispatchQueue.main.async { callback?() }
+    }
+}

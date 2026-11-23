@@ -1,0 +1,177 @@
+// DetailView.swift — 详情页（v2 重建）
+// 顶部 16:9 小窗口内嵌 AVPlayerViewController（PlayerView），不弹全屏；
+// 点封面进来 onAppear 即调 PlayerViewModel.play(item, host) 自动起播，从 0:00 开始，
+// 不自动续播（新 AVPlayerItem 本来就从 0:00 起）。currentURL 变化由 PlayerView
+// 在 update 时换 item 并 play。播放/暂停、线路切换都直接作用于同一个 AVPlayer。
+// 离开页面 onDisappear 停播（pause + replaceCurrentItem(nil)）。
+// 失败时红字显示 failureReason。下载：m3u8 走 downloadHLS，mp4 走 downloadMP4。
+
+import AVKit
+import SwiftUI
+
+struct DetailView: View {
+    let item: VideoItem
+    let host: WidgetHost
+    let sourceId: String
+
+    @EnvironmentObject private var favorites: FavoritesStore
+    @EnvironmentObject private var downloader: Downloader
+
+    @StateObject private var playerVM = PlayerViewModel()
+    @State private var player = AVPlayer()
+    @State private var isPlaying = false
+    @State private var downloadAlertMessage: String?
+    @State private var showDownloadAlert = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                PlayerView(player: player, url: playerVM.currentURL)
+                    .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                    .background(Color.black)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                if case .failed(let reason) = playerVM.status {
+                    Text(reason)
+                        .foregroundColor(.red)
+                        .font(.subheadline)
+                } else if let failureReason = playerVM.failureReason {
+                    Text(failureReason)
+                        .foregroundColor(.red)
+                        .font(.subheadline)
+                } else if playerVM.status == .loading {
+                    Text("正在解析播放线路…")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+
+                Text(item.title)
+                    .font(.title3)
+                    .fontWeight(.semibold)
+
+                Text("时长 --:--")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+
+                if !item.description.isEmpty {
+                    Text(item.description)
+                        .font(.body)
+                        .foregroundColor(.secondary)
+                }
+
+                buttonRow
+
+                if !playerVM.lines.isEmpty {
+                    Text("线路")
+                        .font(.headline)
+                    VStack(spacing: 0) {
+                        ForEach(Array(playerVM.lines.enumerated()), id: \.offset) { _, line in
+                            Button {
+                                playerVM.switchLine(line)
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(line.name)
+                                            .font(.headline)
+                                        if !line.description.isEmpty {
+                                            Text(line.description)
+                                                .font(.subheadline)
+                                                .foregroundColor(.secondary)
+                                        }
+                                    }
+                                    Spacer()
+                                    if playerVM.currentURL?.absoluteString == line.url {
+                                        Image(systemName: "checkmark")
+                                            .foregroundColor(.accentColor)
+                                    }
+                                }
+                                .padding(.vertical, 8)
+                            }
+                            .buttonStyle(.plain)
+                            Divider()
+                        }
+                    }
+                }
+            }
+            .padding()
+        }
+        .navigationTitle("详情")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            Task {
+                await playerVM.play(item: item, host: host)
+            }
+        }
+        .onChange(of: playerVM.currentURL) { _, newURL in
+            // 有了可播 URL 即视为正在播（实际换 item + play 由 PlayerView.update 做）。
+            isPlaying = newURL != nil
+        }
+        .onDisappear {
+            player.pause()
+            player.replaceCurrentItem(with: nil)
+            isPlaying = false
+        }
+        .alert("下载", isPresented: $showDownloadAlert) {
+            Button("好", role: .cancel) {}
+        } message: {
+            Text(downloadAlertMessage ?? "")
+        }
+    }
+
+    // MARK: - 按钮行：收藏 / 播放-暂停切换 / 下载
+
+    private var buttonRow: some View {
+        HStack(spacing: 16) {
+            Button {
+                favorites.toggle(item: item, sourceId: sourceId)
+            } label: {
+                Label(
+                    favorites.isFavorite(item.id) ? "已收藏" : "收藏",
+                    systemImage: favorites.isFavorite(item.id) ? "star.fill" : "star"
+                )
+            }
+            .buttonStyle(.bordered)
+
+            Button {
+                if isPlaying {
+                    player.pause()
+                } else {
+                    player.play()
+                }
+                isPlaying.toggle()
+            } label: {
+                Label(isPlaying ? "暂停" : "播放", systemImage: isPlaying ? "pause.fill" : "play.fill")
+            }
+            .buttonStyle(.bordered)
+            .disabled(playerVM.currentURL == nil)
+
+            Button {
+                downloadCurrent()
+            } label: {
+                Label("下载", systemImage: "arrow.down.circle")
+            }
+            .buttonStyle(.bordered)
+            .disabled(playerVM.currentURL == nil && PlaybackEngine.fastPathURL(for: item) == nil)
+        }
+    }
+
+    // MARK: - 下载
+
+    private func downloadCurrent() {
+        guard let url = playerVM.currentURL ?? PlaybackEngine.fastPathURL(for: item) else {
+            downloadAlertMessage = "没有可下载的直链，这个站不支持下载。"
+            showDownloadAlert = true
+            return
+        }
+        Task {
+            if url.pathExtension.lowercased() == "m3u8"
+                || url.absoluteString.lowercased().contains("m3u8") {
+                await downloader.downloadHLS(url, title: item.title)
+            } else {
+                await downloader.downloadMP4(url, title: item.title)
+            }
+            downloadAlertMessage = "已加入下载，可在「我的 → 下载」里查看进度。"
+            showDownloadAlert = true
+        }
+    }
+}
