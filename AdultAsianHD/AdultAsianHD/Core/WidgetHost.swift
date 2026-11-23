@@ -454,7 +454,7 @@ final class WidgetHost: @unchecked Sendable {
                 // 拦截命中但返回空，或没命中：都继续走直调 WP REST（真空还是假空由它判定）
             } catch is CancellationError {
                 requestInterceptor.disarm(token: token)
-                throw
+                throw error
             } catch {
                 requestInterceptor.disarm(token: token)
                 // 模块这条路抛错也继续走直调；直调再失败才报
