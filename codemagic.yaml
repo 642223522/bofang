@@ -121,9 +121,12 @@ workflows:
             /usr/libexec/PlistBuddy -c "Set :NSAppTransportSecurity:NSAllowsArbitraryLoads true" "$PLIST"
           /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoadsInWebContent bool true" "$PLIST" 2>/dev/null || \
             /usr/libexec/PlistBuddy -c "Set :NSAppTransportSecurity:NSAllowsArbitraryLoadsInWebContent true" "$PLIST"
+          # 后台模式：只留 fetch（后台刷新），不要 audio。
+          # audio 后台模式会让 AVPlayer 自动向系统注册 Now Playing，
+          # 播放一开始 iOS 就在灵动岛弹出那个带播放/暂停的媒体大卡片（还会进控制中心），
+          # 用户要的就是去掉它。反正离开详情页就停播，后台音频本来就不需要。
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST" 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string audio" "$PLIST" 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:1 string fetch" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string fetch" "$PLIST" 2>/dev/null || true
           echo "--- 修复后的 Info.plist ---"
           /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$PLIST"
           /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST"
