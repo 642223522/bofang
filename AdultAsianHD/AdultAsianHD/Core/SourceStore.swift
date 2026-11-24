@@ -89,7 +89,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return .failure(.unreadable)
         }
-        let validation = WidgetHost.validate(jsSource: text)
+        let validation = WidgetHost.validate(jsSource: text, fallbackTitle: fileName)
         guard validation.ok, let meta = validation.meta else {
             return .failure(.notModule(validation.error ?? "这个脚本不是 ForwardWidget 模块格式"))
         }
@@ -243,7 +243,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         guard let text = jsSource(for: source) else {
             throw ImportError.unreadable
         }
-        return try WidgetHost(jsSource: text)
+        return try WidgetHost(jsSource: text, fallbackTitle: source.fileName)
     }
 
     /// 按模块 title/description 猜国家（主页按国家分框用）。

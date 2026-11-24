@@ -54,8 +54,9 @@ final class WidgetHost: @unchecked Sendable {
 
     /// 建 context、注入 Widget 桥接、evaluate 模块源码、取出元数据与模块清单。
     /// 取不到或格式不对就 throw（中文人话）。本方法只 evaluate，不发任何请求。
-    init(jsSource: String) throws {
-        let built = try Self.buildOnMainThread(jsSource: jsSource)
+    /// fallbackTitle：WidgetMetadata 缺标题时用的兜底（一般传文件名），再没有用 id。
+    init(jsSource: String, fallbackTitle: String? = nil) throws {
+        let built = try Self.buildOnMainThread(jsSource: jsSource, fallbackTitle: fallbackTitle)
         self.context = built.context
         self.meta = built.meta
         self.modules = built.modules
@@ -71,20 +72,20 @@ final class WidgetHost: @unchecked Sendable {
         let requestInterceptor: CategoryRequestInterceptor
     }
 
-    private static func buildOnMainThread(jsSource: String) throws -> BuiltHost {
+    private static func buildOnMainThread(jsSource: String, fallbackTitle: String? = nil) throws -> BuiltHost {
         if Thread.isMainThread {
-            return try build(jsSource: jsSource)
+            return try build(jsSource: jsSource, fallbackTitle: fallbackTitle)
         }
         // 不在主线程时同步切过去建（init 是同步的，没法 await；
         // 主线程调进来时走上面那条，不会死锁）。
         var result: Result<BuiltHost, Error>?
         DispatchQueue.main.sync {
-            result = Result { try build(jsSource: jsSource) }
+            result = Result { try build(jsSource: jsSource, fallbackTitle: fallbackTitle) }
         }
         return try result!.get()
     }
 
-    private static func build(jsSource: String) throws -> BuiltHost {
+    private static func build(jsSource: String, fallbackTitle: String? = nil) throws -> BuiltHost {
         guard let context = JSContext() else {
             throw WidgetHostError.invalidFormat("创建 JS 环境失败")
         }
@@ -108,10 +109,15 @@ final class WidgetHost: @unchecked Sendable {
             throw WidgetHostError.invalidFormat("这个脚本不是 ForwardWidget 模块格式（缺 WidgetMetadata）")
         }
         let metaId = metaDict["id"] as? String ?? ""
-        let metaTitle = metaDict["title"] as? String ?? ""
-        guard !metaId.isEmpty, !metaTitle.isEmpty else {
-            throw WidgetHostError.invalidFormat("这个脚本不是 ForwardWidget 模块格式（模块信息不完整，缺 id 或标题）")
+        guard !metaId.isEmpty else {
+            throw WidgetHostError.invalidFormat("这个脚本不是 ForwardWidget 模块格式（模块信息不完整，缺 id）")
         }
+        // 标题缺失不整文件报错：先用调用方给的文件名，再退回 id。
+        let metaTitle: String = {
+            if let t = metaDict["title"] as? String, !t.isEmpty { return t }
+            if let f = fallbackTitle, !f.isEmpty { return f }
+            return metaId
+        }()
         let searchDict = metaDict["search"] as? [String: Any]
         let meta = WidgetMeta(
             id: metaId,
@@ -123,11 +129,11 @@ final class WidgetHost: @unchecked Sendable {
             site: siteString(from: metaDict)
         )
 
-        // 取 JS_MODULES
-        guard let modulesValue = context.objectForKeyedSubscript("JS_MODULES"),
-              !modulesValue.isUndefined, !modulesValue.isNull,
-              let rawModules = modulesValue.toArray() else {
-            throw WidgetHostError.invalidFormat("这个脚本不是 ForwardWidget 模块格式（缺模块清单 JS_MODULES）")
+        // 取模块清单（超集，三路，比 Rex 更宽松）：
+        // (1) 全局 JS_MODULES；(2) WidgetMetadata.modules（如 huangguo.js 的 HG_MODULES）；
+        // (3) 兜底扫顶层：任何一个元素含 id + functionName 的数组（变量名任意）。
+        guard let rawModules = findModuleList(in: context, metaDict: metaDict) else {
+            throw WidgetHostError.invalidFormat("这个脚本不是 ForwardWidget 模块格式（找不到模块清单）")
         }
         var modules: [ModuleDescriptor] = []
         for raw in rawModules {
@@ -143,6 +149,7 @@ final class WidgetHost: @unchecked Sendable {
                 functionName: functionName,
                 type: dict["type"] as? String,
                 cacheDuration: dict["cacheDuration"] as? Int ?? 0,
+                requiresWebView: dict["requiresWebView"] as? Bool ?? false,
                 params: dict["params"] as? [[String: Any]] ?? []
             ))
         }
@@ -163,9 +170,44 @@ final class WidgetHost: @unchecked Sendable {
         return nil
     }
 
+    /// 找模块清单（超集，三路）：(1) 全局 JS_MODULES；(2) WidgetMetadata.modules；
+    /// (3) 兜底扫顶层变量：任何一个元素含 id + functionName 的数组（变量名任意，比 Rex 更宽松）。
+    /// 返回解析好的 [[String: Any]]，三路都找不到返回 nil。
+    private static func findModuleList(in context: JSContext, metaDict: [String: Any]) -> [[String: Any]]? {
+        // (1) 全局 JS_MODULES（pornjav.js 那套老格式）
+        if let value = context.objectForKeyedSubscript("JS_MODULES"),
+           !value.isUndefined, !value.isNull,
+           let raw = value.toArray() {
+            let dicts = raw.compactMap { $0 as? [String: Any] }
+            if !dicts.isEmpty { return dicts }
+        }
+        // (2) WidgetMetadata.modules（huangguo.js：HG_MODULES 只挂在这里）
+        if let raw = metaDict["modules"] as? [Any] {
+            let dicts = raw.compactMap { $0 as? [String: Any] }
+            if !dicts.isEmpty { return dicts }
+        }
+        // (3) 兜底扫顶层：变量名任意，只要首个元素像模块（id + functionName 齐全）。
+        // HG_CATS 这种元素是数组的、BLOCK_TERMS 这种空数组，首元素一关就过不去。
+        guard let keysValue = context.evaluateScript("Object.keys(this)"),
+              let keys = keysValue.toArray() as? [String] else { return nil }
+        for key in keys {
+            guard key != "JS_MODULES", key != "WidgetMetadata", key != "Widget" else { continue }
+            guard let value = context.objectForKeyedSubscript(key),
+                  !value.isUndefined, !value.isNull,
+                  value.isArray,
+                  let raw = value.toArray(), !raw.isEmpty,
+                  let first = raw.first as? [String: Any],
+                  let firstId = first["id"] as? String, !firstId.isEmpty,
+                  let firstFn = first["functionName"] as? String, !firstFn.isEmpty else { continue }
+            let dicts = raw.compactMap { $0 as? [String: Any] }
+            if !dicts.isEmpty { return dicts }
+        }
+        return nil
+    }
+
     // MARK: - Widget 桥接
 
-    /// 注入全局 Widget 对象：Widget.http.get / Widget.storage.get / set，
+    /// 注入全局 Widget 对象：Widget.http.get / post、Widget.storage.get / set，
     /// 再加一个空的 console.log（有的模块会 log，没它会报异常）。
     private static func installWidgetBridge(in context: JSContext, interceptor: CategoryRequestInterceptor) {
         let widget = JSValue(newObjectIn: context)!
@@ -184,6 +226,17 @@ final class WidgetHost: @unchecked Sendable {
             return makeHttpGetPromise(in: context, urlString: urlString, options: options, interceptor: interceptor)
         }
         http.setValue(httpGet, forProperty: "get")
+
+        // Widget.http.post(url, body, {headers}) -> Promise<{status, data}>
+        // 与 get 同一套 Promise 机制；POST 不套分类拦截器（拦截只改 WP 帖子 GET）。
+        // body 一般是字符串（huangguo 现铸签名传 "{}"）；是对象时转 JSON。
+        let httpPost: @convention(block) (String, JSValue?, JSValue?) -> JSValue = { [weak context] urlString, body, options in
+            guard let context else {
+                fatalError("WidgetHost: JSContext 已释放，无法发起请求")
+            }
+            return makeHttpPostPromise(in: context, urlString: urlString, body: body, options: options)
+        }
+        http.setValue(httpPost, forProperty: "post")
         widget.setValue(http, forProperty: "http")
 
         // Widget.storage.get(key) / set(key, value)：同步，UserDefaults，前缀 fw.storage.。
@@ -261,6 +314,62 @@ final class WidgetHost: @unchecked Sendable {
         return promise
     }
 
+    /// Widget.http.post 的 Promise：与 get 同一套机制（后台发请求，主线程 resolve/reject），
+    /// 只是 method 是 POST、带 body、不套分类拦截器。
+    /// 只在传输层失败时 reject；HTTP 状态码是多少都 resolve 回去，让模块自己按 status 判断。
+    private static func makeHttpPostPromise(in context: JSContext, urlString: String, body: JSValue?, options: JSValue?) -> JSValue {
+        guard let promiseConstructor = context.objectForKeyedSubscript("Promise"),
+              !promiseConstructor.isUndefined else {
+            fatalError("WidgetHost: JS 环境里没有 Promise")
+        }
+        // headers 与 body 在 executor 外同步抠出来（当时还在主线程），Task 只带纯 Swift 值走，
+        // resolve/reject 装进 Sendable 盒子带进 Task（JSValue 本身不是 Sendable）。
+        let headers = headers(from: options)
+        let bodyData = httpBodyData(from: body)
+        let executor: @convention(block) (JSValue, JSValue) -> Void = { resolve, reject in
+            let box = JSCallbackBox(resolve: resolve, reject: reject)
+            Task {
+                do {
+                    let (status, data) = try await Self.fetchHTTP(urlString: urlString, method: "POST", body: bodyData, headers: headers)
+                    await MainActor.run {
+                        guard let ctx = box.resolve.context else { return }
+                        let result = JSValue(newObjectIn: ctx)!
+                        result.setValue(status, forProperty: "status")
+                        result.setValue(data, forProperty: "data")
+                        box.resolve.call(withArguments: [result])
+                    }
+                } catch {
+                    let message = error.localizedDescription
+                    await MainActor.run {
+                        guard let ctx = box.reject.context else { return }
+                        if let jsError = ctx.objectForKeyedSubscript("Error")?.construct(withArguments: [message]) {
+                            box.reject.call(withArguments: [jsError])
+                        } else {
+                            box.reject.call(withArguments: [message])
+                        }
+                    }
+                }
+            }
+        }
+        guard let promise = promiseConstructor.construct(withArguments: [executor]) else {
+            fatalError("WidgetHost: 构造 Promise 失败")
+        }
+        return promise
+    }
+
+    /// POST 的 body 转 Data：字符串直接 UTF-8；对象转 JSON；没有/空返回 nil。
+    private static func httpBodyData(from body: JSValue?) -> Data? {
+        guard let body, !body.isUndefined, !body.isNull else { return nil }
+        if body.isString {
+            return body.toString().data(using: .utf8)
+        }
+        if let dict = body.toDictionary() as? [String: Any],
+           let data = try? JSONSerialization.data(withJSONObject: dict) {
+            return data
+        }
+        return body.toString().data(using: .utf8)
+    }
+
     private static func headers(from options: JSValue?) -> [String: String] {
         var headers: [String: String] = ["User-Agent": NetConstants.iPhoneUserAgent]
         if let dict = options?.objectForKeyedSubscript("headers")?.toDictionary() {
@@ -276,13 +385,15 @@ final class WidgetHost: @unchecked Sendable {
     /// 真正发请求。只在传输层失败时 throw（对应 Promise reject）；
     /// HTTP 状态码是多少都 resolve 回去（{status, data}），让模块自己按 status 判断，
     /// pornjav 的 httpGetStatus 就是这么用的（404 也要看 status）。
-    private static func fetchHTTP(urlString: String, headers: [String: String]) async throws -> (status: Int, data: Any) {
+    /// method/body 默认 GET/无 body，老的 GET 调用不用改。
+    private static func fetchHTTP(urlString: String, method: String = "GET", body: Data? = nil, headers: [String: String]) async throws -> (status: Int, data: Any) {
         guard let url = URL(string: urlString) else {
             throw WidgetHostError.callFailed("链接格式不对：\(urlString)")
         }
         var request = URLRequest(url: url)
-        request.httpMethod = "GET"
+        request.httpMethod = method
         request.timeoutInterval = 30
+        if let body { request.httpBody = body }
         for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
@@ -398,6 +509,9 @@ final class WidgetHost: @unchecked Sendable {
         guard let module = modules.first(where: { $0.id == moduleId }) else {
             throw WidgetHostError.functionMissing("没有这个模块：\(moduleId)")
         }
+        guard !module.requiresWebView else {
+            throw WidgetHostError.functionMissing("这个模块需要 WebView，当前版本暂不支持")
+        }
         let result = try await callFunction(module.functionName, params: buildParams(for: module, page: page, inputs: [:]))
         return try parseVideoItems(result)
     }
@@ -408,8 +522,19 @@ final class WidgetHost: @unchecked Sendable {
         guard let module = modules.first(where: { $0.type == "stream" }) else {
             throw WidgetHostError.functionMissing("这个模块没有播放解析功能")
         }
+        guard !module.requiresWebView else {
+            throw WidgetHostError.functionMissing("这个模块需要 WebView，当前版本暂不支持")
+        }
         let result = try await callFunction(module.functionName, params: buildParams(for: module, page: 1, inputs: ["link": link, "title": title]))
         return parsePlayLines(result)
+    }
+
+    /// 调模块的 loadDetail(link)（短剧/分集类模块有，如 huangguo.js），返回详情与分集。
+    /// 没有 loadDetail 函数的模块 throw functionMissing，调用方据此隐藏分集区（不是错误）。
+    /// loadDetail 在模块里是 loadDetail(link) 单字符串参数，不是 params 对象。
+    func loadDetail(link: String) async throws -> DetailItem {
+        let result = try await callFunction("loadDetail", args: [link])
+        return try parseDetailItem(result)
     }
 
     /// 调 WidgetMetadata.search.functionName（一般是 searchVideos）。
@@ -419,6 +544,9 @@ final class WidgetHost: @unchecked Sendable {
         }
         let params: [String: Any]
         if let module = modules.first(where: { $0.functionName == functionName }) {
+            guard !module.requiresWebView else {
+                throw WidgetHostError.functionMissing("这个模块需要 WebView，当前版本暂不支持")
+            }
             params = buildParams(for: module, page: page, inputs: ["keyword": keyword])
         } else {
             params = ["keyword": keyword, "page": page]
@@ -475,9 +603,9 @@ final class WidgetHost: @unchecked Sendable {
     }
 
     /// 导入时做格式校验：新建一个临时 WidgetHost（只 evaluate + 取元数据，不发请求）。
-    static func validate(jsSource: String) -> (ok: Bool, meta: WidgetMeta?, error: String?) {
+    static func validate(jsSource: String, fallbackTitle: String? = nil) -> (ok: Bool, meta: WidgetMeta?, error: String?) {
         do {
-            let host = try WidgetHost(jsSource: jsSource)
+            let host = try WidgetHost(jsSource: jsSource, fallbackTitle: fallbackTitle)
             return (true, host.meta, nil)
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
@@ -790,6 +918,40 @@ final class WidgetHost: @unchecked Sendable {
         )
     }
 
+    /// 解析 loadDetail 返回的详情对象：复用 videoItem 的字段（id/标题/链接/封面/描述），
+    /// 再取 videoUrl（首集预铸直链）与 childItems（分集）。
+    private func parseDetailItem(_ value: JSValue) throws -> DetailItem {
+        guard let dict = value.toDictionary() as? [String: Any] else {
+            throw WidgetHostError.unexpectedResult("模块返回的不是详情，看不懂")
+        }
+        let base = videoItem(from: dict)
+        var episodes: [DetailEpisode] = []
+        if let children = dict["childItems"] as? [Any] {
+            for raw in children {
+                guard let child = raw as? [String: Any] else { continue }
+                let epLink = child["link"] as? String ?? ""
+                guard !epLink.isEmpty else { continue }
+                episodes.append(DetailEpisode(
+                    id: (child["id"] as? String).flatMap { $0.nilIfEmpty } ?? epLink,
+                    title: child["title"] as? String ?? epLink,
+                    link: epLink,
+                    videoURL: (child["videoUrl"] as? String).flatMap { $0.nilIfEmpty },
+                    description: child["description"] as? String ?? "",
+                    playerHint: child["playerHint"] as? String
+                ))
+            }
+        }
+        return DetailItem(
+            id: base.id,
+            title: base.title,
+            link: base.link,
+            coverURL: base.coverURL,
+            description: base.description,
+            videoURL: (dict["videoUrl"] as? String).flatMap { $0.nilIfEmpty },
+            episodes: episodes
+        )
+    }
+
     private func parsePlayLines(_ value: JSValue) -> [PlayLine] {
         var dicts: [[String: Any]] = []
         if let array = value.toArray() {
@@ -809,7 +971,8 @@ final class WidgetHost: @unchecked Sendable {
             lines.append(PlayLine(
                 name: dict["name"] as? String ?? "线路",
                 url: url,
-                description: dict["description"] as? String ?? ""
+                description: dict["description"] as? String ?? "",
+                playerHint: dict["playerHint"] as? String
             ))
         }
         return lines

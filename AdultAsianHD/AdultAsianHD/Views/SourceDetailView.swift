@@ -311,6 +311,11 @@ private struct ModuleListView: View {
                                     .foregroundColor(.secondary)
                                     .lineLimit(2)
                             }
+                            if module.requiresWebView {
+                                Text("需 WebView · 当前版本暂不支持")
+                                    .font(.caption)
+                                    .foregroundColor(.orange)
+                            }
                         }
                         .padding(.vertical, 4)
                     }

@@ -30,6 +30,12 @@ struct DetailView: View {
     @State private var isPlaying = false
     @State private var downloadAlertMessage: String?
     @State private var showDownloadAlert = false
+    /// 分集详情（loadDetail 返回；没有 loadDetail 的模块为 nil，不显示分集区）。
+    @State private var detail: DetailItem?
+    /// 正在播的分集 id（点播时记下来，勾选标记用）。
+    @State private var currentEpisodeId: String?
+    /// 分集现铸失败时显示的红字。
+    @State private var episodeError: String?
 
     var body: some View {
         ScrollView {
@@ -100,6 +106,44 @@ struct DetailView: View {
                         }
                     }
                 }
+
+                if let detail, !detail.episodes.isEmpty {
+                    Text("分集")
+                        .font(.headline)
+                    if let episodeError {
+                        Text(episodeError)
+                            .foregroundColor(.red)
+                            .font(.subheadline)
+                    }
+                    VStack(spacing: 0) {
+                        ForEach(detail.episodes) { ep in
+                            Button {
+                                playEpisode(ep)
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(ep.title)
+                                            .font(.headline)
+                                        if !ep.description.isEmpty {
+                                            Text(ep.description)
+                                                .font(.subheadline)
+                                                .foregroundColor(.secondary)
+                                        }
+                                    }
+                                    Spacer()
+                                    if currentEpisodeId == ep.id
+                                        || playerVM.currentURL?.absoluteString == ep.videoURL {
+                                        Image(systemName: "checkmark")
+                                            .foregroundColor(.accentColor)
+                                    }
+                                }
+                                .padding(.vertical, 8)
+                            }
+                            .buttonStyle(.plain)
+                            Divider()
+                        }
+                    }
+                }
             }
             .padding()
         }
@@ -108,6 +152,12 @@ struct DetailView: View {
         .onAppear {
             Task {
                 await playerVM.play(item: item, host: host)
+            }
+            Task {
+                // 分集：模块有 loadDetail 就取详情（短剧站）；没有就当没有分集，不报错。
+                if let d = try? await host.loadDetail(link: item.link) {
+                    detail = d
+                }
             }
         }
         .onChange(of: playerVM.currentURL) { _, newURL in
@@ -161,6 +211,35 @@ struct DetailView: View {
             }
             .buttonStyle(.bordered)
             .disabled(playerVM.currentURL == nil && PlaybackEngine.fastPathURL(for: item) == nil)
+        }
+    }
+
+    // MARK: - 分集点播
+
+    /// 点某集：有预铸直链直接播；没有就用该集 epLink 调 loadResource 现铸再播。
+    private func playEpisode(_ ep: DetailEpisode) {
+        currentEpisodeId = ep.id
+        episodeError = nil
+        if let urlString = ep.videoURL, !urlString.isEmpty {
+            playerVM.playLine(PlayLine(
+                name: ep.title,
+                url: urlString,
+                description: ep.description,
+                playerHint: ep.playerHint
+            ))
+            return
+        }
+        Task {
+            do {
+                let lines = try await host.loadResource(link: ep.link, title: ep.title)
+                if let first = lines.first {
+                    playerVM.playLine(first)
+                } else {
+                    episodeError = "这集没有可用的播放线路"
+                }
+            } catch {
+                episodeError = "这集解析失败：\(error.localizedDescription)"
+            }
         }
     }
 

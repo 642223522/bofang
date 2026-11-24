@@ -211,6 +211,20 @@ final class PlayerViewModel: ObservableObject {
         setCurrent(line)
     }
 
+    /// 直接播一条指定线路（分集点播用）：把这条线放进线路列表并切过去。
+    /// 已有同样 URL 的线不重复加；失败记录里有它就清掉（手动点的允许重试）。
+    /// 地址非法时报 failed，不静默。
+    func playLine(_ line: PlayLine) {
+        failedURLs.remove(line.url)
+        if !lines.contains(where: { $0.url == line.url }) {
+            lines.insert(line, at: 0)
+        }
+        if !setCurrent(line) {
+            failureReason = "这条线路的地址不对，播不了"
+            status = .failed("这条线路的地址不对，播不了")
+        }
+    }
+
     /// 播放器报错时调（Views 层监听 AVPlayerItemFailedToPlayToEndTime 等）。
     /// 先试下一条没失败过的线，都失败才报 failed。
     func markFailed(_ reason: String) {

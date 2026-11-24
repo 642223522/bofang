@@ -105,6 +105,9 @@ struct ModuleDescriptor: Identifiable {
     let functionName: String
     let type: String?
     let cacheDuration: Int
+    /// 该模块是否需要 WebView 才能跑（Rex 格式字段，如 huangguo.js 全是 false）。
+    /// true 的模块当前版本暂不支持：入口处标出来、调用时给人话报错，不静默失败。
+    let requiresWebView: Bool = false
     /// 每个 param 是 {name, title, type, value}，type 是 input / constant / page
     let params: [[String: Any]]
 }
@@ -128,6 +131,33 @@ struct PlayLine {
     let name: String
     let url: String
     let description: String
+    /// 播放器提示（如 "hlsjs"，AES-128 HLS；AVPlayer 原生支持 AES-128 HLS，照常播，hint 只存不用）
+    let playerHint: String? = nil
+}
+
+/// 详情（loadDetail 返回）：含分集 childItems（短剧站，如 huangguo.js）。
+struct DetailItem {
+    let id: String
+    let title: String
+    let link: String
+    let coverURL: String?
+    let description: String
+    /// 详情自带的直链（首集预铸的 URL，没有为空）
+    let videoURL: String?
+    let episodes: [DetailEpisode]
+}
+
+/// 一集（loadDetail 的 childItems 一项）：type "url"。
+struct DetailEpisode: Identifiable, Hashable {
+    let id: String
+    let title: String
+    /// 该集的播放链接（huangguo://video/<id>/ep/<n> 这类自定义 scheme；点开时交给 loadResource 现铸）
+    let link: String
+    /// 预铸的直链（首集有，其余集为空，点开时现铸）
+    let videoURL: String?
+    let description: String
+    /// 播放器提示（如 "hlsjs"，只存不用）
+    let playerHint: String?
 }
 
 /// 已导入的源记录。清单存在 Documents/sources.json，
