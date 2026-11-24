@@ -224,7 +224,7 @@ final class CustomPlayerController: ObservableObject {
         item.startsOnFirstEligibleVariant = true
         // 预热：详情页打开、item 一建好就先 load isPlayable（不阻塞起播，
         // 只是让 asset 提前走完 TLS/重定向/签名校验，首个 play() 少等首字节）。
-        Task { _ = try? await item.load(.isPlayable) }
+        Task { _ = try? await item.asset.load(.isPlayable) }
         currentItem = item
         // 就绪后 play：自动播真正可靠的触发点。旧播放器只在 replace 后调一次 play()，
         // item 还没就绪时那次 play() 会丢，时间就停在 0:00:00 不走——这里就绪后再补一次。
@@ -577,6 +577,7 @@ struct CustomPlayerView: View {
                 if controller.controlsVisible {
                     PlayerControlBar(
                         isPlaying: controller.isPlaying,
+                        isBuffering: controller.isLoading,
                         currentTime: controller.currentTime,
                         duration: controller.duration,
                         bufferedEnd: controller.bufferedEnd,
@@ -585,7 +586,6 @@ struct CustomPlayerView: View {
                         qualityOptions: controller.qualityOptions,
                         onQualitySelected: { controller.switchQuality(to: $0) },
                         isFullscreen: false,
-                        isBuffering: controller.isLoading,
                         onFullscreen: { controller.enterFullscreen() },
                         onClose: nil,
                         statusText: nil,
@@ -643,6 +643,7 @@ struct FullscreenPlayerContent: View {
                 if controller.controlsVisible {
                     PlayerControlBar(
                         isPlaying: controller.isPlaying,
+                        isBuffering: controller.isLoading,
                         currentTime: controller.currentTime,
                         duration: controller.duration,
                         bufferedEnd: controller.bufferedEnd,
@@ -651,7 +652,6 @@ struct FullscreenPlayerContent: View {
                         qualityOptions: controller.qualityOptions,
                         onQualitySelected: { controller.switchQuality(to: $0) },
                         isFullscreen: true,
-                        isBuffering: controller.isLoading,
                         onFullscreen: { onExit() },
                         onClose: nil,
                         statusText: nil,
