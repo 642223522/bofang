@@ -110,6 +110,21 @@ struct ModuleDescriptor: Identifiable {
     let requiresWebView: Bool = false
     /// 每个 param 是 {name, title, type, value}，type 是 input / constant / page
     let params: [[String: Any]]
+
+    /// 显式 init（不依赖编译器合成的 memberwise init）：
+    /// 构建 #38/#39 在 Xcode 27.2 上报 "extra argument 'requiresWebView' in call"，
+    /// 而 Models.swift 明明有该字段、构建机签出与缓存都已核实无误；
+    /// 显式写出 init 后调用点不再依赖合成行为。
+    init(id: String, title: String, description: String, functionName: String, type: String?, cacheDuration: Int, requiresWebView: Bool = false, params: [[String: Any]]) {
+        self.id = id
+        self.title = title
+        self.description = description
+        self.functionName = functionName
+        self.type = type
+        self.cacheDuration = cacheDuration
+        self.requiresWebView = requiresWebView
+        self.params = params
+    }
 }
 
 /// 模块元数据（JS 里的 WidgetMetadata）
@@ -136,6 +151,18 @@ struct PlayLine {
     /// 播这条线时 AVPlayer 要带的 Referer（解流得到的直链用，如 dood/playmogo 嵌入解出的 HLS，
     /// CDN 要 Referer=嵌入页；直链模块没这个字段时为 nil，走原有 headers 逻辑）。
     let referer: String? = nil
+
+    /// 显式 init（不依赖编译器合成的 memberwise init）：
+    /// 构建 #38/#39 在 Xcode 27.2 上报 "extra argument 'playerHint' in call"，
+    /// 而 Models.swift 明明有该字段、构建机签出与缓存都已核实无误；
+    /// 显式写出 init 后调用点不再依赖合成行为。
+    init(name: String, url: String, description: String, playerHint: String? = nil, referer: String? = nil) {
+        self.name = name
+        self.url = url
+        self.description = description
+        self.playerHint = playerHint
+        self.referer = referer
+    }
 }
 
 /// 详情（loadDetail 返回）：含分集 childItems（短剧站，如 huangguo.js）。
