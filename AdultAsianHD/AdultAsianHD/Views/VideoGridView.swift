@@ -1,7 +1,8 @@
 // VideoGridView.swift — 视频封面墙（v2 重建）
 // LazyVGrid 2 列（宽屏 3–4 列），封面卡片带收藏星标，点封面 → DetailView。
 // 下拉刷新（.refreshable）、向下滚动加载更多（到最后一项时 page+1 追加）、
-// 从详情页返回恢复滚动位置（ScrollViewReader + 记录最后可见项 id，返回时 scrollTo）。
+// 从详情页返回恢复滚动位置（iOS 17 scrollPosition 绑视口顶部那一项的 id，
+// 返回时同一行回到顶部；窄屏宽屏都一样，折叠/展开切列数也不乱）。
 // 顶部搜索框调 host.search。
 
 import SwiftUI
@@ -28,55 +29,57 @@ struct VideoGridView: View {
     @State private var errorMessage: String?
     @State private var searchText = ""
     @State private var isSearching = false
-    @State private var lastVisibleId: String?
+    /// 滚动位置锚点：视口顶部那一项的 id，由 scrollPosition 自动同步
+    /// （用户滚到哪，它就是哪一行最上面那张封面）。
+    /// 从详情页返回时 ScrollView 按这个 id 恢复，同一行回到顶部；
+    /// id 不随列数变，折叠/展开切列数、宽屏窄屏都回到同一行。
+    /// 旧修法记的是“最后可见项”（最下面一行）再 scrollTo 置顶，
+    /// 返回时整屏往下跳一屏——就是这次报的 bug，已删掉。
+    @State private var topItemId: String?
 
     var body: some View {
         GeometryReader { geometry in
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(spacing: 12) {
-                        searchBar
+            ScrollView {
+                VStack(spacing: 12) {
+                    searchBar
 
-                        if let errorMessage, items.isEmpty {
-                            EmptyState(title: "加载失败", message: errorMessage)
-                        } else if items.isEmpty && !isLoading {
-                            EmptyState(title: "这里还没有视频", message: "换个分类看看，或下拉刷新。")
-                        } else {
-                            LazyVGrid(columns: columns(for: geometry.size.width), spacing: 16) {
-                                ForEach(items) { item in
-                                    NavigationLink {
-                                        destination(for: item)
-                                    } label: {
-                                        VideoCard(item: item, sourceId: sourceId)
-                                    }
-                                    .buttonStyle(.plain)
-                                    .id(item.id)
-                                    .onAppear {
-                                        lastVisibleId = item.id
-                                        if item.id == items.last?.id {
-                                            loadNextPage()
-                                        }
+                    if let errorMessage, items.isEmpty {
+                        EmptyState(title: "加载失败", message: errorMessage)
+                    } else if items.isEmpty && !isLoading {
+                        EmptyState(title: "这里还没有视频", message: "换个分类看看，或下拉刷新。")
+                    } else {
+                        LazyVGrid(columns: columns(for: geometry.size.width), spacing: 16) {
+                            ForEach(items) { item in
+                                NavigationLink {
+                                    destination(for: item)
+                                } label: {
+                                    VideoCard(item: item, sourceId: sourceId)
+                                }
+                                .buttonStyle(.plain)
+                                .id(item.id)
+                                .onAppear {
+                                    // 只剩加载更多这一件事：到最后一项时追加下一页。
+                                    // 注意：这里不再记任何位置——位置由 scrollPosition 锚点管，
+                                    // onAppear 的触发顺序在 LazyVGrid 里不固定，记它必跳。
+                                    if item.id == items.last?.id {
+                                        loadNextPage()
                                     }
                                 }
                             }
+                        }
 
-                            if isLoading {
-                                ProgressView()
-                                    .padding()
-                            }
+                        if isLoading {
+                            ProgressView()
+                                .padding()
                         }
                     }
-                    .padding()
                 }
-                .refreshable {
-                    await reload()
-                }
-                .onAppear {
-                    // 从详情页返回时恢复到之前的位置。
-                    if let lastVisibleId {
-                        proxy.scrollTo(lastVisibleId, anchor: .top)
-                    }
-                }
+                .padding()
+            }
+            // 位置恢复就靠这一行：绑定视口顶部项的 id，返回/重建时自动回到同一行。
+            .scrollPosition(id: $topItemId, anchor: .top)
+            .refreshable {
+                await reload()
             }
         }
         .navigationTitle(title)
@@ -182,6 +185,9 @@ struct VideoGridView: View {
                 items.append(contentsOf: fetched)
             } else {
                 items = fetched
+                // 整页换了（下拉刷新 / 搜索 / 清除搜索）：旧锚点作废，回顶部，
+                // 不然 scrollPosition 会把人拉回刷新前那一行。
+                topItemId = nil
             }
             hasMore = !fetched.isEmpty
             currentPage = page
