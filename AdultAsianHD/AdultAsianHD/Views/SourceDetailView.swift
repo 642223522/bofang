@@ -1,8 +1,9 @@
 // SourceDetailView.swift — 源信息页（v2 重建）
-// 主页点源名 / 源 Tab 点源行都进这里：显示模块元数据、导入方式、
+// 源 Tab 的代码页从「源详情」进这里；主页点源名不再经过这里，
+// 直接进 SourceBrowseView（模块入口列表）。本页显示模块元数据、导入方式、
 // 自检状态，操作有导出 / 自检 / 删除（带确认）/ 上传坏模块（自检失败时）。
-// 浏览仍走「浏览此源」→ ModuleListView（原来的模块入口列表，
-// 点模块 → VideoGridView），主页浏览不断。
+// 浏览仍走「浏览此源」→ ModuleListView（模块入口列表，
+// 点模块 → VideoGridView）。
 // 元数据取自 host.meta（WidgetMeta）：id、名称、版本、描述、作者、站点都有；
 // 作者与站点是可选字段，模块没给就显示 "—"。
 
@@ -275,55 +276,5 @@ struct SourceDetailView: View {
             resultMessage = error.localizedDescription
         }
         showResultAlert = true
-    }
-}
-
-// MARK: - 浏览子页：该源的模块入口列表（原来的 SourceDetailView 内容）
-// 点模块 → VideoGridView（loadList，page=1 起）。
-// 从 WidgetHost.modules 取，排除 type == "stream" 的资源模块。
-
-private struct ModuleListView: View {
-    let source: SourceRecord
-    let host: WidgetHost
-
-    var body: some View {
-        List {
-            let modules = host.modules.filter { $0.type != "stream" }
-            if modules.isEmpty {
-                EmptyState(title: "没有可用的模块", message: "这个源里没有列表模块。")
-                    .listRowBackground(Color.clear)
-            } else {
-                ForEach(modules) { module in
-                    NavigationLink {
-                        VideoGridView(
-                            host: host,
-                            mode: .module(id: module.id),
-                            title: module.title,
-                            sourceId: source.id
-                        )
-                    } label: {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(module.title)
-                                .font(.headline)
-                            if !module.description.isEmpty {
-                                Text(module.description)
-                                    .font(.subheadline)
-                                    .foregroundColor(.secondary)
-                                    .lineLimit(2)
-                            }
-                            if module.requiresWebView {
-                                Text("需 WebView · 嵌入播放")
-                                    .font(.caption)
-                                    .foregroundColor(.orange)
-                            }
-                        }
-                        .padding(.vertical, 4)
-                    }
-                }
-            }
-        }
-        .listStyle(.plain)
-        .navigationTitle(source.title)
-        .navigationBarTitleDisplayMode(.inline)
     }
 }

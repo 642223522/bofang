@@ -4,7 +4,8 @@
 // 折叠/展开时立即重排；每个源名是一个圆角芯片（圆角 10，自适应底色 + 细边框），
 // 文字居中、单行截断，行高 56pt，初显 3 排，框高 216pt，超出框内滚动。
 // 无轮播、无最新/热门行、无「亚洲高清无码」标题。
-// 点源名 → SourceDetailView。无源时空态：「还没有源」+「去导入源」跳源 Tab。
+// 点源名 → SourceBrowseView（直接进模块入口列表，不经过源信息页）。
+// 无源时空态：「还没有源」+「去导入源」跳源 Tab。
 
 import SwiftUI
 
@@ -70,7 +71,7 @@ struct HomeView: View {
                 LazyVGrid(columns: columns(for: width), spacing: 4) {
                     ForEach(sources) { source in
                         NavigationLink {
-                            SourceDetailView(source: source)
+                            SourceBrowseView(source: source)
                         } label: {
                             Text(source.title)
                                 .font(.subheadline)

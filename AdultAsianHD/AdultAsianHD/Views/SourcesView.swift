@@ -282,7 +282,7 @@ struct SourcesView: View {
                     ForEach(store.sources) { source in
                         HStack(spacing: 12) {
                             NavigationLink {
-                                SourceDetailView(source: source)
+                                SourceCodeView(source: source)
                             } label: {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(source.title)
