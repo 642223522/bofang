@@ -155,11 +155,21 @@ workflows:
           # 用户要的就是去掉它。反正离开详情页就停播，后台音频本来就不需要。
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string fetch" "$PLIST" 2>/dev/null || true
+          # 支持方向：竖屏 + 左右横屏。源码 Info.plist 与 project.yml 的
+          # INFOPLIST_KEY_UISupportedInterfaceOrientations 里都有，但构建管线会把这个 key
+          # 弄丢（#45、#47 产物里都没有），iPhone 上缺它默认只竖屏，自定义播放器的
+          # 全屏（要 .landscape）会被 app 级竖屏掩码挡住转不过去。这里跟后台模式一样，
+          # 在已编好的 .app 上直接补，保证进最终 IPA。
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations array" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations:0 string UIInterfaceOrientationPortrait" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations:1 string UIInterfaceOrientationLandscapeLeft" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations:2 string UIInterfaceOrientationLandscapeRight" "$PLIST" 2>/dev/null || true
           echo "--- 修复后的 Info.plist ---"
           /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$PLIST"
           /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST"
           /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$PLIST"
           /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :UISupportedInterfaceOrientations" "$PLIST"
       - name: Package IPA
         script: |
           set -eo pipefail
