@@ -18,7 +18,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     @Published private(set) var lastSyncAt: Date?
     /// 自检结果：[源 id: 结果]，持久化在 Documents/check-results.json
     /// （与 sources.json 分开，不动 SourceRecord）。
-    @Published private(set) var checkResults: [String: SourceCheckResult] = []
+    @Published private(set) var checkResults: [String: SourceCheckResult] = [:]
 
     private let fileManager = FileManager.default
     private let sourcesDirectory: URL
@@ -179,12 +179,12 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     /// 找已存在的重复源：同模块 id，或同站点域名（读对方 JS 文件算域名）。
     /// 返回重复的那个源（没有返回 nil）。同 id 优先于同域名。
     /// 同一站点/内容池被不同域名或不同模块重复收录时，只留一个。
-    func existingDuplicate(for meta: WidgetMeta, jsSource: String) async -> SourceRecord? {
+    func existingDuplicate(for meta: WidgetMeta, jsSource jsText: String) async -> SourceRecord? {
         let all = await MainActor.run { self.sources }
         if let sameId = all.first(where: { $0.id == meta.id }) {
             return sameId
         }
-        guard let domain = Self.siteDomain(fromJS: jsSource, metaSite: meta.site) else { return nil }
+        guard let domain = Self.siteDomain(fromJS: jsText, metaSite: meta.site) else { return nil }
         for source in all {
             guard let js = jsSource(for: source),
                   Self.siteDomain(fromJS: js) == domain else { continue }

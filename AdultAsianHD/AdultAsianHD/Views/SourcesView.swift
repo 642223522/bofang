@@ -226,11 +226,11 @@ struct SourcesView: View {
             switch result.status {
             case .ok:
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("自检正常" + (result.checkedAt.map { " · \($0.formatted(date: .numeric, time: .short))" } ?? ""))
+                    Text("自检正常" + (result.checkedAt.map { " · \($0.formatted(date: .numeric, time: .shortened))" } ?? ""))
                         .font(.caption)
                         .foregroundColor(.green)
                     if let probe = result.deepProbe, !probe.passed {
-                        Text("深探针：坏了（\(probe.failedStep ?? "首片")）· \(probe.checkedAt.formatted(date: .numeric, time: .short))")
+                        Text("深探针：坏了（\(probe.failedStep ?? "首片")）· \(probe.checkedAt.formatted(date: .numeric, time: .shortened))")
                             .font(.caption)
                             .foregroundColor(.orange)
                     }
@@ -238,12 +238,12 @@ struct SourcesView: View {
             case .failed:
                 VStack(alignment: .leading, spacing: 2) {
                     let step = result.failedStep.map { "死在\($0)步" } ?? "自检失败"
-                    Text(step + "：" + (result.failedReason ?? result.failedLines.sorted(by: { $0.key < $1.key }).first.map { "\($0.key)：\($0.value)" } ?? "") + (result.checkedAt.map { " · \($0.formatted(date: .numeric, time: .short))" } ?? ""))
+                    Text(step + "：" + (result.failedReason ?? result.failedLines.sorted(by: { $0.key < $1.key }).first.map { "\($0.key)：\($0.value)" } ?? "") + (result.checkedAt.map { " · \($0.formatted(date: .numeric, time: .shortened))" } ?? ""))
                         .font(.caption)
                         .foregroundColor(.red)
                         .lineLimit(1)
                     if let probe = result.deepProbe, !probe.passed {
-                        Text("深探针：坏了（\(probe.failedStep ?? "首片")）· \(probe.checkedAt.formatted(date: .numeric, time: .short))")
+                        Text("深探针：坏了（\(probe.failedStep ?? "首片")）· \(probe.checkedAt.formatted(date: .numeric, time: .shortened))")
                             .font(.caption)
                             .foregroundColor(.orange)
                     }

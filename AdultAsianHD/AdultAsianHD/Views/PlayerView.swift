@@ -15,6 +15,7 @@
 // （ViewModel 给 headers；裸 AVPlayerItem(url:) 不带这些头会被 CDN 拒）；
 // memojav m3u8 快路径 headers 为 nil，走原来的 AVPlayerItem(url:) 不动它。
 
+import AVFoundation
 import AVKit
 import SwiftUI
 

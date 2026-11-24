@@ -104,7 +104,7 @@ final class WidgetHost: @unchecked Sendable {
         // 取 WidgetMetadata
         guard let metaValue = context.objectForKeyedSubscript("WidgetMetadata"),
               !metaValue.isUndefined, !metaValue.isNull,
-              let metaDict = metaValue.toDictionary() else {
+              let metaDict = metaValue.toDictionary() as? [String: Any] else {
             throw WidgetHostError.invalidFormat("这个脚本不是 ForwardWidget 模块格式（缺 WidgetMetadata）")
         }
         let metaId = metaDict["id"] as? String ?? ""
@@ -452,9 +452,9 @@ final class WidgetHost: @unchecked Sendable {
                     return items
                 }
                 // 拦截命中但返回空，或没命中：都继续走直调 WP REST（真空还是假空由它判定）
-            } catch is CancellationError {
+            } catch let e as CancellationError {
                 requestInterceptor.disarm(token: token)
-                throw error
+                throw e
             } catch {
                 requestInterceptor.disarm(token: token)
                 // 模块这条路抛错也继续走直调；直调再失败才报
