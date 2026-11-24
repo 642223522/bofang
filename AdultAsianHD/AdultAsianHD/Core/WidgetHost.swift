@@ -447,34 +447,60 @@ final class WidgetHost: @unchecked Sendable {
     /// 进模块时后台竞速（只跑一次）：调固定验线拿样本，各调 loadResource 解线计时，
     /// 最快且能播的线记为本次首选线（preferredLine，内存里，进模块时重算）。
     /// 没分出胜负 / 两条都死 / 无固定验线 → preferredLine 保持 nil，按现有逻辑。
-    /// 不抛错、不阻塞调用方；后台跑，跑完写 preferredLine。
+    /// 不抛错、不阻塞调用方；后台跑，跑完写 preferredLine，并把结果
+    /// （胜出线、各线耗时）记到 SourceStore，供检测页显示。
     /// 播放器读 preferredLine：首选 memojav 走快路径直拼；首选 nmcorp 先走 loadResource 拿 nmcorp 线。
     func raceLinesIfNeeded() {
         guard !didRaceLines else { return }
         didRaceLines = true
         Task.detached { [weak self] in
             guard let self else { return }
-            let winner = await self.runLineRace()
+            let outcome = await self.runLineRace()
             self.raceLock.lock()
-            self._preferredLine = winner
+            self._preferredLine = outcome.winner
             self.raceLock.unlock()
+            // 结果记到 SourceStore（检测页显示用；竞速算法本身不动）。
+            // key 是 WidgetMeta.id，与 SourceRecord.id 同一个值。
+            await SourceStore.shared.recordRaceResult(
+                LineRaceResult(
+                    winnerLabel: outcome.winner?.displayLabel,
+                    timings: outcome.timings,
+                    racedAt: Date(),
+                    note: outcome.note
+                ),
+                for: self.meta.id
+            )
         }
+    }
+
+    /// 一次竞速的内部结果：胜出线 + 每种线的最快耗时 + 没分出胜负的原因。
+    /// 算法与原来一字不差（并发解线、每样本第一条可播线定种类、最快获胜）；
+    /// 只是把原来只留胜者、其余丢掉的计时也收起来，记到 SourceStore 供检测页显示。
+    private struct LineRaceOutcome {
+        let winner: PreferredLine?
+        let timings: [LineTiming]
+        let note: String?
     }
 
     /// 真正跑竞速：固定验线取样本，并发调 loadResource 解线计时。
     /// 每样本取第一条能播的线（.m3u8 或 .mp4）定种类；最快的那种线获胜。
-    /// 没样本 / 都解不出 / 种类认不出 → nil（按现有逻辑）。
+    /// 没样本 / 都解不出 / 种类认不出 → winner 为 nil（按现有逻辑），note 写清原因。
     /// 并发跑：两条线同时解，总耗时取最慢的一条，不叠加。
-    private func runLineRace() async -> PreferredLine? {
-        guard let probe = fixedProbeModule() else { return nil }
+    private func runLineRace() async -> LineRaceOutcome {
+        guard let probe = fixedProbeModule() else {
+            return LineRaceOutcome(winner: nil, timings: [], note: "没有固定验线")
+        }
         let samples: [VideoItem]
         do {
             samples = try await loadList(moduleId: probe.id, page: 1)
         } catch {
-            return nil
+            return LineRaceOutcome(winner: nil, timings: [], note: "验线样本取不到")
         }
-        guard !samples.isEmpty else { return nil }
+        guard !samples.isEmpty else {
+            return LineRaceOutcome(winner: nil, timings: [], note: "固定验线没有返回样本")
+        }
         var best: (kind: PreferredLine, elapsed: TimeInterval)?
+        var fastestByKind: [PreferredLine: TimeInterval] = [:]
         await withTaskGroup(of: (PreferredLine, TimeInterval)?.self) { group in
             for sample in samples {
                 group.addTask {
@@ -496,12 +522,23 @@ final class WidgetHost: @unchecked Sendable {
             }
             for await result in group {
                 guard let result else { continue }
+                if let prev = fastestByKind[result.0] {
+                    fastestByKind[result.0] = min(prev, result.1)
+                } else {
+                    fastestByKind[result.0] = result.1
+                }
                 if best == nil || result.1 < best!.elapsed {
                     best = result
                 }
             }
         }
-        return best?.kind
+        let timings = fastestByKind
+            .map { LineTiming(kind: $0.key.displayLabel, milliseconds: Int($0.value * 1000)) }
+            .sorted { $0.milliseconds < $1.milliseconds }
+        guard let winner = best?.kind else {
+            return LineRaceOutcome(winner: nil, timings: timings, note: "样本都解不出可播线路")
+        }
+        return LineRaceOutcome(winner: winner, timings: timings, note: nil)
     }
 
     /// 调指定模块的列表函数，返回视频列表。

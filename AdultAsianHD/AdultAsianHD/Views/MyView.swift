@@ -1,6 +1,7 @@
 // MyView.swift — 我的 Tab（v2 重建）
-// 两层：第一层只是入口列表（下载、设置、关于）；点一个入口进第二层，
-// 里面是该功能的列表与操作。下载管理在第二层：Downloader.tasks 列表，
+// 两层：第一层只是入口列表（收藏、下载、设置、关于）；点一个入口进第二层，
+// 里面是该功能的列表与操作。收藏原来是底部第二项，现挪到这里（入口换地方，
+// 收藏本身、详情页星标、增删都不动）。下载管理在第二层：Downloader.tasks 列表，
 // 标题 + 进度条 + 状态，支持删除已下载文件。
 
 import SwiftUI
@@ -8,6 +9,12 @@ import SwiftUI
 struct MyView: View {
     var body: some View {
         List {
+            NavigationLink {
+                FavoritesView()
+            } label: {
+                Label("收藏", systemImage: "star")
+            }
+
             NavigationLink {
                 DownloadsView()
             } label: {

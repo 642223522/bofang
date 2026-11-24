@@ -5,9 +5,17 @@ import Foundation
 /// 线路竞速决出的首选线（按模块 id 存内存，进模块时重算）。
 /// memojav：静态 m3u8，可直拼快路径；nmcorp：签名 MP4，必须走 loadResource 现解。
 /// nil（没竞速 / 没分出胜负 / 两条都死 / 无固定验线）= 按现有逻辑（快路径 + 备线）。
-enum PreferredLine: Equatable {
+enum PreferredLine: Hashable {
     case memojav
     case nmcorp
+
+    /// 检测页显示用（竞速结果里写哪条线胜出）。
+    var displayLabel: String {
+        switch self {
+        case .memojav: return "MemoJav"
+        case .nmcorp: return "NMCorp"
+        }
+    }
 }
 
 enum PlaybackEngine {

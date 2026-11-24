@@ -19,11 +19,16 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     /// 自检结果：[源 id: 结果]，持久化在 Documents/check-results.json
     /// （与 sources.json 分开，不动 SourceRecord）。
     @Published private(set) var checkResults: [String: SourceCheckResult] = [:]
+    /// 线路竞速结果：[源 id（= WidgetMeta.id）: 结果]，持久化在 Documents/race-results.json。
+    /// 竞速本身仍在 WidgetHost 跑（进模块时 raceLinesIfNeeded），这里只归拢结果，
+    /// 供检测 Tab 显示（哪条线胜出、各线耗时、下次重测）。
+    @Published private(set) var raceResults: [String: LineRaceResult] = [:]
 
     private let fileManager = FileManager.default
     private let sourcesDirectory: URL
     private let manifestURL: URL
     private let checkResultsURL: URL
+    private let raceResultsURL: URL
 
     private let giteeTokenKey = "gitee.token"
     private let lastSyncDefaultsKey = "gitee.lastSyncAt"
@@ -55,12 +60,14 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         self.sourcesDirectory = documents.appendingPathComponent("Sources", isDirectory: true)
         self.manifestURL = documents.appendingPathComponent("sources.json")
         self.checkResultsURL = documents.appendingPathComponent("check-results.json")
+        self.raceResultsURL = documents.appendingPathComponent("race-results.json")
         try? fileManager.createDirectory(at: sourcesDirectory, withIntermediateDirectories: true)
         if let timestamp = UserDefaults.standard.object(forKey: lastSyncDefaultsKey) as? TimeInterval {
             self.lastSyncAt = Date(timeIntervalSince1970: timestamp)
         }
         loadManifest()
         loadCheckResults()
+        loadRaceResults()
     }
 
     // MARK: - 清单读写
@@ -221,6 +228,8 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             self.saveManifest()
             self.checkResults.removeValue(forKey: source.id)
             self.saveCheckResults()
+            self.raceResults.removeValue(forKey: source.id)
+            self.saveRaceResults()
         }
         if Thread.isMainThread {
             update()
@@ -442,6 +451,40 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             self.checkResults[sourceId] = result
             self.saveCheckResults()
         }
+    }
+
+    // MARK: - 线路竞速结果（归拢，不跑竞速）
+
+    /// 竞速结果持久化：Documents/race-results.json（与 check-results.json 同一套路）。
+    private func loadRaceResults() {
+        guard let data = try? Data(contentsOf: raceResultsURL),
+              let decoded = try? JSONDecoder().decode([String: LineRaceResult].self, from: data) else {
+            self.raceResults = [:]
+            return
+        }
+        self.raceResults = decoded
+    }
+
+    private func saveRaceResults() {
+        guard let data = try? JSONEncoder().encode(raceResults) else { return }
+        try? data.write(to: raceResultsURL, options: .atomic)
+    }
+
+    /// WidgetHost 跑完竞速后调这里记一笔（进模块时 raceLinesIfNeeded → 记结果）。
+    /// 竞速算法本身不动，这里只收结果：胜出线、各线耗时、时间。
+    func recordRaceResult(_ result: LineRaceResult, for sourceId: String) async {
+        await MainActor.run {
+            self.raceResults[sourceId] = result
+            self.saveRaceResults()
+        }
+    }
+
+    /// 后台自动自检的轮次说明（检测页“同步与健康”区显示用）：
+    /// 轻检 12 小时一轮，深探针 7 天一轮（直接读现有的轮次常量，不另写死数字）。
+    var autoCheckCycleDescription: String {
+        let lightHours = Int(autoCheckInterval / 3600)
+        let deepDays = Int(deepProbeInterval / (24 * 3600))
+        return "轻检 \(lightHours) 小时一轮，深探针 \(deepDays) 天一轮"
     }
 
     /// JS 内容指纹（FNV-1a 64 位哈希转十六进制）：增量自检用。
@@ -1293,6 +1336,27 @@ enum CheckStepError: Error {
     case http(Int)
     /// URL 非法
     case badURL
+}
+
+/// 一次线路竞速里某条线的耗时（kind 是显示名，如 "MemoJav" / "NMCorp"）。
+struct LineTiming: Codable {
+    let kind: String
+    /// 该线解出可播链接的耗时（毫秒）
+    let milliseconds: Int
+}
+
+/// 一次线路竞速的结果（WidgetHost 进模块时 raceLinesIfNeeded 跑完记一笔）。
+/// winnerLabel 为 nil = 没分出胜负（note 写清原因，如“两条线都解不出”）。
+/// 下次重测：进模块时 host 重建即重跑；检测页“重新竞速”也是同一条路。
+struct LineRaceResult: Codable {
+    /// 胜出的线（显示名，如 "MemoJav"）；没分出胜负时 nil
+    var winnerLabel: String?
+    /// 各线耗时（每种线取最快的一次）
+    var timings: [LineTiming]
+    /// 竞速时间
+    var racedAt: Date
+    /// 没分出胜负时的原因（如“没有固定验线”、“样本都解不出可播线路”）；分出胜负时 nil
+    var note: String?
 }
 
 // MARK: - 自检结果（单独持久化在 check-results.json，不动 SourceRecord）

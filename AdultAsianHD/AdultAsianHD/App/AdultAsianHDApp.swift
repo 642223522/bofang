@@ -1,6 +1,8 @@
 // AdultAsianHDApp.swift — App 入口（v2 重建，1.0.0）
-// 四 Tab 顺序固定：主页 / 收藏 / 源 / 我的。App 级持有 SourceStore.shared
-// 并注入 environmentObject；外观跟随 SettingsView 的 @AppStorage 选择。
+// 四 Tab 顺序固定：主页 / 检测 / 源 / 我的。收藏原来是底部第二项，
+// 现挪到「我的」第一层入口里；第二项改放检测（自检 / 线路竞速 / 同步与健康）。
+// App 级持有 SourceStore.shared 并注入 environmentObject；
+// 外观跟随 SettingsView 的 @AppStorage 选择。
 
 import SwiftUI
 
@@ -31,9 +33,9 @@ struct AdultAsianHDApp: App {
                 .tag(0)
 
                 NavigationStack {
-                    FavoritesView()
+                    DiagnosticsView()
                 }
-                .tabItem { Label("收藏", systemImage: "star") }
+                .tabItem { Label("检测", systemImage: "stethoscope") }
                 .tag(1)
 
                 NavigationStack {
