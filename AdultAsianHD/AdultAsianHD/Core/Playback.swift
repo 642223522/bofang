@@ -116,7 +116,8 @@ enum PlayerStatus: Equatable {
     case failed(String)
 }
 
-/// 只管 URL 与线路状态；AVPlayer 本身由 Views 层包（AVPlayerViewController），
+/// 只管 URL 与线路状态；AVPlayer 本身由 Views 层的自定义播放器
+/// （CustomPlayerView：AVPlayerLayer + 自绘底条，不用 AVPlayerViewController），
 /// 嵌入页由 WebViewPlayer.swift（页内播）+ EmbedStreamExtractor.swift（解流）负责，
 /// ViewModel 只做路由：直链 → 现有 AVPlayer，嵌入页 → 先解流、解不出再 WebView。
 /// 播放流程：快路径先上（不抓帖页、不验播单），后台再跑模块的 loadResource 拿备线；
@@ -141,7 +142,9 @@ final class PlayerViewModel: ObservableObject {
     private var failedURLs: Set<String> = []
     /// 每次 play 换一个 generation，旧的后台备线任务回来发现对不上就丢弃，
     /// 防止切到别的片后旧备线写回 lines。
-    private var playGeneration = UUID()
+    /// internal（不 private）：自定义播放器靠它区分“新片/新一集”（从 0:00 起）
+    /// 还是“同片切线”（保当前进度）。
+    var playGeneration = UUID()
     /// 当前片的帖页链接：nmcorp 签名 MP4 的 Referer 就用它（模块取播放器页时也是这个 Referer）。
     private var currentItemLink: String?
     /// 正在跑的混合解流（一次只跑一路；换线/停播时取消，旧结果写不回来）。
@@ -349,7 +352,9 @@ final class PlayerViewModel: ObservableObject {
     /// 直接播一条指定线路（分集点播用）：把这条线放进线路列表并切过去。
     /// 已有同样 URL 的线不重复加；失败记录里有它就清掉（手动点的允许重试）。
     /// 地址非法时报 failed，不静默。
+    /// 分集是新片：换 generation，自定义播放器从 0:00 起播（不同于 switchLine 的同片保进度）。
     func playLine(_ line: PlayLine) {
+        playGeneration = UUID()
         failedURLs.remove(line.url)
         if !lines.contains(where: { $0.url == line.url }) {
             lines.insert(line, at: 0)

@@ -1,15 +1,19 @@
 // DetailView.swift — 详情页（v2 重建）
-// 顶部 16:9 小窗口内嵌 AVPlayerViewController（PlayerView），不弹全屏；
+// 顶部 16:9 小窗口内嵌自定义播放器（CustomPlayerView：AVPlayerLayer + 自绘底条，
+// 不用 AVPlayerViewController，所以不触发系统 Now Playing，灵动岛干干净净），不弹全屏；
 // 点封面进来 onAppear 即调 PlayerViewModel.play(item, host) 自动起播，从 0:00 开始，
-// 不自动续播（新 AVPlayerItem 本来就从 0:00 起）。currentURL 变化由 PlayerView
-// 在 update 时换 item 并 play。播放/暂停、线路切换都直接作用于同一个 AVPlayer。
-// “正在解析播放线路…”只在 status == .loading 时显示，PlayerView 的 coordinator
+// 不自动续播（新 AVPlayerItem 本来就从 0:00 起）。currentURL 变化由 CustomPlayerView
+// 的 controller 换 item：新片/新一集从 0:00 起，同片切线保当前进度；
+// 就绪后再 play（自动播可靠的触发点），卡住 2 秒再补一次 play()。
+// 播放/暂停按钮在播放器底条里，状态由 timeControlStatus 驱动（真正在出帧才显示“暂停”），
+// 不再用本地 isPlaying 旗子猜（那正是旧版状态对不上的根）。
+// “正在解析播放线路…”只在 status == .loading 时显示，controller
 // 真监听到出帧（timeControlStatus == .playing）才调 markPlaying() 让它消失，
 // 不再等后台 loadResource。离开页面 onDisappear 停播（pause + replaceCurrentItem(nil)
 // + playerVM.stop()，迟到的备线也被 generation 拦住）。
 // 失败时红字显示 failureReason。下载：m3u8 走 downloadHLS，mp4 走 downloadMP4。
 
-import AVKit
+import AVFoundation
 import SwiftUI
 
 struct DetailView: View {
@@ -24,10 +28,11 @@ struct DetailView: View {
     @State private var player: AVPlayer = {
         let player = AVPlayer()
         // 起播不等攒缓冲：有首帧就播，不等 forward buffer 攒满（慢首帧的主因之一）。
+        // 不走 AirPlay（用户不要），也不触发 Now Playing（自定义播放器只用 AVPlayerLayer）。
         player.automaticallyWaitsToMinimizeStalling = false
+        player.allowsExternalPlayback = false
         return player
     }()
-    @State private var isPlaying = false
     @State private var downloadAlertMessage: String?
     @State private var showDownloadAlert = false
     /// 分集详情（loadDetail 返回；没有 loadDetail 的模块为 nil，不显示分集区）。
@@ -40,15 +45,15 @@ struct DetailView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                // 播放器：嵌入页 fallback 时显示 WebView 播放器，否则显示 AVPlayer 直链播放器。
-                // 解出直链后回到 AVPlayer，快进、跟手进度条还是原生的。
+                // 播放器：嵌入页 fallback 时显示 WebView 播放器（同一套自定义底条），
+                // 否则显示直链自定义播放器（AVPlayerLayer + 自绘底条）。
                 if let webViewURL = playerVM.webViewURL {
                     WebViewPlayerView(url: webViewURL, onClose: { playerVM.closeWebView() })
                         .aspectRatio(16.0 / 9.0, contentMode: .fit)
                         .background(Color.black)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                 } else {
-                    PlayerView(player: player, url: playerVM.currentURL, headers: playerVM.currentHeaders, viewModel: playerVM)
+                    CustomPlayerView(player: player, url: playerVM.currentURL, headers: playerVM.currentHeaders, viewModel: playerVM)
                         .aspectRatio(16.0 / 9.0, contentMode: .fit)
                         .background(Color.black)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -175,12 +180,9 @@ struct DetailView: View {
                 }
             }
         }
-        .onChange(of: playerVM.currentURL) { _, newURL in
-            // 有了可播 URL 即视为正在播（实际换 item + play 由 PlayerView.update 做）。
-            isPlaying = newURL != nil
-        }
         .onChange(of: playerVM.isResolvingEmbed) { _, resolving in
             // 开始解嵌入页时，停掉正在播的直链（不然旧的直链会继续出声）。
+            // 只 pause，不改 controller 的 shouldPlay：解出直链后新 URL 到达会自动播起来。
             if resolving { player.pause() }
         }
         .onChange(of: playerVM.webViewURL) { _, webURL in
@@ -191,7 +193,6 @@ struct DetailView: View {
             player.pause()
             player.replaceCurrentItem(with: nil)
             playerVM.stop()
-            isPlaying = false
         }
         .alert("下载", isPresented: $showDownloadAlert) {
             Button("好", role: .cancel) {}
@@ -200,7 +201,9 @@ struct DetailView: View {
         }
     }
 
-    // MARK: - 按钮行：收藏 / 播放-暂停切换 / 下载
+    // MARK: - 按钮行：收藏 / 下载
+    // 播放/暂停在播放器底条里（状态由 timeControlStatus 驱动），这里不再另设一个
+    // （旧版这里的 isPlaying 是本地旗子，和真实播放状态对不上，正是状态 bug 的根）。
 
     private var buttonRow: some View {
         HStack(spacing: 16) {
@@ -213,19 +216,6 @@ struct DetailView: View {
                 )
             }
             .buttonStyle(.bordered)
-
-            Button {
-                if isPlaying {
-                    player.pause()
-                } else {
-                    player.play()
-                }
-                isPlaying.toggle()
-            } label: {
-                Label(isPlaying ? "暂停" : "播放", systemImage: isPlaying ? "pause.fill" : "play.fill")
-            }
-            .buttonStyle(.bordered)
-            .disabled(playerVM.currentURL == nil)
 
             Button {
                 downloadCurrent()
