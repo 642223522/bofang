@@ -116,7 +116,10 @@ struct PlayerView: UIViewControllerRepresentable {
 
             let item: AVPlayerItem
             if let headers {
-                let asset = AVURLAsset(url: url, options: [AVURLAssetHTTPHeaderFieldsKey: headers])
+                // AVURLAssetHTTPHeaderFieldsKey 在 Xcode 27.2 / iOS 27 SDK 的 Swift 接口里不可见
+                //（import AVFoundation 也找不到，#36 因此失败），改用等值字面量——
+                // 该常量的字符串值就是它自己的名字，运行时等价。
+                let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
                 item = AVPlayerItem(asset: asset)
             } else {
                 item = AVPlayerItem(url: url)
