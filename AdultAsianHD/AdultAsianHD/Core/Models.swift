@@ -107,7 +107,9 @@ struct ModuleDescriptor: Identifiable {
     let cacheDuration: Int
     /// 该模块是否需要 WebView 才能跑（Rex 格式字段，如 huangguo.js 全是 false）。
     /// true 的模块走嵌入播放：先混合解流（解出直链→AVPlayer），解不出再页内 WebView 播。
-    let requiresWebView: Bool = false
+    /// 注意：声明处不给默认值（默认值在下方显式 init 的参数里）——
+    /// 声明处给了 `= false` 又在 init 里赋值，Swift 会报 "immutable value may only be initialized once"（构建 #41 就是这么死的）。
+    let requiresWebView: Bool
     /// 每个 param 是 {name, title, type, value}，type 是 input / constant / page
     let params: [[String: Any]]
 
@@ -147,10 +149,12 @@ struct PlayLine {
     let url: String
     let description: String
     /// 播放器提示（如 "hlsjs"，AES-128 HLS；AVPlayer 原生支持 AES-128 HLS，照常播，hint 只存不用）
-    let playerHint: String? = nil
+    /// 注意：声明处不给默认值（默认值在下方显式 init 的参数里）——
+    /// 声明处给了 `= nil` 又在 init 里赋值，Swift 会报 "immutable value may only be initialized once"（构建 #41 就是这么死的）。
+    let playerHint: String?
     /// 播这条线时 AVPlayer 要带的 Referer（解流得到的直链用，如 dood/playmogo 嵌入解出的 HLS，
     /// CDN 要 Referer=嵌入页；直链模块没这个字段时为 nil，走原有 headers 逻辑）。
-    let referer: String? = nil
+    let referer: String?
 
     /// 显式 init（不依赖编译器合成的 memberwise init）：
     /// 构建 #38/#39 在 Xcode 27.2 上报 "extra argument 'playerHint' in call"，
