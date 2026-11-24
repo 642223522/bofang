@@ -35,6 +35,11 @@ struct DetailView: View {
     }()
     @State private var downloadAlertMessage: String?
     @State private var showDownloadAlert = false
+    /// 全屏是不是开着（CustomPlayerView 从 controller 同步上来）：
+    /// 全屏进出会触发 onDisappear/onAppear，靠它区分“去全屏”还是“真离开”。
+    @State private var isFullscreen = false
+    /// 本次进详情页是否已起播过：起播只做一次（首进），从全屏回来不重播、不从头。
+    @State private var hasStartedPlayback = false
     /// 分集详情（loadDetail 返回；没有 loadDetail 的模块为 nil，不显示分集区）。
     @State private var detail: DetailItem?
     /// 正在播的分集 id（点播时记下来，勾选标记用）。
@@ -53,7 +58,7 @@ struct DetailView: View {
                         .background(Color.black)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                 } else {
-                    CustomPlayerView(player: player, url: playerVM.currentURL, headers: playerVM.currentHeaders, viewModel: playerVM)
+                    CustomPlayerView(player: player, url: playerVM.currentURL, headers: playerVM.currentHeaders, viewModel: playerVM, isFullscreen: $isFullscreen)
                         .aspectRatio(16.0 / 9.0, contentMode: .fit)
                         .background(Color.black)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -170,8 +175,13 @@ struct DetailView: View {
         .navigationTitle("详情")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
-            Task {
-                await playerVM.play(item: item, host: host)
+            // 起播只做一次（首进）：全屏进出也会触发 onAppear，回来不重播、不从头。
+            // 分集加载不受影响（每次出现都取，幂等）。
+            if !hasStartedPlayback {
+                hasStartedPlayback = true
+                Task {
+                    await playerVM.play(item: item, host: host)
+                }
             }
             Task {
                 // 分集：模块有 loadDetail 就取详情（短剧站）；没有就当没有分集，不报错。
@@ -190,6 +200,9 @@ struct DetailView: View {
             if webURL != nil { player.pause() }
         }
         .onDisappear {
+            // 全屏时不拆播放器：全屏模态盖上来也会触发 onDisappear，
+            // 只是去全屏、没离开详情页，回来要接着播；真离开（isFullscreen=false）才停播。
+            guard !isFullscreen else { return }
             player.pause()
             player.replaceCurrentItem(with: nil)
             playerVM.stop()

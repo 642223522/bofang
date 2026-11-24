@@ -363,9 +363,12 @@ final class CustomPlayerController: ObservableObject {
         showControlsTemporarily()
     }
 
-    /// 开始拖进度条：记下拖之前是不是在播，拖动期间先停播（seek 干净不卡）。
+    /// 开始拖进度条：记下拖之前用户是不是想播，拖动期间先停播（seek 干净不卡）。
+    /// 用 shouldPlay（用户意图）记，不用 isPlaying（瞬时 timeControlStatus）：
+    /// 播着的片在等缓冲时会短暂进 .waitingToPlayAtSpecifiedRate，isPlaying=false，
+    /// 用它记就会把“在播”记成“暂停”，松手不续播；shouldPlay 只有用户点暂停才变 false。
     func beginScrub() {
-        wasPlayingBeforeScrub = isPlaying
+        wasPlayingBeforeScrub = shouldPlay
         player.pause()
     }
 
@@ -382,16 +385,24 @@ final class CustomPlayerController: ObservableObject {
     func endScrub(to seconds: Double) {
         guard let item = currentItem, item.status == .readyToPlay, duration > 0 else { return }
         let clamped = min(max(seconds, 0), duration)
+        currentTime = clamped
+        let resume = wasPlayingBeforeScrub
         player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600),
                     toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
                 self.currentTime = clamped
-                if self.wasPlayingBeforeScrub {
+                if resume {
                     self.shouldPlay = true
                     self.player.play()
                 }
             }
+        }
+        // 兜底：seek 回调万一丢了（被后一次 seek 顶掉、手势异常结束），
+        // 也不要一直停在暂停态——先直接补一次 play()，回调里再补一次也无害。
+        if resume {
+            shouldPlay = true
+            player.play()
         }
     }
 
@@ -457,14 +468,18 @@ struct CustomPlayerView: View {
     let url: URL?
     let headers: [String: String]?
     let viewModel: PlayerViewModel
+    /// 全屏状态上行到 DetailView：详情页靠它判断 onDisappear 是不是全屏引起的，
+    /// 全屏时不拆播放器、不停播；退出全屏回来接着播。
+    @Binding var isFullscreen: Bool
 
     @StateObject private var controller: CustomPlayerController
 
-    init(player: AVPlayer, url: URL?, headers: [String: String]?, viewModel: PlayerViewModel) {
+    init(player: AVPlayer, url: URL?, headers: [String: String]?, viewModel: PlayerViewModel, isFullscreen: Binding<Bool>) {
         self.player = player
         self.url = url
         self.headers = headers
         self.viewModel = viewModel
+        _isFullscreen = isFullscreen
         _controller = StateObject(wrappedValue: CustomPlayerController(player: player, viewModel: viewModel))
     }
 
@@ -506,6 +521,8 @@ struct CustomPlayerView: View {
         .onChange(of: url) { _, newURL in controller.load(url: newURL, headers: headers) }
         .onChange(of: headers) { _, newHeaders in controller.load(url: url, headers: newHeaders) }
         .onChange(of: controller.isFullscreen) { _, fullscreen in
+            // 全屏状态同步给 DetailView（它靠这个判断 onDisappear 是不是全屏引起的）。
+            isFullscreen = fullscreen
             if fullscreen {
                 FullscreenPlayerPresenter.present(
                     player: player,
@@ -583,7 +600,10 @@ final class FullscreenPlayerViewController: UIViewController {
         self.viewModel = viewModel
         self.onExit = onExit
         super.init(nibName: nil, bundle: nil)
-        modalPresentationStyle = .fullScreen
+        // overFullScreen（不是 fullScreen）：盖全屏时底下的详情页不从层级里摘掉，
+        // DetailView 的 onDisappear/onAppear 不触发，播放器不被拆、不重播。
+        // 用 fullScreen 的话，盖上来就触发 onDisappear 拆播放器，退出又触发 onAppear 从头重播。
+        modalPresentationStyle = .overFullScreen
         isModalInPresentation = true
     }
 
