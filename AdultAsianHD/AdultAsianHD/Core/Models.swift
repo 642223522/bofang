@@ -143,8 +143,12 @@ struct WidgetMeta {
     let site: String?
 }
 
-/// 一条播放线路（loadResource 返回的项）
-struct PlayLine {
+/// 一条播放线路（loadResource 返回的项）。
+/// Hashable：PlayerControlBar 的 QualityOption（Identifiable, Hashable）里存了一条 PlayLine，
+/// PlayLine 不实现 Hashable 时编译器无法自动合成 QualityOption 的 Hashable/Equatable
+/// （构建 #46 就是这么死的）。字段全是 String / String?，可自动合成；
+/// 显式 init 不动，协议一致性合成不依赖 memberwise init。
+struct PlayLine: Hashable {
     let name: String
     let url: String
     let description: String
