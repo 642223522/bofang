@@ -479,6 +479,47 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         }
     }
 
+    // MARK: - 本会话竞速去重（内存里，不持久化；关软件即清零）
+
+    /// 本会话已开过竞速的源 id（自动竞速或手动重竞，开始即记）。
+    /// 只放内存、不写磁盘：下次打开软件（新会话）进模块重新竞速。
+    /// 注意别拿 raceResults（持久化到 race-results.json）来去重，那样关软件
+    /// 重开也不会再竞速。锁保护：WidgetHost 的竞速在后台 Task 写、主线程读。
+    private let sessionRaceLock = NSLock()
+    private var racedThisSession: Set<String> = []
+    /// 本会话各源定下的首选线（竞速跑完记一笔；没分出胜负时不记）。
+    /// 新 host 不重竞时，preferredLine 的兜底读这里。
+    private var sessionPreferredLines: [String: PreferredLine] = [:]
+
+    /// 本会话这个源开过竞速没有（开始即算，不管结果出没出）。
+    func hasRacedThisSession(_ sourceId: String) -> Bool {
+        sessionRaceLock.lock()
+        defer { sessionRaceLock.unlock() }
+        return racedThisSession.contains(sourceId)
+    }
+
+    /// 本会话这个源定下的首选线（还没竞完 / 没分出胜负时 nil）。
+    func sessionPreferredLine(for sourceId: String) -> PreferredLine? {
+        sessionRaceLock.lock()
+        defer { sessionRaceLock.unlock() }
+        return sessionPreferredLines[sourceId]
+    }
+
+    /// 竞速开始时记一笔（同步记：重入瞬间两个 host 不会都开竞）。
+    func markRaceStarted(for sourceId: String) {
+        sessionRaceLock.lock()
+        defer { sessionRaceLock.unlock() }
+        racedThisSession.insert(sourceId)
+    }
+
+    /// 竞速跑完记一笔：首选线进会话缓存（分出胜负才记；nil 不记）。
+    func markRaceFinished(for sourceId: String, preferredLine: PreferredLine?) {
+        guard let preferredLine else { return }
+        sessionRaceLock.lock()
+        defer { sessionRaceLock.unlock() }
+        sessionPreferredLines[sourceId] = preferredLine
+    }
+
     /// 后台自动自检的轮次说明（检测页“同步与健康”区显示用）：
     /// 轻检 12 小时一轮，深探针 7 天一轮（直接读现有的轮次常量，不另写死数字）。
     var autoCheckCycleDescription: String {
@@ -1347,7 +1388,8 @@ struct LineTiming: Codable {
 
 /// 一次线路竞速的结果（WidgetHost 进模块时 raceLinesIfNeeded 跑完记一笔）。
 /// winnerLabel 为 nil = 没分出胜负（note 写清原因，如“两条线都解不出”）。
-/// 下次重测：进模块时 host 重建即重跑；检测页“重新竞速”也是同一条路。
+/// 下次重测：本会话再进模块不再自动重跑（每模块每会话只竞一次）；
+/// 检测页“重新竞速”点一次强制重测一次。
 struct LineRaceResult: Codable {
     /// 胜出的线（显示名，如 "MemoJav"）；没分出胜负时 nil
     var winnerLabel: String?

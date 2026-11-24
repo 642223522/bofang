@@ -2,7 +2,7 @@ import Foundation
 
 /// 播放快路径：番号 → memojav 静态播单直拼，不抓帖页、不验播单。
 /// 点封面的一瞬间就能拼出播单 URL，直接交给 AVPlayer。
-/// 线路竞速决出的首选线（按模块 id 存内存，进模块时重算）。
+/// 线路竞速决出的首选线（按模块 id 存内存，本会话每模块只竞一次、关软件重开再竞）。
 /// memojav：静态 m3u8，可直拼快路径；nmcorp：签名 MP4，必须走 loadResource 现解。
 /// nil（没竞速 / 没分出胜负 / 两条都死 / 无固定验线）= 按现有逻辑（快路径 + 备线）。
 enum PreferredLine: Hashable {

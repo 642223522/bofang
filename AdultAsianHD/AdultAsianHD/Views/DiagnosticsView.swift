@@ -193,8 +193,8 @@ struct DiagnosticsView: View {
 // MARK: - 竞速明细（点一行进来）
 
 /// 某源一次竞速的明细：胜出线、各线耗时、竞速时间、没分出胜负的原因。
-/// “重新竞速”走同一条老路：现建一个 host 调 raceLinesIfNeeded（每个 host 只跑一次，
-/// 新 host 即重跑）；结果记回 SourceStore 后本页自动刷新。
+/// “重新竞速”走同一条老路：现建一个 host 调 raceLinesIfNeeded(force: true)
+///（无视本会话去重，强制重测一次）；结果记回 SourceStore 后本页自动刷新。
 /// 竞速跑着的时候 host 存在 @State 里扣着（不然 host 一释放，后台竞速就丢了）。
 private struct RaceDetailView: View {
     let source: SourceRecord
@@ -310,7 +310,8 @@ private struct RaceDetailView: View {
                 let host = try store.loadHost(for: source)
                 // host 扣在 @State 里，竞速跑完（结果记回 store）前不释放。
                 racingHost = host
-                host.raceLinesIfNeeded()
+                // 手动重竞：force 强制重测一次（无视本会话“每模块只竞一次”的去重）。
+                host.raceLinesIfNeeded(force: true)
             } catch {
                 racing = false
                 raceError = "加载源失败：\(error.localizedDescription)"

@@ -19,15 +19,20 @@ final class WidgetHost: @unchecked Sendable {
     /// 分类请求拦截器（一个 host 一个，跟着它自己的 JSContext 走）。
     private let requestInterceptor: CategoryRequestInterceptor
     /// 线路竞速（进模块时跑一次）：本次该模块的首选线。
-    /// 内存里，进模块时重算；离开不保留（host 释放即丢弃）。
-    /// nil = 没竞速 / 没分出胜负 / 两条都死 / 无固定验线 → 按现有逻辑。
+    /// 本会话（开软件到关软件）每个模块只自动竞速一次：首选线记在 SourceStore
+    /// 的会话缓存里，新 host 不重竞时 preferredLine 兜底读它（见下面 getter）。
+    /// 内存里；关软件即丢弃，下次打开重竞。nil = 没竞速 / 没分出胜负 /
+    /// 两条都死 / 无固定验线 → 按现有逻辑。
     /// 锁保护：竞速在后台 Task 写，播放器在主线程读。
     private let raceLock = NSLock()
     private var _preferredLine: PreferredLine?
     var preferredLine: PreferredLine? {
         raceLock.lock()
         defer { raceLock.unlock() }
-        return _preferredLine
+        if let line = _preferredLine { return line }
+        // 本会话别的 host 已竞出首选线：直接用它，不再重竞。
+        // 竞速还在跑时这里是 nil，播放器按现有逻辑走（与竞速前一样）。
+        return SourceStore.shared.sessionPreferredLine(for: meta.id)
     }
     /// 是否已跑过竞速（一个 host 只跑一次，进模块时触发）。
     private var didRaceLines = false
@@ -444,15 +449,26 @@ final class WidgetHost: @unchecked Sendable {
         }
     }
 
-    /// 进模块时后台竞速（只跑一次）：调固定验线拿样本，各调 loadResource 解线计时，
-    /// 最快且能播的线记为本次首选线（preferredLine，内存里，进模块时重算）。
+    /// 进模块时后台竞速：每个模块、每次打开软件到关闭软件，最多自动竞速一次。
+    /// 旧行为是“一个 host 只跑一次”，但 loadHost 每次都 new host，等于每次进
+    /// 模块、从封面页返回都重竞（下测试片段抢网，感觉慢）。
+    /// 本会话已竞过 → 不再跑，直接用会话里定的首选线（preferredLine 兜底读它）。
+    /// force=true（检测页“重新竞速”）无视会话去重，强制重测一次。
+    /// 调固定验线拿样本，各调 loadResource 解线计时，最快且能播的线记为本次首选线。
     /// 没分出胜负 / 两条都死 / 无固定验线 → preferredLine 保持 nil，按现有逻辑。
     /// 不抛错、不阻塞调用方；后台跑，跑完写 preferredLine，并把结果
     /// （胜出线、各线耗时）记到 SourceStore，供检测页显示。
     /// 播放器读 preferredLine：首选 memojav 走快路径直拼；首选 nmcorp 先走 loadResource 拿 nmcorp 线。
-    func raceLinesIfNeeded() {
+    func raceLinesIfNeeded(force: Bool = false) {
         guard !didRaceLines else { return }
         didRaceLines = true
+        // 本会话已竞过：不再下测试片段抢网，首选线由 preferredLine 兜底读会话缓存。
+        if !force, SourceStore.shared.hasRacedThisSession(meta.id) {
+            return
+        }
+        // 同步先把 id 记进本会话已竞集合：重入瞬间（进模块又立刻返回再进）
+        // 两个 host 不会都开竞。手动重竞也记，防并发的自动竞速插进来。
+        SourceStore.shared.markRaceStarted(for: meta.id)
         Task.detached { [weak self] in
             guard let self else { return }
             let outcome = await self.runLineRace()
@@ -470,6 +486,8 @@ final class WidgetHost: @unchecked Sendable {
                 ),
                 for: self.meta.id
             )
+            // 首选线进会话缓存：同会话再进这个模块的新 host 直接用，不重竞。
+            SourceStore.shared.markRaceFinished(for: self.meta.id, preferredLine: outcome.winner)
         }
     }
 
