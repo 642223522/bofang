@@ -357,7 +357,7 @@ struct SourcesView: View {
         let contentTypes = [UTType(filenameExtension: "js") ?? .plainText]
         let controller = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: true)
         controller.delegate = picker
-        controller.allowsMultipleSelection = false
+        controller.allowsMultipleSelection = true
 
         guard let top = Self.topViewController() else {
             documentPicker = nil
@@ -381,32 +381,54 @@ struct SourcesView: View {
         return top
     }
 
+    /// 批量导入：一次选多个 .js 一起导。逐个处理（每个文件单独开安全域读），
+    /// 最后汇总弹一次结果，不一个一个弹。单个文件也走同一条路。
     private func handlePickedDocuments(_ urls: [URL]) {
         documentPicker = nil
-        guard let url = urls.first else { return }
+        guard !urls.isEmpty else { return }
         isReading = true
-        readingLabel = "正在读取文件…"
+        readingLabel = "正在导入 1/\(urls.count)…"
         Task { @MainActor in
-            let data = await Task.detached(priority: .userInitiated) { () -> Data? in
-                let scoped = url.startAccessingSecurityScopedResource()
-                defer {
-                    if scoped { url.stopAccessingSecurityScopedResource() }
+            var importedTitles: [String] = []
+            var skippedTitles: [String] = []
+            var failedLines: [String] = []
+            for (index, url) in urls.enumerated() {
+                readingLabel = "正在导入 \(index + 1)/\(urls.count)…"
+                let data = await Task.detached(priority: .userInitiated) { () -> Data? in
+                    let scoped = url.startAccessingSecurityScopedResource()
+                    defer {
+                        if scoped { url.stopAccessingSecurityScopedResource() }
+                    }
+                    return try? Data(contentsOf: url)
+                }.value
+                guard let data else {
+                    failedLines.append("\(url.lastPathComponent)：读取文件失败")
+                    continue
                 }
-                return try? Data(contentsOf: url)
-            }.value
-            guard let data else {
-                isReading = false
-                showResultAlert("读取文件失败，请确认文件存在且是 .js 文件。")
-                return
+                switch await store.importData(data, fileName: url.lastPathComponent, origin: "外部导入") {
+                case .success(let record):
+                    importedTitles.append(record.title)
+                case .failure(let error):
+                    // 已存在相同源：算跳过，不算失败
+                    if case .duplicate(let existingTitle) = error {
+                        skippedTitles.append(existingTitle)
+                    } else {
+                        failedLines.append("\(url.lastPathComponent)：\(error.localizedDescription)")
+                    }
+                }
             }
-            let result = await store.importData(data, fileName: url.lastPathComponent, origin: "外部导入")
             isReading = false
-            switch result {
-            case .success(let record):
-                showResultAlert("已导入 \(record.title)")
-            case .failure(let error):
-                showResultAlert(error.localizedDescription)
+            var parts: [String] = []
+            if !importedTitles.isEmpty {
+                parts.append("已导入 \(importedTitles.count) 个源：\(importedTitles.joined(separator: "、"))")
             }
+            if !skippedTitles.isEmpty {
+                parts.append("已跳过 \(skippedTitles.count) 个重复源：\(skippedTitles.joined(separator: "、"))")
+            }
+            if !failedLines.isEmpty {
+                parts.append("失败 \(failedLines.count) 个：\n\(failedLines.joined(separator: "\n"))")
+            }
+            showResultAlert(parts.isEmpty ? "没有导入任何源。" : parts.joined(separator: "\n"))
         }
     }
 

@@ -316,7 +316,16 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             guard let name = entry["name"] as? String else { continue }
             let rawURLString = entry["download_url"] as? String
                 ?? "https://gitee.com/individual-freedom/ziyong-ziliao-beifang/raw/js/\(name)"
-            guard let rawURL = URL(string: rawURLString) else { continue }
+            // 下载也要带 Token：仓库是私有的，裸 GET 拉 raw 文件会被码云 403 拦
+            // （列表请求带了 Token 所以能列出文件，下载没带所以 403）。
+            // 两处都带：Authorization 头（直连时用）+ access_token 查询参数
+            // （URLSession 跨域重定向会丢 Authorization 头，查询参数能活下来）。
+            var rawComponents = URLComponents(string: rawURLString)
+            var rawQueryItems = rawComponents?.queryItems ?? []
+            rawQueryItems.removeAll { $0.name == "access_token" }
+            rawQueryItems.append(URLQueryItem(name: "access_token", value: effectiveToken))
+            rawComponents?.queryItems = rawQueryItems
+            guard let rawURL = rawComponents?.url else { continue }
 
             let existing = await MainActor.run { self.sources.first(where: { $0.fileName == name }) }
             if let existing {
@@ -328,7 +337,11 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             }
 
             do {
-                let (data, response) = try await URLSession.shared.data(from: rawURL)
+                var downloadRequest = URLRequest(url: rawURL)
+                downloadRequest.setValue("token \(effectiveToken)", forHTTPHeaderField: "Authorization")
+                downloadRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
+                downloadRequest.timeoutInterval = 30
+                let (data, response) = try await URLSession.shared.data(for: downloadRequest)
                 if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
                     if firstError == nil { firstError = "下载 \(name) 失败（HTTP \(http.statusCode)）" }
                     continue
