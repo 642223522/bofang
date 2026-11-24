@@ -100,16 +100,11 @@ struct FavoritesView: View {
                     ForEach(favorites.entries) { entry in
                         NavigationLink(value: entry) {
                             HStack(spacing: 12) {
-                                AsyncImage(url: coverURL(of: entry)) { phase in
-                                    switch phase {
-                                    case .success(let image):
-                                        image.resizable().aspectRatio(contentMode: .fill)
-                                    default:
-                                        Color(.systemGray5)
-                                    }
-                                }
-                                .frame(width: 96, height: 54)
-                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                                // 和网格同一套封面加载（带重试 + 黄果密文解密），
+                                // 不然收藏里的黄果封面还是灰框。
+                                CoverImage(urlString: entry.coverURL)
+                                    .frame(width: 96, height: 54)
+                                    .clipShape(RoundedRectangle(cornerRadius: 6))
                                 Text(entry.title)
                                     .font(.subheadline)
                                     .lineLimit(2)
@@ -131,11 +126,6 @@ struct FavoritesView: View {
         .navigationDestination(for: FavoriteEntry.self) { entry in
             FavoriteDetailLoader(entry: entry)
         }
-    }
-
-    private func coverURL(of entry: FavoriteEntry) -> URL? {
-        guard let raw = entry.coverURL, !raw.isEmpty else { return nil }
-        return URL(string: raw)
     }
 }
 

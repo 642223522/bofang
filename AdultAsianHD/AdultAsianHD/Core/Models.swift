@@ -159,21 +159,32 @@ struct PlayLine: Hashable {
     /// 播这条线时 AVPlayer 要带的 Referer（解流得到的直链用，如 dood/playmogo 嵌入解出的 HLS，
     /// CDN 要 Referer=嵌入页；直链模块没这个字段时为 nil，走原有 headers 逻辑）。
     let referer: String?
+    /// 朋友桥的线路标记：这条线要求剥广告（onlybokep.js 的 loadDetail 会把
+    /// loadResource 线路上的 adStrip 原样透传到 childItems；朋友的宿主认这个标记，
+    /// 我们以前没接——解析时直接丢了）。嵌入页播放器恒开广告剥离，
+    /// 这个标记记下来供以后按线精细控制。
+    let adStrip: Bool
+
+    /// 显式 init（不依赖编译器合成的 memberwise init）：
 
     /// 显式 init（不依赖编译器合成的 memberwise init）：
     /// 构建 #38/#39 在 Xcode 27.2 上报 "extra argument 'playerHint' in call"，
     /// 而 Models.swift 明明有该字段、构建机签出与缓存都已核实无误；
     /// 显式写出 init 后调用点不再依赖合成行为。
-    init(name: String, url: String, description: String, playerHint: String? = nil, referer: String? = nil) {
+    init(name: String, url: String, description: String, playerHint: String? = nil, referer: String? = nil, adStrip: Bool = false) {
         self.name = name
         self.url = url
         self.description = description
         self.playerHint = playerHint
         self.referer = referer
+        self.adStrip = adStrip
     }
 }
 
 /// 详情（loadDetail 返回）：含分集 childItems（短剧站，如 huangguo.js）。
+/// relatedItems：朋友桥的 loadDetail 给分类返回的相关视频（onlybokep.js 的
+/// loadDetail 对分类链接返回 relatedItems）；我们以前解析时直接丢了，
+/// 现在接住，详情页下方显示“相关”区。
 struct DetailItem {
     let id: String
     let title: String
@@ -183,6 +194,21 @@ struct DetailItem {
     /// 详情自带的直链（首集预铸的 URL，没有为空）
     let videoURL: String?
     let episodes: [DetailEpisode]
+    /// 相关视频（loadDetail 的 relatedItems，没有为空数组）
+    let relatedItems: [VideoItem]
+
+    /// 显式 init（PlayLine/ModuleDescriptor 同款原因：不依赖编译器合成的
+    /// memberwise init，Xcode 27.2 上合成行为不可靠）。
+    init(id: String, title: String, link: String, coverURL: String?, description: String, videoURL: String?, episodes: [DetailEpisode], relatedItems: [VideoItem] = []) {
+        self.id = id
+        self.title = title
+        self.link = link
+        self.coverURL = coverURL
+        self.description = description
+        self.videoURL = videoURL
+        self.episodes = episodes
+        self.relatedItems = relatedItems
+    }
 }
 
 /// 一集（loadDetail 的 childItems 一项）：type "url"。
@@ -196,6 +222,19 @@ struct DetailEpisode: Identifiable, Hashable {
     let description: String
     /// 播放器提示（如 "hlsjs"，只存不用）
     let playerHint: String?
+    /// 朋友桥标记：这集要求剥广告（同 PlayLine.adStrip，透传用）。
+    let adStrip: Bool
+
+    /// 显式 init（PlayLine 同款原因）。
+    init(id: String, title: String, link: String, videoURL: String?, description: String, playerHint: String? = nil, adStrip: Bool = false) {
+        self.id = id
+        self.title = title
+        self.link = link
+        self.videoURL = videoURL
+        self.description = description
+        self.playerHint = playerHint
+        self.adStrip = adStrip
+    }
 }
 
 /// 已导入的源记录。清单存在 Documents/sources.json，

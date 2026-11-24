@@ -27,9 +27,11 @@ struct DetailView: View {
     @StateObject private var playerVM = PlayerViewModel()
     @State private var player: AVPlayer = {
         let player = AVPlayer()
-        // 起播不等攒缓冲：有首帧就播，不等 forward buffer 攒满（慢首帧的主因之一）。
+        // 等缓冲再播（true）：四家 AI 一致纠正，false 会让播放器一有首帧就播、
+        // 首片播完必卡；true 让 AVPlayer 按实测速度管起播缓冲。配合
+        // CustomPlayerView 的 10 秒前向缓冲 + 起播码率封顶。
         // 不走 AirPlay（用户不要），也不触发 Now Playing（自定义播放器只用 AVPlayerLayer）。
-        player.automaticallyWaitsToMinimizeStalling = false
+        player.automaticallyWaitsToMinimizeStalling = true
         player.allowsExternalPlayback = false
         return player
     }()
@@ -166,6 +168,23 @@ struct DetailView: View {
                             }
                             .buttonStyle(.plain)
                             Divider()
+                        }
+                    }
+                }
+
+                // 相关视频：朋友桥的 loadDetail 给分类返回的 relatedItems，
+                // 以前解析时直接丢了，现在接住显示（点开进新详情页）。
+                if let detail, !detail.relatedItems.isEmpty {
+                    Text("相关")
+                        .font(.headline)
+                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
+                        ForEach(detail.relatedItems) { rel in
+                            NavigationLink {
+                                DetailView(item: rel, host: host, sourceId: sourceId)
+                            } label: {
+                                VideoCard(item: rel, sourceId: sourceId)
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
                 }

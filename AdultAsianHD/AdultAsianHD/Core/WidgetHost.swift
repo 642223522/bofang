@@ -271,6 +271,33 @@ final class WidgetHost: @unchecked Sendable {
         console.setValue(log, forProperty: "log")
         context.setObject(console, forKeyedSubscript: "console" as NSString)
 
+        // setTimeout / clearTimeout：裸 JavaScriptCore 没有这两个（浏览器才有），
+        // 但模块里常用来做超时兜底（比如 onlybokep 封面补全的 8 秒封顶）；
+        // 没有它模块调 setTimeout 会直接报 ReferenceError。补一个最小实现：
+        // 主线程延时回调，返回一个数字 id 供 clearTimeout 取消。
+        // 注意：回调里 JSContext 可能已释放，调之前先判空，不 crash。
+        var timerCounter = 0
+        var timers: [Int: DispatchWorkItem] = [:]
+        let setTimeout: @convention(block) (JSValue, Double) -> Int = { [weak context] callback, delayMs in
+            timerCounter += 1
+            let id = timerCounter
+            // delay 非数/没传时按 0 算（JS 调 setTimeout(fn) 不带延迟时 JSC 传过来的就是 NaN）。
+            let delay = delayMs.isFinite ? delayMs : 0
+            let work = DispatchWorkItem {
+                timers.removeValue(forKey: id)
+                guard let context, !callback.isUndefined, !callback.isNull else { return }
+                callback.call(withArguments: [])
+            }
+            timers[id] = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay / 1000.0, execute: work)
+            return id
+        }
+        let clearTimeout: @convention(block) (Int) -> Void = { id in
+            timers.removeValue(forKey: id)?.cancel()
+        }
+        context.setObject(setTimeout as @convention(block) (JSValue, Double) -> Int, forKeyedSubscript: "setTimeout" as NSString)
+        context.setObject(clearTimeout as @convention(block) (Int) -> Void, forKeyedSubscript: "clearTimeout" as NSString)
+
         context.setObject(widget, forKeyedSubscript: "Widget" as NSString)
     }
 
@@ -987,8 +1014,18 @@ final class WidgetHost: @unchecked Sendable {
                     link: epLink,
                     videoURL: (child["videoUrl"] as? String).flatMap { $0.nilIfEmpty },
                     description: child["description"] as? String ?? "",
-                    playerHint: child["playerHint"] as? String
+                    playerHint: child["playerHint"] as? String,
+                    // 朋友桥标记透传（同 PlayLine.adStrip）。
+                    adStrip: (child["adStrip"] as? Bool) ?? false
                 ))
+            }
+        }
+        // 朋友桥：loadDetail 给分类返回的相关视频（relatedItems），以前直接丢了。
+        var related: [VideoItem] = []
+        if let relArray = dict["relatedItems"] as? [Any] {
+            for raw in relArray {
+                guard let rel = raw as? [String: Any] else { continue }
+                related.append(videoItem(from: rel))
             }
         }
         return DetailItem(
@@ -998,7 +1035,8 @@ final class WidgetHost: @unchecked Sendable {
             coverURL: base.coverURL,
             description: base.description,
             videoURL: (dict["videoUrl"] as? String).flatMap { $0.nilIfEmpty },
-            episodes: episodes
+            episodes: episodes,
+            relatedItems: related
         )
     }
 
@@ -1023,7 +1061,9 @@ final class WidgetHost: @unchecked Sendable {
                 url: url,
                 description: dict["description"] as? String ?? "",
                 playerHint: dict["playerHint"] as? String,
-                referer: (dict["referer"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                referer: (dict["referer"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                // 朋友桥标记：模块说这条线要剥广告（onlybokep.js 透传），以前直接丢了。
+                adStrip: (dict["adStrip"] as? Bool) ?? false
             ))
         }
         return lines

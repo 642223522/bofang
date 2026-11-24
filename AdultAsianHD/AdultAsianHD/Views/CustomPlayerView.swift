@@ -93,14 +93,27 @@ final class CustomPlayerController: ObservableObject {
     private var endObserver: NSObjectProtocol?
     private var hideTask: Task<Void, Never>?
     private var stallKickTask: Task<Void, Never>?
+    /// 起播码率封顶的放开计时：播稳 12 秒后把 preferredPeakBitRate/720p 封顶撤掉。
+    /// 四家 AI 一致：起播先封顶（800Kbps + 720p）防 4G 下一上来就抢高码率变体饿死，
+    /// 播稳后再放开吃满画质。每个新 item 重新封顶、重新计时。
+    private var capLiftTask: Task<Void, Never>?
+    private var capsLifted = false
+    /// accessLog 采样计数（周期回调 0.25 秒一次，每 8 次≈2 秒采一次，
+    /// 只记数、不动播放；DEBUG 下打印，供定位“到底是带宽还是首字节延迟”）。
+    private var accessLogSampleCount = 0
     private var cancellables = Set<AnyCancellable>()
 
     init(player: AVPlayer, viewModel: PlayerViewModel) {
         self.player = player
         self.viewModel = viewModel
-        // 不出灵动岛：不走 AirPlay（用户不要），起播不等攒缓冲。
+        // 不出灵动岛：不走 AirPlay（用户不要）。
         player.allowsExternalPlayback = false
-        player.automaticallyWaitsToMinimizeStalling = false
+        // 等缓冲再播（true，默认值）：四家 AI 一致纠正——设 false 会让播放器
+        // 一有首帧就立即播，首片播完、下一片还没拉到就必卡（8 秒停就是这么来的）；
+        // true 让 AVPlayer 按实测下载速度动态管起播缓冲阈值，起播稍慢一点、
+        // 播起来不断。配合同一文件里 replaceItem 的 10 秒前向缓冲 + 起播码率封顶。
+        // （首帧速度若真机回退明显，可再 A/B 测 false——ChatGPT 的保留意见。）
+        player.automaticallyWaitsToMinimizeStalling = true
         setupPlayerObservations()
         // 线路表是后台慢慢补的（loadResource），变了就重算画质选项。
         viewModel.$lines
@@ -119,6 +132,7 @@ final class CustomPlayerController: ObservableObject {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         hideTask?.cancel()
         stallKickTask?.cancel()
+        capLiftTask?.cancel()
     }
 
     // MARK: - 换项与自动播
@@ -168,6 +182,10 @@ final class CustomPlayerController: ObservableObject {
         }
         stallKickTask?.cancel()
         stallKickTask = nil
+        capLiftTask?.cancel()
+        capLiftTask = nil
+        capsLifted = false
+        accessLogSampleCount = 0
         didMarkPlayingURL = nil
         didMarkFailedURL = nil
         pendingResumeAt = resumeAt
@@ -190,7 +208,23 @@ final class CustomPlayerController: ObservableObject {
         } else {
             item = AVPlayerItem(url: url)
         }
-        item.preferredForwardBufferDuration = 2
+        // 前向缓冲 10 秒（约 2~3 个分片）：memojav 分片 4~8 秒、码率约 2.1Mbps，
+        // 4G 下拉一个分片要几秒；只留 2 秒缓冲的话，播到第一片末尾（8.34 秒）
+        // 才开始拉下一片、根本来不及，必定在 8 秒处饿死。10 秒让播放器一边播
+        // 一边提前拉 2~3 片，4G 下也有余量；起播缓冲阈值由
+        // automaticallyWaitsToMinimizeStalling=true 交给 AVPlayer 按实测速度管。
+        item.preferredForwardBufferDuration = 10
+        // 起播码率封顶（四家 AI 一致）：先 800Kbps + 720p 起播，防 4G 下一上来
+        // 就抢最高码率变体、首片没播完就饿死；播稳 12 秒后放开（见 capLiftTask）。
+        // 蜂窝单独封顶（preferredPeakBitRateForExpensiveNetworks），WiFi 走通用封顶。
+        item.preferredPeakBitRate = 800_000
+        item.preferredPeakBitRateForExpensiveNetworks = 800_000
+        item.preferredMaximumResolution = CGSize(width: 1280, height: 720)
+        // 有合规变体就先播，不等最高码率变体就绪（首帧快一步）。
+        item.startsOnFirstEligibleVariant = true
+        // 预热：详情页打开、item 一建好就先 load isPlayable（不阻塞起播，
+        // 只是让 asset 提前走完 TLS/重定向/签名校验，首个 play() 少等首字节）。
+        Task { _ = try? await item.load(.isPlayable) }
         currentItem = item
         // 就绪后 play：自动播真正可靠的触发点。旧播放器只在 replace 后调一次 play()，
         // item 还没就绪时那次 play() 会丢，时间就停在 0:00:00 不走——这里就绪后再补一次。
@@ -274,15 +308,21 @@ final class CustomPlayerController: ObservableObject {
                 viewModel.markPlaying()
             }
             showControlsTemporarily()
+            // 播稳了就开始计 12 秒，满了放开起播码率封顶。
+            scheduleCapLift()
         case .paused:
             isPlaying = false
             stallKickTask?.cancel()
+            capLiftTask?.cancel()
             // 暂停时控制条常显，不自动藏。
             controlsVisible = true
         case .waitingToPlayAtSpecifiedRate:
             // 等数据/缓冲：不算在播（按钮显示“播放”），画面转圈。
             isPlaying = false
             isLoading = true
+            // 等缓冲不算播稳：放开计时取消，播起来再重计。
+            capLiftTask?.cancel()
+            scheduleStallKick()
             scheduleStallKick()
         @unknown default:
             break
@@ -304,11 +344,51 @@ final class CustomPlayerController: ObservableObject {
         }
     }
 
+    /// 起播码率封顶的放开：连续播满 12 秒才放开（800Kbps + 720p → 不限），
+    /// 中间一旦暂停/等缓冲就取消重计；每个新 item 重新封顶、重新计时。
+    /// 放开只是撤掉“起播求稳”的上限，画质仍由 AVPlayer 按带宽自适应。
+    private func scheduleCapLift() {
+        guard !capsLifted, currentItem != nil else { return }
+        capLiftTask?.cancel()
+        capLiftTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 12_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            guard self.player.timeControlStatus == .playing,
+                  let item = self.currentItem, item.status == .readyToPlay else { return }
+            item.preferredPeakBitRate = 0
+            item.preferredPeakBitRateForExpensiveNetworks = 0
+            item.preferredMaximumResolution = .zero
+            self.capsLifted = true
+        }
+    }
+
+    /// accessLog 采样（DEBUG 日志用）：卡顿到底是带宽不够还是首字节延迟，
+    /// 看 observedBitrate（实测带宽）和 numberOfStalls（卡顿次数）才知道，
+    /// 不能只凭感觉加缓冲。采样本身不影响播放。
+    private func sampleAccessLog(_ item: AVPlayerItem) {
+        guard let event = item.accessLog()?.events.last else { return }
+        #if DEBUG
+        print("[HLS] observedBitrate=\(Int(event.observedBitrate)) indicatedBitrate=\(Int(event.indicatedBitrate)) stalls=\(event.numberOfStalls) uri=\(event.uri ?? "")")
+        #endif
+    }
+
     private func handlePeriodicTime(_ time: CMTime) {
         currentTime = time.seconds
         if let item = currentItem {
             updateDuration(item)
             updateBuffered(item)
+            // 兜底：item 万一进了 failed、KVO/通知又没抓到（回调丢了），
+            // 这里每 0.25 秒扫一次也能发现，立刻走失败切线；handleItemFailure
+            // 自带“同一 URL 只认一次” guard，重复调无害。
+            if item.status == .failed {
+                handleItemFailure(item)
+            }
+            // 每 2 秒采一次 accessLog（8 次 × 0.25 秒）。
+            accessLogSampleCount += 1
+            if accessLogSampleCount >= 8 {
+                accessLogSampleCount = 0
+                sampleAccessLog(item)
+            }
         }
     }
 
@@ -505,6 +585,7 @@ struct CustomPlayerView: View {
                         qualityOptions: controller.qualityOptions,
                         onQualitySelected: { controller.switchQuality(to: $0) },
                         isFullscreen: false,
+                        isBuffering: controller.isLoading,
                         onFullscreen: { controller.enterFullscreen() },
                         onClose: nil,
                         statusText: nil,
@@ -570,6 +651,7 @@ struct FullscreenPlayerContent: View {
                         qualityOptions: controller.qualityOptions,
                         onQualitySelected: { controller.switchQuality(to: $0) },
                         isFullscreen: true,
+                        isBuffering: controller.isLoading,
                         onFullscreen: { onExit() },
                         onClose: nil,
                         statusText: nil,

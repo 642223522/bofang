@@ -11,7 +11,9 @@ struct ExtractedStream {
 /// 混合解流（优先路径）：无界面 WKWebView 加载嵌入页（playmogo/dood 这类），
 /// 等页内 video 元素出 src，或拦截到 .m3u8/.mp4 请求，把直链抽出来交给 AVPlayer。
 /// WKWebView 是真浏览器，能过 Cloudflare 挑战（URLSession 直拉会被 403 拦住）。
-/// 15 秒超时、页内无 video、CF 一直拦 → 返回 nil，调用方 fallback 到页内 WebView 播放器。
+/// dood/playmogo 要点一下播放按钮才去拉流：加载完就试着点播（只点 play 字样的按钮），
+/// 点完 8 秒还没抽到直链就提前收尾，不等满 15 秒；15 秒是绝对超时。
+/// 页内无 video、CF 一直拦 → 返回 nil，调用方 fallback 到页内 WebView 播放器。
 /// 只在主线程用（WKWebView 只认主线程）；调用方（PlayerViewModel）本身就是 @MainActor。
 @MainActor
 final class EmbedStreamExtractor: NSObject {
@@ -87,6 +89,38 @@ final class EmbedStreamExtractor: NSObject {
     private var continuation: CheckedContinuation<ExtractedStream?, Never>?
     private var finished = false
     private var timeoutTask: Task<Void, Never>?
+    /// 最后一次页面加载完成的时间（CF 挑战解完会重载，每次重载都刷新；
+    /// 用它判断“页面是不是已经 settled、再等也没新东西”）。
+    private var lastSettledAt: Date?
+    /// 第一次尝试点播放的时间（见 attemptClick）。
+    private var firstClickAt: Date?
+    /// 点播放尝试次数（最多 3 次，播按钮可能晚出现）。
+    private var clickAttempts = 0
+    /// 快速失败检查：点播放后 8 秒还没抽到直链就提前收尾，不用等满 15 秒。
+    private var settleTask: Task<Void, Never>?
+
+    /// 点播放脚本：dood/playmogo 这类嵌页要用户点一下播放按钮才去拉流，
+    /// 不点就永远不出 .m3u8——以前的解流就是这么空等满 15 秒的。
+    /// 先调 video.play()（最安全，不点广告），没有 video 再点播放按钮
+    /// （只认 play 字样的按钮/海报层，不点别的链接，防点到广告跳转）。
+    /// 返回非空=点到了（或调了 play），调用方据此开始算快速失败的 8 秒。
+    private static let clickPlayScript = """
+    (function(){
+      try {
+        var v = document.querySelector('video');
+        if (v) { try { v.play(); } catch(e){} return 'video-play'; }
+        var sels = ['.vjs-big-play-button', '.jw-display-icon', '[class*="big-play"]',
+                    '[class*="play-button"]', 'button[aria-label*="Play" i]',
+                    'button[title*="Play" i]', '.play-btn', '#playBtn',
+                    '[class*="poster"]', '[id*="poster"]'];
+        for (var i = 0; i < sels.length; i++) {
+          var el = document.querySelector(sels[i]);
+          if (el && el.offsetParent !== null) { el.click(); return 'clicked:' + sels[i]; }
+        }
+      } catch(e){}
+      return '';
+    })();
+    """
 
     init(embedURL: URL) {
         self.embedURL = embedURL
@@ -132,6 +166,27 @@ final class EmbedStreamExtractor: NSObject {
             try? await Task.sleep(nanoseconds: Self.timeoutSeconds * 1_000_000_000)
             self?.finish(with: nil)
         }
+        // 快速失败：页面 settled 且已点过播放，8 秒还没抽到直链就提前收尾
+        // （dood 这类要点播才出流的站，点完 8 秒没出就不会出了；不等满 15 秒）。
+        // CF 挑战会重载页面，每次 didFinish 都刷新 lastSettledAt，时钟重算，
+        // 所以挑战慢也不会被误杀；15 秒绝对超时仍在。
+        settleTask = Task { [weak self] in
+            var ticks = 0
+            while let self, !self.finished {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !self.finished else { return }
+                ticks += 1
+                // 播按钮可能晚出现：每 2 秒补点一次（attemptClick 自己限 3 次）。
+                if ticks % 2 == 0 { self.attemptClick() }
+                if let clicked = self.firstClickAt, let settled = self.lastSettledAt {
+                    let since = Date().timeIntervalSince(max(clicked, settled))
+                    if since > 8 {
+                        self.finish(with: nil)
+                        return
+                    }
+                }
+            }
+        }
     }
 
     /// 只认第一次（抽到/超时/取消谁先到算谁），continuation 恰好 resume 一次。
@@ -140,6 +195,8 @@ final class EmbedStreamExtractor: NSObject {
         finished = true
         timeoutTask?.cancel()
         timeoutTask = nil
+        settleTask?.cancel()
+        settleTask = nil
         teardownWebView()
         let cont = continuation
         continuation = nil
@@ -176,8 +233,10 @@ final class EmbedStreamExtractor: NSObject {
         return lower.contains(".m3u8") || lower.contains(".mp4") || lower.contains(".mpd")
     }
 
-    /// 页加载完再扫一次 video/source（document-start 的脚本可能漏掉迟加入的）。
+    /// 页加载完再扫一次 video/source（document-start 的脚本可能漏掉迟加入的），
+    /// 并试着点一下播放（dood/playmogo 要点播才出流；点到了就开始算 8 秒快速失败）。
     private func scanForVideoElements() {
+        lastSettledAt = Date()
         let js = """
         (function(){
           var out=[];
@@ -192,6 +251,20 @@ final class EmbedStreamExtractor: NSObject {
             guard let self, let text = result as? String else { return }
             for line in text.split(separator: "\n") {
                 self.considerCandidate(String(line))
+            }
+        }
+        attemptClick()
+    }
+
+    /// 试着点播放（最多 3 次：播按钮可能晚出现，didFinish 和 settle 循环都会调）。
+    /// 点到了记 firstClickAt（快速失败的时钟起点）；点一次没点到不记，等下次。
+    private func attemptClick() {
+        guard !finished, clickAttempts < 3 else { return }
+        clickAttempts += 1
+        webView?.evaluateJavaScript(Self.clickPlayScript) { [weak self] result, _ in
+            guard let self, !self.finished else { return }
+            if let text = result as? String, !text.isEmpty, self.firstClickAt == nil {
+                self.firstClickAt = Date()
             }
         }
     }

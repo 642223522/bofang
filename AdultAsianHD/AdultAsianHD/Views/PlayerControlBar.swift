@@ -122,6 +122,9 @@ struct PlayerProgressSlider: View {
 struct PlayerControlBar: View {
     // 播放状态（真实状态驱动，不要用本地旗子猜）
     var isPlaying: Bool
+    /// 正在缓冲（等数据）：区别于用户点的暂停；为 true 时不显示 ▶，改显示转圈 +“缓冲中”。
+    /// 默认 false，WebView 播放器不传（它有自己的 statusText），直链播放器传 controller.isLoading。
+    var isBuffering: Bool = false
     // 进度（showsProgress=false 时不显示进度条与时间，改显示 statusText）
     var currentTime: Double
     var duration: Double
@@ -157,13 +160,21 @@ struct PlayerControlBar: View {
             }
             HStack(spacing: 12) {
                 if showsProgress {
-                    Button(action: onPlayPause) {
-                        Image(systemName: isPlaying ? "pause.fill" : "play.fill")
-                            .font(.system(size: 18))
-                            .foregroundColor(.white)
+                    if isBuffering {
+                        // 缓冲中：不要冒充暂停（▶ 会让人以为播停了、反复点播放）。
+                        // 转圈 +“缓冲中”才是真实状态；数据到了会自动续播。
+                        ProgressView()
+                            .tint(.white)
                             .frame(width: 32, height: 32)
+                    } else {
+                        Button(action: onPlayPause) {
+                            Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                                .font(.system(size: 18))
+                                .foregroundColor(.white)
+                                .frame(width: 32, height: 32)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
 
                 if showsProgress {
@@ -171,6 +182,11 @@ struct PlayerControlBar: View {
                         .font(.caption)
                         .monospacedDigit()
                         .foregroundColor(.white)
+                    if isBuffering {
+                        Text("缓冲中…")
+                            .font(.caption)
+                            .foregroundColor(.white.opacity(0.85))
+                    }
                 } else if let statusText {
                     Text(statusText)
                         .font(.caption)
