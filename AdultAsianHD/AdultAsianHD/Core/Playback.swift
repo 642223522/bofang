@@ -66,6 +66,31 @@ enum PlaybackEngine {
         return memojavURL(for: code)
     }
 
+    /// 直链（AVPlayer 能直接播）：扩展名是 m3u8/mp4/mpd/mov，或 URL 里含 .m3u8/.mp4。
+    /// 播单 URL 先过这一关：是直链走现有 AVPlayer，不是再看是不是嵌入页。
+    static func isDirectMediaURL(_ urlString: String) -> Bool {
+        guard let url = URL(string: urlString),
+              url.scheme == "http" || url.scheme == "https" else { return false }
+        let ext = url.pathExtension.lowercased()
+        if ["m3u8", "mp4", "mpd", "mov"].contains(ext) { return true }
+        let lower = urlString.lowercased()
+        return lower.contains(".m3u8") || lower.contains(".mp4")
+    }
+
+    /// 嵌入页（要先解流或 WebView 播）：http(s) 链接且不是直链；
+    /// 或 playerHint 明确标嵌入（"embed"/"webview"）。
+    /// playmogo/dood 这类嵌入页 URL 走这条；huangguo 的直链 HLS 虽然 hint 也是 hlsjs，
+    /// 但 URL 本身是 .m3u8，先被上一关认成直链，不会误判。
+    static func isEmbedURL(_ urlString: String, playerHint: String? = nil) -> Bool {
+        if let hint = playerHint?.lowercased(),
+           hint.contains("embed") || hint.contains("webview") {
+            return true
+        }
+        guard let url = URL(string: urlString),
+              url.scheme == "http" || url.scheme == "https" else { return false }
+        return !isDirectMediaURL(urlString)
+    }
+
     /// 该线路播放时要带的 HTTP 请求头。只给签名 MP4 线（nmcorp/cdn2.pvvstream
     /// 的 vid_*p.mp4?secure=…）：模块取播放器页时带 Referer=帖页才拿到签名，
     /// AVPlayer 默认不带 Referer，CDN 会拒 → 黑屏；补 Referer=帖页 + iPhone UA。
@@ -92,7 +117,8 @@ enum PlayerStatus: Equatable {
 }
 
 /// 只管 URL 与线路状态；AVPlayer 本身由 Views 层包（AVPlayerViewController），
-/// 这里不写任何 WebView 播放器。
+/// 嵌入页由 WebViewPlayer.swift（页内播）+ EmbedStreamExtractor.swift（解流）负责，
+/// ViewModel 只做路由：直链 → 现有 AVPlayer，嵌入页 → 先解流、解不出再 WebView。
 /// 播放流程：快路径先上（不抓帖页、不验播单），后台再跑模块的 loadResource 拿备线；
 /// 快路径失败时自动切备线，备线也都失败才报 failed。
 /// nmcorp 签名 MP4 换线时带上 Referer + iPhone UA（AVPlayer 默认不带，CDN 会拒），
@@ -106,6 +132,10 @@ final class PlayerViewModel: ObservableObject {
     @Published var currentHeaders: [String: String]?
     @Published var status: PlayerStatus = .idle
     @Published var failureReason: String?
+    /// 正在用页内 WebView 播的嵌入页地址（非 nil 时 DetailView 显示 WebView 播放器，不显示 AVPlayer）。
+    @Published var webViewURL: URL?
+    /// 正在跑混合解流（无界面 WebView 抽直链）时为 true，DetailView 显示“正在解析嵌入播放…”。
+    @Published var isResolvingEmbed = false
 
     /// 已经失败过的线路 URL（切线时跳过，不来回横跳）
     private var failedURLs: Set<String> = []
@@ -114,17 +144,114 @@ final class PlayerViewModel: ObservableObject {
     private var playGeneration = UUID()
     /// 当前片的帖页链接：nmcorp 签名 MP4 的 Referer 就用它（模块取播放器页时也是这个 Referer）。
     private var currentItemLink: String?
+    /// 正在跑的混合解流（一次只跑一路；换线/停播时取消，旧结果写不回来）。
+    private var embedExtractor: EmbedStreamExtractor?
+    private var embedTask: Task<Void, Never>?
 
     /// 换当前线路：URL + 该线路要带的请求头一起换，状态回 .loading。
     /// URL 非法返回 false，调用方据此报“没有可用的播放线路”。
+    /// 切到直链时，取消正在跑的解流、清掉 WebView（旧的解流结果不能再写回）。
     @discardableResult
     private func setCurrent(_ line: PlayLine) -> Bool {
         guard let url = URL(string: line.url) else { return false }
+        embedTask?.cancel()
+        embedTask = nil
+        embedExtractor?.cancel()
+        embedExtractor = nil
+        webViewURL = nil
+        isResolvingEmbed = false
         currentURL = url
-        currentHeaders = PlaybackEngine.headers(forLineURL: line.url, referer: currentItemLink)
+        // 解流得到的直链带了 Referer（嵌入页）：AVPlayer 取流时带上，CDN 要这个。
+        // 没带 Referer 的线走原有逻辑（一字不动）。
+        if let referer = line.referer, !referer.isEmpty {
+            currentHeaders = ["Referer": referer, "User-Agent": PlaybackEngine.iPhoneUserAgent]
+        } else {
+            currentHeaders = PlaybackEngine.headers(forLineURL: line.url, referer: currentItemLink)
+        }
         status = .loading
         failureReason = nil
         return true
+    }
+
+    /// 播一条线：直链走现有 AVPlayer（setCurrent，一字不动）；
+    /// 嵌入页先走混合解流（解出直链→AVPlayer），解不出 fallback 到页内 WebView 播放器。
+    /// 返回 true 表示这条线已被接手（直链已设或嵌入流程已启动）。
+    @discardableResult
+    private func routeLine(_ line: PlayLine) -> Bool {
+        guard PlaybackEngine.isEmbedURL(line.url, playerHint: line.playerHint) else {
+            return setCurrent(line)
+        }
+        playEmbedLine(line)
+        return true
+    }
+
+    /// 嵌入页播放：先混合解流（15 秒），解出直链→AVPlayer；解不出→页内 WebView 播放器。
+    /// 解流期间状态 .loading，DetailView 显示“正在解析嵌入播放…”。
+    private func playEmbedLine(_ line: PlayLine) {
+        guard let embedURL = URL(string: line.url) else {
+            failureReason = "这条线路的地址不对，播不了"
+            status = .failed("这条线路的地址不对，播不了")
+            return
+        }
+        // 取消上一路解流（换线时旧的不能再写回）
+        embedTask?.cancel()
+        embedTask = nil
+        embedExtractor?.cancel()
+        embedExtractor = nil
+        webViewURL = nil
+        isResolvingEmbed = true
+        currentURL = nil
+        currentHeaders = nil
+        status = .loading
+        failureReason = nil
+        let extractor = EmbedStreamExtractor(embedURL: embedURL)
+        embedExtractor = extractor
+        embedTask = Task { [weak self] in
+            guard let self else { return }
+            let stream = await extractor.extract()
+            // 解流期间换了别的线/停播了，这路结果丢弃
+            guard self.embedExtractor === extractor else { return }
+            self.embedExtractor = nil
+            self.embedTask = nil
+            self.isResolvingEmbed = false
+            if let stream {
+                // 解出直链：Referer=嵌入页，交给现有 AVPlayer 通路；
+                // 线路表里把这条嵌入线换成解出的直链（切线/失败重试能认出它）。
+                let directLine = PlayLine(
+                    name: line.name,
+                    url: stream.url.absoluteString,
+                    description: line.description,
+                    playerHint: line.playerHint,
+                    referer: stream.referer.absoluteString
+                )
+                if let idx = self.lines.firstIndex(where: { $0.url == line.url }) {
+                    self.lines[idx] = directLine
+                } else if !self.lines.contains(where: { $0.url == directLine.url }) {
+                    self.lines.append(directLine)
+                }
+                _ = self.setCurrent(directLine)
+            } else {
+                // 解不出：fallback 到页内 WebView 播放器，不报错（用户看到的是嵌入页在加载/过挑战）。
+                self.webViewURL = embedURL
+                self.status = .playing
+            }
+        }
+    }
+
+    /// 关闭嵌入播放器（WebView 里的 X）：停掉解流/清掉 WebView，
+    /// 这条嵌入线记一次失败（不再自动重试），状态回 idle，等用户另点线路。
+    func closeWebView() {
+        embedTask?.cancel()
+        embedTask = nil
+        embedExtractor?.cancel()
+        embedExtractor = nil
+        if let embedURL = webViewURL?.absoluteString {
+            failedURLs.insert(embedURL)
+        }
+        webViewURL = nil
+        isResolvingEmbed = false
+        status = .idle
+        failureReason = nil
     }
 
     /// 点封面即播：快路径立刻设 currentURL，后台拿备线。
@@ -143,13 +270,20 @@ final class PlayerViewModel: ObservableObject {
         currentHeaders = nil
         currentItemLink = item.link
         status = .loading
+        // 同一 ViewModel 重播时，旧的解流/WebView 不能残留
+        embedTask?.cancel()
+        embedTask = nil
+        embedExtractor?.cancel()
+        embedExtractor = nil
+        webViewURL = nil
+        isResolvingEmbed = false
 
         if host.preferredLine == .nmcorp {
             let resolved = (try? await host.loadResource(link: item.link, title: item.title)) ?? []
             guard playGeneration == generation else { return } // 已播别的片，丢弃
             lines = resolved
             if let nmcorpLine = resolved.first(where: { PlaybackEngine.preferredLineKind(of: $0) == .nmcorp }) {
-                setCurrent(nmcorpLine)
+                routeLine(nmcorpLine)
                 return
             }
             // 没 nmcorp 线：退回快路径（memojav 直拼），已解出的线留作备线
@@ -158,9 +292,9 @@ final class PlayerViewModel: ObservableObject {
                 if !lines.contains(where: { $0.url == fastLine.url }) {
                     lines.insert(fastLine, at: 0)
                 }
-                if setCurrent(fastLine) { return }
+                if routeLine(fastLine) { return }
             }
-            if let first = resolved.first, setCurrent(first) { return }
+            if let first = resolved.first, routeLine(first) { return }
             status = .failed("没有可用的播放线路")
             failureReason = "这个视频没有可用的播放线路"
             return
@@ -170,7 +304,7 @@ final class PlayerViewModel: ObservableObject {
         if let fastURL = PlaybackEngine.fastPathURL(for: item) {
             let fastLine = PlayLine(name: "快速线", url: fastURL.absoluteString, description: "番号直拼，秒播")
             lines = [fastLine]
-            setCurrent(fastLine)
+            routeLine(fastLine)
         } else {
             currentURL = nil
         }
@@ -188,9 +322,10 @@ final class PlayerViewModel: ObservableObject {
                 // 没快路径时，直接上第一条备线
                 if self.currentURL == nil {
                     if let first = merged.first {
-                        self.setCurrent(first)
+                        self.routeLine(first)
                     }
-                    if self.currentURL == nil {
+                    // 嵌入线已接手（正在解流，isResolvingEmbed=true）：别报失败，等解流结果
+                    if self.currentURL == nil && !self.isResolvingEmbed {
                         self.status = .failed("没有可用的播放线路")
                         self.failureReason = "这个视频没有可用的播放线路"
                     }
@@ -199,7 +334,7 @@ final class PlayerViewModel: ObservableObject {
                 // 快路径已经失败过了、备线刚到：有没试过的备线就立刻续上
                 if case .failed = self.status,
                    let next = merged.first(where: { !self.failedURLs.contains($0.url) }) {
-                    self.setCurrent(next)
+                    self.routeLine(next)
                 }
             }
         }
@@ -208,7 +343,7 @@ final class PlayerViewModel: ObservableObject {
     /// 点线路切线（在小窗口里切，不重建播放器，由 Views 层换 AVPlayerItem）。
     func switchLine(_ line: PlayLine) {
         failedURLs.remove(line.url) // 手动点的线允许重试：先清掉它的失败记录
-        setCurrent(line)
+        routeLine(line)
     }
 
     /// 直接播一条指定线路（分集点播用）：把这条线放进线路列表并切过去。
@@ -219,7 +354,7 @@ final class PlayerViewModel: ObservableObject {
         if !lines.contains(where: { $0.url == line.url }) {
             lines.insert(line, at: 0)
         }
-        if !setCurrent(line) {
+        if !routeLine(line) {
             failureReason = "这条线路的地址不对，播不了"
             status = .failed("这条线路的地址不对，播不了")
         }
@@ -233,7 +368,7 @@ final class PlayerViewModel: ObservableObject {
         guard let current = currentURL?.absoluteString, !failedURLs.contains(current) else { return }
         failedURLs.insert(current)
         if let next = lines.first(where: { !failedURLs.contains($0.url) }) {
-            setCurrent(next)
+            routeLine(next)
             return
         }
         failureReason = reason
@@ -248,7 +383,14 @@ final class PlayerViewModel: ObservableObject {
     }
 
     /// 离开详情页即停播：清 URL 与线路，旧的后台备线任务回来也会被 generation 拦住。
+    /// 正在跑的解流也取消、WebView 也清掉（嵌入页不继续在后台跑）。
     func stop() {
+        embedTask?.cancel()
+        embedTask = nil
+        embedExtractor?.cancel()
+        embedExtractor = nil
+        webViewURL = nil
+        isResolvingEmbed = false
         playGeneration = UUID()
         currentURL = nil
         currentHeaders = nil

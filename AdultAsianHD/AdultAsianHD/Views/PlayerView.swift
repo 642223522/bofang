@@ -2,7 +2,7 @@
 // 不自动全屏（entersFullScreenWhenPlaybackBegins = false），系统控制条自带全屏按钮。
 // update 时换 item：coordinator 记下上一次的 URL，只有 URL 变了才 replaceCurrentItem
 // 并 play，避免每次 SwiftUI 刷新都重建播放项（那正是旧版 AbortError 连锁的诱因之一）。
-// 不用 WKWebView 播放器。
+// 不用 WKWebView 播放器（本文件只包 AVPlayer 直链；嵌入页播放器在 WebViewPlayer.swift）。
 // 首帧与失败都由 coordinator 真监听 AVPlayer/AVPlayerItem 汇报给 PlayerViewModel：
 // timeControlStatus == .playing / item .readyToPlay 且 rate > 0 → markPlaying()，
 // “正在解析播放线路…” 由此消失，不再等后台 loadResource；

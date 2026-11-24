@@ -505,12 +505,11 @@ final class WidgetHost: @unchecked Sendable {
     }
 
     /// 调指定模块的列表函数，返回视频列表。
+    /// requiresWebView 的模块也能跑：列表本身是 JS 调 API，不依赖播放器；
+    /// 播的时候按线路类型路由（直链→AVPlayer，嵌入页→解流/WebView）。
     func loadList(moduleId: String, page: Int) async throws -> [VideoItem] {
         guard let module = modules.first(where: { $0.id == moduleId }) else {
             throw WidgetHostError.functionMissing("没有这个模块：\(moduleId)")
-        }
-        guard !module.requiresWebView else {
-            throw WidgetHostError.functionMissing("这个模块需要 WebView，当前版本暂不支持")
         }
         let result = try await callFunction(module.functionName, params: buildParams(for: module, page: page, inputs: [:]))
         return try parseVideoItems(result)
@@ -518,12 +517,10 @@ final class WidgetHost: @unchecked Sendable {
 
     /// 调 type == "stream" 的模块（一般是 loadResource），返回播放线路。
     /// url 为空的项已跳过；模块说“无可用播放源”时返回空数组，由调用方决定怎么显示。
+    /// requiresWebView 的模块也能跑：返回的嵌入页线路走解流/WebView 播放器。
     func loadResource(link: String, title: String) async throws -> [PlayLine] {
         guard let module = modules.first(where: { $0.type == "stream" }) else {
             throw WidgetHostError.functionMissing("这个模块没有播放解析功能")
-        }
-        guard !module.requiresWebView else {
-            throw WidgetHostError.functionMissing("这个模块需要 WebView，当前版本暂不支持")
         }
         let result = try await callFunction(module.functionName, params: buildParams(for: module, page: 1, inputs: ["link": link, "title": title]))
         return parsePlayLines(result)
@@ -538,15 +535,13 @@ final class WidgetHost: @unchecked Sendable {
     }
 
     /// 调 WidgetMetadata.search.functionName（一般是 searchVideos）。
+    /// requiresWebView 的模块也能跑（搜索是 JS 调 API，与播放器无关）。
     func search(keyword: String, page: Int) async throws -> [VideoItem] {
         guard let functionName = meta.searchFunctionName, !functionName.isEmpty else {
             throw WidgetHostError.functionMissing("这个模块不支持搜索")
         }
         let params: [String: Any]
         if let module = modules.first(where: { $0.functionName == functionName }) {
-            guard !module.requiresWebView else {
-                throw WidgetHostError.functionMissing("这个模块需要 WebView，当前版本暂不支持")
-            }
             params = buildParams(for: module, page: page, inputs: ["keyword": keyword])
         } else {
             params = ["keyword": keyword, "page": page]
@@ -972,7 +967,8 @@ final class WidgetHost: @unchecked Sendable {
                 name: dict["name"] as? String ?? "线路",
                 url: url,
                 description: dict["description"] as? String ?? "",
-                playerHint: dict["playerHint"] as? String
+                playerHint: dict["playerHint"] as? String,
+                referer: (dict["referer"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             ))
         }
         return lines

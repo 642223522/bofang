@@ -106,7 +106,7 @@ struct ModuleDescriptor: Identifiable {
     let type: String?
     let cacheDuration: Int
     /// 该模块是否需要 WebView 才能跑（Rex 格式字段，如 huangguo.js 全是 false）。
-    /// true 的模块当前版本暂不支持：入口处标出来、调用时给人话报错，不静默失败。
+    /// true 的模块走嵌入播放：先混合解流（解出直链→AVPlayer），解不出再页内 WebView 播。
     let requiresWebView: Bool = false
     /// 每个 param 是 {name, title, type, value}，type 是 input / constant / page
     let params: [[String: Any]]
@@ -133,6 +133,9 @@ struct PlayLine {
     let description: String
     /// 播放器提示（如 "hlsjs"，AES-128 HLS；AVPlayer 原生支持 AES-128 HLS，照常播，hint 只存不用）
     let playerHint: String? = nil
+    /// 播这条线时 AVPlayer 要带的 Referer（解流得到的直链用，如 dood/playmogo 嵌入解出的 HLS，
+    /// CDN 要 Referer=嵌入页；直链模块没这个字段时为 nil，走原有 headers 逻辑）。
+    let referer: String? = nil
 }
 
 /// 详情（loadDetail 返回）：含分集 childItems（短剧站，如 huangguo.js）。

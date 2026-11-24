@@ -312,7 +312,7 @@ private struct ModuleListView: View {
                                     .lineLimit(2)
                             }
                             if module.requiresWebView {
-                                Text("需 WebView · 当前版本暂不支持")
+                                Text("需 WebView · 嵌入播放")
                                     .font(.caption)
                                     .foregroundColor(.orange)
                             }

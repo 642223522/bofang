@@ -40,10 +40,19 @@ struct DetailView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                PlayerView(player: player, url: playerVM.currentURL, headers: playerVM.currentHeaders, viewModel: playerVM)
-                    .aspectRatio(16.0 / 9.0, contentMode: .fit)
-                    .background(Color.black)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                // 播放器：嵌入页 fallback 时显示 WebView 播放器，否则显示 AVPlayer 直链播放器。
+                // 解出直链后回到 AVPlayer，快进、跟手进度条还是原生的。
+                if let webViewURL = playerVM.webViewURL {
+                    WebViewPlayerView(url: webViewURL, onClose: { playerVM.closeWebView() })
+                        .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                        .background(Color.black)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                } else {
+                    PlayerView(player: player, url: playerVM.currentURL, headers: playerVM.currentHeaders, viewModel: playerVM)
+                        .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                        .background(Color.black)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
 
                 if case .failed(let reason) = playerVM.status {
                     Text(reason)
@@ -53,6 +62,10 @@ struct DetailView: View {
                     Text(failureReason)
                         .foregroundColor(.red)
                         .font(.subheadline)
+                } else if playerVM.isResolvingEmbed {
+                    Text("正在解析嵌入播放…")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
                 } else if playerVM.status == .loading {
                     Text("正在解析播放线路…")
                         .font(.subheadline)
@@ -94,7 +107,8 @@ struct DetailView: View {
                                         }
                                     }
                                     Spacer()
-                                    if playerVM.currentURL?.absoluteString == line.url {
+                                    if playerVM.currentURL?.absoluteString == line.url
+                                        || playerVM.webViewURL?.absoluteString == line.url {
                                         Image(systemName: "checkmark")
                                             .foregroundColor(.accentColor)
                                     }
@@ -132,7 +146,8 @@ struct DetailView: View {
                                     }
                                     Spacer()
                                     if currentEpisodeId == ep.id
-                                        || playerVM.currentURL?.absoluteString == ep.videoURL {
+                                        || playerVM.currentURL?.absoluteString == ep.videoURL
+                                        || playerVM.webViewURL?.absoluteString == ep.videoURL {
                                         Image(systemName: "checkmark")
                                             .foregroundColor(.accentColor)
                                     }
@@ -163,6 +178,14 @@ struct DetailView: View {
         .onChange(of: playerVM.currentURL) { _, newURL in
             // 有了可播 URL 即视为正在播（实际换 item + play 由 PlayerView.update 做）。
             isPlaying = newURL != nil
+        }
+        .onChange(of: playerVM.isResolvingEmbed) { _, resolving in
+            // 开始解嵌入页时，停掉正在播的直链（不然旧的直链会继续出声）。
+            if resolving { player.pause() }
+        }
+        .onChange(of: playerVM.webViewURL) { _, webURL in
+            // 切到页内 WebView 播时，同样停掉直链播放器。
+            if webURL != nil { player.pause() }
         }
         .onDisappear {
             player.pause()
