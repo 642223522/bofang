@@ -1,6 +1,6 @@
 // SettingsView.swift — 设置（v2 重建）
 // 外观：跟随系统 / 浅色 / 深色（三选一，存 UserDefaults @AppStorage，
-// App 入口用 .preferredColorScheme 生效）。显示版本号 1.0.0 与 Bundle ID，
+// App 入口用 .preferredColorScheme 生效）。版本号从 Info.plist 读（不硬编码）与 Bundle ID，
 // 以及下载说明（直接本地下载、不限 Wi-Fi）。
 
 import SwiftUI
@@ -8,6 +8,17 @@ import SwiftUI
 struct SettingsView: View {
     /// 0 跟随系统 / 1 浅色 / 2 深色，与 AdultAsianHDApp 读写同一 key。
     @AppStorage("appearanceMode") private var appearanceMode = 0
+
+    /// 版本号 + 构建号从 Info.plist 读（CFBundleShortVersionString / CFBundleVersion），
+    /// 不硬编码——包是 1.0.3 时这里就显示 1.0.3 (4)；读不到时 fallback "1.0.3"。
+    private var appVersionText: String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "1.0.3"
+        if let build = info?["CFBundleVersion"] as? String, !build.isEmpty {
+            return "\(version) (\(build))"
+        }
+        return version
+    }
 
     var body: some View {
         List {
@@ -30,7 +41,7 @@ struct SettingsView: View {
                 HStack {
                     Text("版本")
                     Spacer()
-                    Text("1.0.0")
+                    Text(appVersionText)
                         .foregroundColor(.secondary)
                 }
                 HStack {

@@ -337,14 +337,24 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             }
 
             do {
-                var downloadRequest = URLRequest(url: rawURL)
-                downloadRequest.setValue("token \(effectiveToken)", forHTTPHeaderField: "Authorization")
-                downloadRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
-                downloadRequest.timeoutInterval = 30
-                let (data, response) = try await URLSession.shared.data(for: downloadRequest)
-                if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-                    if firstError == nil { firstError = "下载 \(name) 失败（HTTP \(http.statusCode)）" }
-                    continue
+                // 优先走 contents API 单文件接口（带 Token 的 JSON 接口，不经过 raw 链接
+                // 重定向，鉴权不会丢）；#43 的 raw 下载带了 Authorization 头 +
+                // access_token 参数仍失败，可能是重定向后鉴权丢了或 access_token 对
+                // raw 端点无效。contents API 拿不到再 fallback 到 raw 下载。
+                let data: Data
+                if let contentsData = await fetchGiteeContentsFile(name: name, token: effectiveToken) {
+                    data = contentsData
+                } else {
+                    var downloadRequest = URLRequest(url: rawURL)
+                    downloadRequest.setValue("token \(effectiveToken)", forHTTPHeaderField: "Authorization")
+                    downloadRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
+                    downloadRequest.timeoutInterval = 30
+                    let (rawData, response) = try await URLSession.shared.data(for: downloadRequest)
+                    if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                        if firstError == nil { firstError = "下载 \(name) 失败（HTTP \(http.statusCode)）" }
+                        continue
+                    }
+                    data = rawData
                 }
                 switch await importData(data, fileName: name, origin: "gitee") {
                 case .success:
@@ -372,6 +382,37 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             UserDefaults.standard.set(now.timeIntervalSince1970, forKey: self.lastSyncDefaultsKey)
         }
         return .success(imported)
+    }
+
+    /// 用 Gitee contents API 单文件接口拿一个 .js 文件的内容。
+    /// GET /api/v5/repos/<repo>/contents/<文件名>?ref=js，带 Authorization 头；
+    /// 返回 JSON 里 `content` 是 base64（可能含换行，先去掉空白字符再解），
+    /// `encoding` 应为 base64。contents API 是带 Token 的 JSON 接口，不经过
+    /// raw 链接重定向，鉴权不会丢——raw 下载在 #43 里带了 Authorization 头 +
+    /// access_token 参数仍失败，contents API 更稳妥。
+    /// 任何一步失败（非 2xx、JSON 解析失败、encoding 不对、base64 解不开）
+    /// 都返回 nil，由调用方 fallback 到 raw 下载。
+    private func fetchGiteeContentsFile(name: String, token: String) async -> Data? {
+        let encodedName = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
+        guard let url = URL(string: "https://gitee.com/api/v5/repos/individual-freedom/ziyong-ziliao-beifang/contents/\(encodedName)?ref=js") else {
+            return nil
+        }
+        var request = URLRequest(url: url)
+        request.setValue("token \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 30
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let content = json["content"] as? String else {
+            return nil
+        }
+        if let encoding = json["encoding"] as? String, encoding.lowercased() != "base64" {
+            return nil
+        }
+        // content 是 base64，可能含换行，先去掉所有空白字符再解。
+        let cleaned = content.filter { !$0.isWhitespace }
+        return Data(base64Encoded: cleaned)
     }
 
     /// 读 Keychain 里存过的 Gitee Token（同步表单预填 / 上传坏模块用）。

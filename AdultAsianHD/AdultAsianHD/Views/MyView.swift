@@ -74,12 +74,23 @@ struct DownloadsView: View {
 // MARK: - 第二层：关于
 
 private struct AboutView: View {
+    /// 版本号 + 构建号从 Info.plist 读（CFBundleShortVersionString / CFBundleVersion），
+    /// 不硬编码——包是 1.0.3 时这里就显示 1.0.3 (4)；读不到时 fallback "1.0.3"。
+    private var appVersionText: String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "1.0.3"
+        if let build = info?["CFBundleVersion"] as? String, !build.isEmpty {
+            return "版本 \(version) (\(build))"
+        }
+        return "版本 \(version)"
+    }
+
     var body: some View {
         List {
             Section {
                 Text("我的私人影院")
                     .font(.headline)
-                Text("版本 1.0.0")
+                Text(appVersionText)
                     .font(.subheadline)
                     .foregroundColor(.secondary)
                 Text("Bundle ID：com.liudehen.xiaoshipin")
