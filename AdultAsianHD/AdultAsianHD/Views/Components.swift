@@ -37,6 +37,10 @@ enum CryptoImage {
         guard key.count == kCCKeySizeAES128, iv.count == kCCBlockSizeAES128,
               data.count > kCCBlockSizeAES128 else { return nil }
         var decrypted = Data(count: data.count + kCCBlockSizeAES128)
+        // 注意：decrypted.count 必须在 withUnsafeMutableBytes 之前先取出来。
+        // 在闭包里一边持有 decrypted 的可变访问、一边又读 decrypted.count，
+        // 会触发 Swift 的排他访问检查（overlapping accesses），编不过。
+        let decryptedCapacity = decrypted.count
         var decryptedLength = 0
         let status = key.withUnsafeBytes { keyPtr in
             iv.withUnsafeBytes { ivPtr in
@@ -49,7 +53,7 @@ enum CryptoImage {
                             keyPtr.baseAddress, key.count,
                             ivPtr.baseAddress,
                             dataPtr.baseAddress, data.count,
-                            outPtr.baseAddress, decrypted.count,
+                            outPtr.baseAddress, decryptedCapacity,
                             &decryptedLength
                         )
                     }
