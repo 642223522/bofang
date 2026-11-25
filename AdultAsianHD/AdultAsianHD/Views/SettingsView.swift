@@ -21,37 +21,40 @@ struct SettingsView: View {
     }
 
     var body: some View {
-        List {
-            Section("外观") {
-                Picker("外观", selection: $appearanceMode) {
-                    Text("跟随系统").tag(0)
-                    Text("浅色").tag(1)
-                    Text("深色").tag(2)
+        WideContent {
+            List {
+                Section("外观") {
+                    Picker("外观", selection: $appearanceMode) {
+                        Text("跟随系统").tag(0)
+                        Text("浅色").tag(1)
+                        Text("深色").tag(2)
+                    }
+                    .pickerStyle(.segmented)
                 }
-                .pickerStyle(.segmented)
-            }
 
-            Section("下载") {
-                Text("下载是直接保存到本机，不打开网页；不限 Wi-Fi，移动数据也能下载。能下载的站就做，不能下载的站就不做，不强求。")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-            }
-
-            Section("关于本 App") {
-                HStack {
-                    Text("版本")
-                    Spacer()
-                    Text(appVersionText)
+                Section("下载") {
+                    Text("下载是直接保存到本机，不打开网页；不限 Wi-Fi，移动数据也能下载。能下载的站就做，不能下载的站就不做，不强求。")
+                        .font(.subheadline)
                         .foregroundColor(.secondary)
                 }
-                HStack {
-                    Text("Bundle ID")
-                    Spacer()
-                    Text("com.liudehen.xiaoshipin")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
+
+                Section("关于本 App") {
+                    HStack {
+                        Text("版本")
+                        Spacer()
+                        Text(appVersionText)
+                            .foregroundColor(.secondary)
+                    }
+                    HStack {
+                        Text("Bundle ID")
+                        Spacer()
+                        Text("com.liudehen.xiaoshipin")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
                 }
             }
+            .scrollContentBackground(.hidden)
         }
         .navigationTitle("设置")
         .navigationBarTitleDisplayMode(.inline)

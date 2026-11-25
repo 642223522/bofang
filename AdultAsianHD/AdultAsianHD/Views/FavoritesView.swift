@@ -92,33 +92,36 @@ struct FavoritesView: View {
     @EnvironmentObject private var favorites: FavoritesStore
 
     var body: some View {
-        Group {
-            if favorites.entries.isEmpty {
-                EmptyState(title: "还没有收藏", message: "在视频封面或详情页点星标，就会出现在这里。")
-            } else {
-                List {
-                    ForEach(favorites.entries) { entry in
-                        NavigationLink(value: entry) {
-                            HStack(spacing: 12) {
-                                // 和网格同一套封面加载（带重试 + 黄果密文解密），
-                                // 不然收藏里的黄果封面还是灰框。
-                                CoverImage(urlString: entry.coverURL)
-                                    .frame(width: 96, height: 54)
-                                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                                Text(entry.title)
-                                    .font(.subheadline)
-                                    .lineLimit(2)
+        WideContent {
+            Group {
+                if favorites.entries.isEmpty {
+                    EmptyState(title: "还没有收藏", message: "在视频封面或详情页点星标，就会出现在这里。")
+                } else {
+                    List {
+                        ForEach(favorites.entries) { entry in
+                            NavigationLink(value: entry) {
+                                HStack(spacing: 12) {
+                                    // 和网格同一套封面加载（带重试 + 黄果密文解密），
+                                    // 不然收藏里的黄果封面还是灰框。
+                                    CoverImage(urlString: entry.coverURL)
+                                        .frame(width: 96, height: 54)
+                                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                                    Text(entry.title)
+                                        .font(.subheadline)
+                                        .lineLimit(2)
+                                }
+                                .padding(.vertical, 4)
                             }
-                            .padding(.vertical, 4)
+                        }
+                        .onDelete { offsets in
+                            // 先按原下标取出来再删：逐个按下标删会在删除后移位删错。
+                            let toRemove = offsets.map { favorites.entries[$0] }
+                            toRemove.forEach { favorites.remove($0) }
                         }
                     }
-                    .onDelete { offsets in
-                        // 先按原下标取出来再删：逐个按下标删会在删除后移位删错。
-                        let toRemove = offsets.map { favorites.entries[$0] }
-                        toRemove.forEach { favorites.remove($0) }
-                    }
+                    .listStyle(.plain)
+                    .scrollContentBackground(.hidden)
                 }
-                .listStyle(.plain)
             }
         }
         .navigationTitle("收藏")

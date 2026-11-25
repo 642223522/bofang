@@ -50,23 +50,27 @@ struct SourcesView: View {
 
     var body: some View {
         ZStack {
-            VStack(spacing: 0) {
-                actionRow
-                    .padding()
+            // 宽屏限宽 700pt 居中（展开的 Duo 内屏 / 横屏不再两边大黑边），
+            // 底色用分组灰：浅色如旧版，深色是深灰而非纯黑。
+            WideContent {
+                VStack(spacing: 0) {
+                    actionRow
+                        .padding()
 
-                syncInfoRow
-                    .padding(.horizontal)
-                    .padding(.bottom, 8)
+                    syncInfoRow
+                        .padding(.horizontal)
+                        .padding(.bottom, 8)
 
-                checkRow
-                    .padding(.horizontal)
-                    .padding(.bottom, 8)
+                    checkRow
+                        .padding(.horizontal)
+                        .padding(.bottom, 8)
 
-                wifiToggleRow
-                    .padding(.horizontal)
-                    .padding(.bottom, 8)
+                    wifiToggleRow
+                        .padding(.horizontal)
+                        .padding(.bottom, 8)
 
-                sourceList
+                    sourceList
+                }
             }
 
             if isReading {
@@ -98,33 +102,44 @@ struct SourcesView: View {
     }
 
     // MARK: - 顶部三个操作
+    //
+    // 三列等宽卡片：图标在上、单行文字在下，固定高度。
+    // 原来是 HStack 里三个 .bordered 按钮，窄竖屏下 Label 会折成图标在上、
+    // 文字在圆钮里换行（深色下更像三个黑圆坨）；卡片式从根上杜绝了这种折叠。
 
     private var actionRow: some View {
         HStack(spacing: 12) {
-            Button {
+            actionCard(title: "从文件导入", systemImage: "doc.badge.plus") {
                 presentDocumentPicker()
-            } label: {
-                Label("从文件导入", systemImage: "doc.badge.plus")
             }
-            .buttonStyle(.bordered)
-
-            Button {
+            actionCard(title: "从链接导入", systemImage: "link.badge.plus") {
                 urlString = ""
                 showURLSheet = true
-            } label: {
-                Label("从链接导入", systemImage: "link.badge.plus")
             }
-            .buttonStyle(.bordered)
-
-            Button {
+            actionCard(title: "码云同步", systemImage: "arrow.triangle.2.circlepath") {
                 // 打开同步表单时把 Keychain 里存过的 Token 预填进密文框。
                 giteeToken = store.loadSavedGiteeToken() ?? ""
                 showSyncSheet = true
-            } label: {
-                Label("码云同步", systemImage: "arrow.triangle.2.circlepath")
             }
-            .buttonStyle(.bordered)
         }
+    }
+
+    private func actionCard(title: String, systemImage: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 8) {
+                Image(systemName: systemImage)
+                    .font(.title2)
+                    .foregroundColor(.accentColor)
+                Text(title)
+                    .font(.subheadline)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+            .frame(maxWidth: .infinity, minHeight: 76)
+            .background(Color(.secondarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
     }
 
     private var syncInfoRow: some View {
@@ -176,12 +191,16 @@ struct SourcesView: View {
     }
 
     /// “仅 Wi-Fi 时自动自检”开关行（默认关，只影响后台自动自检）。
+    /// 主文案和说明分两行：原来说明跟在主文案后面 inline，窄屏下两处一起换行、
+    /// 挤成三行；现在主文案一行、说明一行，永不乱折。
     private var wifiToggleRow: some View {
         Toggle(isOn: $wifiOnlyAutoCheck) {
-            HStack(spacing: 6) {
-                Image(systemName: "wifi")
-                Text("仅 Wi-Fi 时自动自检")
-                Text("（后台自检，12 小时一轮）")
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Image(systemName: "wifi")
+                    Text("仅 Wi-Fi 时自动自检")
+                }
+                Text("后台自检，12 小时一轮")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -297,7 +316,10 @@ struct SourcesView: View {
                                             .font(.caption)
                                             .padding(.horizontal, 6)
                                             .padding(.vertical, 2)
-                                            .background(Color(.secondarySystemBackground))
+                                            // 实色灰 5：分组底色上浅色深色都看得见
+                                            //（原来的 secondarySystemBackground
+                                            // 在分组底色上浅色/深色都几乎同色）。
+                                            .background(Color(.systemGray5))
                                             .clipShape(Capsule())
                                         Text("版本 \(source.version)")
                                             .font(.caption)
@@ -332,6 +354,7 @@ struct SourcesView: View {
                     }
                 }
                 .listStyle(.plain)
+                .scrollContentBackground(.hidden)
             }
         }
     }

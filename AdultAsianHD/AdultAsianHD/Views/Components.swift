@@ -197,7 +197,30 @@ struct SectionHeader: View {
     }
 }
 
+/// 宽屏内容容器：窄屏贴边，宽屏（展开的 Duo 内屏 / 横屏）内容限宽 700pt 居中，
+/// 两边不再是大黑边。只限宽、不改内容本身；配 systemGroupedBackground 底色，
+/// 深色下是柔和深灰而不是纯黑空洞。
+struct WideContent<Content: View>: View {
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Spacer(minLength: 0)
+            content.frame(maxWidth: 700)
+            Spacer(minLength: 0)
+        }
+        .background(Color(.systemGroupedBackground))
+    }
+}
+
 /// 空态：标题 + 说明 + 可选操作按钮。
+/// 上下 Spacer 让内容在可用高度里真正居中（原来只有 minHeight 400 顶在上方，
+/// 高屏上就是黑底里一小坨）；图标和标题放大一号，窄屏也不显寒酸。
+/// 在 ScrollView 这类无限高度的容器里 Spacer 会缩到 0，内容自然排布，不会撑高。
 struct EmptyState: View {
     let title: String
     let message: String
@@ -205,22 +228,29 @@ struct EmptyState: View {
     var action: (() -> Void)? = nil
 
     var body: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "tray")
-                .font(.largeTitle)
-                .foregroundColor(.secondary)
-            Text(title)
-                .font(.headline)
-            Text(message)
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-            if let actionTitle, let action {
-                Button(actionTitle, action: action)
-                    .buttonStyle(.borderedProminent)
+        VStack(spacing: 0) {
+            Spacer(minLength: 0)
+            VStack(spacing: 12) {
+                Image(systemName: "tray")
+                    .font(.system(size: 52))
+                    .foregroundColor(.secondary)
+                Text(title)
+                    .font(.title3)
+                    .fontWeight(.semibold)
+                Text(message)
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 420)
+                if let actionTitle, let action {
+                    Button(actionTitle, action: action)
+                        .buttonStyle(.borderedProminent)
+                        .padding(.top, 4)
+                }
             }
+            .padding()
+            Spacer(minLength: 0)
         }
-        .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

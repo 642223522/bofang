@@ -8,32 +8,35 @@ import SwiftUI
 
 struct MyView: View {
     var body: some View {
-        List {
-            NavigationLink {
-                FavoritesView()
-            } label: {
-                Label("收藏", systemImage: "star")
-            }
+        WideContent {
+            List {
+                NavigationLink {
+                    FavoritesView()
+                } label: {
+                    Label("收藏", systemImage: "star")
+                }
 
-            NavigationLink {
-                DownloadsView()
-            } label: {
-                Label("下载", systemImage: "arrow.down.circle")
-            }
+                NavigationLink {
+                    DownloadsView()
+                } label: {
+                    Label("下载", systemImage: "arrow.down.circle")
+                }
 
-            NavigationLink {
-                SettingsView()
-            } label: {
-                Label("设置", systemImage: "gearshape")
-            }
+                NavigationLink {
+                    SettingsView()
+                } label: {
+                    Label("设置", systemImage: "gearshape")
+                }
 
-            NavigationLink {
-                AboutView()
-            } label: {
-                Label("关于", systemImage: "info.circle")
+                NavigationLink {
+                    AboutView()
+                } label: {
+                    Label("关于", systemImage: "info.circle")
+                }
             }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
         }
-        .listStyle(.plain)
         .navigationTitle("我的")
         .navigationBarTitleDisplayMode(.inline)
     }
@@ -45,32 +48,35 @@ struct DownloadsView: View {
     @EnvironmentObject private var downloader: Downloader
 
     var body: some View {
-        Group {
-            if downloader.tasks.isEmpty {
-                EmptyState(title: "还没有下载", message: "在详情页点「下载」，下载好的视频会出现在这里。")
-            } else {
-                List {
-                    ForEach(downloader.tasks) { task in
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(task.title)
-                                .font(.headline)
-                                .lineLimit(2)
-                            ProgressView(value: task.progress)
-                            Text(task.status)
-                                .font(.footnote)
-                                .foregroundColor(.secondary)
-                        }
-                        .padding(.vertical, 4)
-                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                            Button(role: .destructive) {
-                                downloader.delete(task)
-                            } label: {
-                                Label("删除", systemImage: "trash")
+        WideContent {
+            Group {
+                if downloader.tasks.isEmpty {
+                    EmptyState(title: "还没有下载", message: "在详情页点「下载」，下载好的视频会出现在这里。")
+                } else {
+                    List {
+                        ForEach(downloader.tasks) { task in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(task.title)
+                                    .font(.headline)
+                                    .lineLimit(2)
+                                ProgressView(value: task.progress)
+                                Text(task.status)
+                                    .font(.footnote)
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding(.vertical, 4)
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                Button(role: .destructive) {
+                                    downloader.delete(task)
+                                } label: {
+                                    Label("删除", systemImage: "trash")
+                                }
                             }
                         }
                     }
+                    .listStyle(.plain)
+                    .scrollContentBackground(.hidden)
                 }
-                .listStyle(.plain)
             }
         }
         .navigationTitle("下载")
@@ -93,22 +99,25 @@ private struct AboutView: View {
     }
 
     var body: some View {
-        List {
-            Section {
-                Text("我的私人影院")
-                    .font(.headline)
-                Text(appVersionText)
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-                Text("Bundle ID：com.liudehen.xiaoshipin")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
+        WideContent {
+            List {
+                Section {
+                    Text("我的私人影院")
+                        .font(.headline)
+                    Text(appVersionText)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                    Text("Bundle ID：com.liudehen.xiaoshipin")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                Section {
+                    Text("软件是壳，JS 是可导入的源；一个站一个 JS 文件，更新 JS 不用重装软件。")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
             }
-            Section {
-                Text("软件是壳，JS 是可导入的源；一个站一个 JS 文件，更新 JS 不用重装软件。")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-            }
+            .scrollContentBackground(.hidden)
         }
         .navigationTitle("关于")
         .navigationBarTitleDisplayMode(.inline)

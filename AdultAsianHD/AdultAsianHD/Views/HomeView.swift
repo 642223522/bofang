@@ -15,23 +15,28 @@ struct HomeView: View {
 
     var body: some View {
         GeometryReader { geometry in
-            ScrollView {
-                VStack(spacing: 16) {
-                    if store.sources.isEmpty {
-                        EmptyState(
-                            title: "还没有源",
-                            message: "先去导入或同步一个 JS 源，就能在这里看到它。",
-                            actionTitle: "去导入源",
-                            action: { tabRouter.selectedTab = 2 }
-                        )
-                        .frame(minHeight: 400)
-                    } else {
+            if store.sources.isEmpty {
+                // 空态：整页居中（EmptyState 自己带 Spacer 垂直居中），
+                // 宽屏限宽 480pt，不再是高屏上方一小坨。
+                VStack {
+                    EmptyState(
+                        title: "还没有源",
+                        message: "先去导入或同步一个 JS 源，就能在这里看到它。",
+                        actionTitle: "去导入源",
+                        action: { tabRouter.selectedTab = 2 }
+                    )
+                    .frame(maxWidth: 480)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    VStack(spacing: 16) {
                         ForEach(groupedCountries) { group in
                             countryBox(country: group.country, sources: group.sources, width: geometry.size.width)
                         }
                     }
+                    .padding()
                 }
-                .padding()
             }
         }
         .navigationTitle("主页")

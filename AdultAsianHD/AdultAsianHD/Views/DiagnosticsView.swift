@@ -17,49 +17,52 @@ struct DiagnosticsView: View {
     @State private var showResultAlert = false
 
     var body: some View {
-        Group {
-            if store.sources.isEmpty {
-                EmptyState(title: "还没有源", message: "先到「源」Tab 导入一个 JS 源，自检与竞速结果会出现在这里。")
-            } else {
-                List {
-                    Section("自检") {
-                        Button {
-                            checkAll()
-                        } label: {
-                            Label(isCheckingAll ? "正在自检…" : "自检全部", systemImage: "stethoscope")
-                        }
-                        .disabled(isCheckingAll)
-
-                        ForEach(store.sources) { source in
-                            NavigationLink {
-                                SourceDetailView(source: source)
+        WideContent {
+            Group {
+                if store.sources.isEmpty {
+                    EmptyState(title: "还没有源", message: "先到「源」Tab 导入一个 JS 源，自检与竞速结果会出现在这里。")
+                } else {
+                    List {
+                        Section("自检") {
+                            Button {
+                                checkAll()
                             } label: {
-                                checkRow(for: source)
+                                Label(isCheckingAll ? "正在自检…" : "自检全部", systemImage: "stethoscope")
+                            }
+                            .disabled(isCheckingAll)
+
+                            ForEach(store.sources) { source in
+                                NavigationLink {
+                                    SourceDetailView(source: source)
+                                } label: {
+                                    checkRow(for: source)
+                                }
                             }
                         }
-                    }
 
-                    Section("线路竞速") {
-                        ForEach(store.sources) { source in
-                            NavigationLink {
-                                RaceDetailView(source: source)
-                            } label: {
-                                raceRow(for: source)
+                        Section("线路竞速") {
+                            ForEach(store.sources) { source in
+                                NavigationLink {
+                                    RaceDetailView(source: source)
+                                } label: {
+                                    raceRow(for: source)
+                                }
                             }
                         }
-                    }
 
-                    Section("同步与健康") {
-                        infoRow("上次同步", lastSyncText)
-                        infoRow("源数量", "\(store.sources.count)")
-                        infoRow("自检失败", "\(failedCheckCount) 个")
-                        infoRow("竞速已测", "\(store.raceResults.count) 个")
-                        infoRow("后台自检", store.autoCheckCycleDescription)
+                        Section("同步与健康") {
+                            infoRow("上次同步", lastSyncText)
+                            infoRow("源数量", "\(store.sources.count)")
+                            infoRow("自检失败", "\(failedCheckCount) 个")
+                            infoRow("竞速已测", "\(store.raceResults.count) 个")
+                            infoRow("后台自检", store.autoCheckCycleDescription)
+                        }
                     }
-                }
-                .listStyle(.plain)
-                .refreshable {
-                    _ = await store.runCheckAll()
+                    .listStyle(.plain)
+                    .scrollContentBackground(.hidden)
+                    .refreshable {
+                        _ = await store.runCheckAll()
+                    }
                 }
             }
         }
@@ -206,89 +209,92 @@ private struct RaceDetailView: View {
     @State private var raceError: String?
 
     var body: some View {
-        Group {
-            if let race = store.raceResults[source.id] {
-                List {
-                    Section("结果") {
-                        if let winner = race.winnerLabel {
-                            HStack {
-                                Text("首选线路")
-                                Spacer()
-                                Text(winner)
-                                    .foregroundColor(.green)
+        WideContent {
+            Group {
+                if let race = store.raceResults[source.id] {
+                    List {
+                        Section("结果") {
+                            if let winner = race.winnerLabel {
+                                HStack {
+                                    Text("首选线路")
+                                    Spacer()
+                                    Text(winner)
+                                        .foregroundColor(.green)
+                                }
+                            } else {
+                                HStack {
+                                    Text("首选线路")
+                                    Spacer()
+                                    Text("未分出胜负")
+                                        .foregroundColor(.orange)
+                                }
+                                if let note = race.note {
+                                    Text(note)
+                                        .font(.footnote)
+                                        .foregroundColor(.secondary)
+                                }
                             }
-                        } else {
                             HStack {
-                                Text("首选线路")
+                                Text("竞速时间")
                                 Spacer()
-                                Text("未分出胜负")
-                                    .foregroundColor(.orange)
-                            }
-                            if let note = race.note {
-                                Text(note)
-                                    .font(.footnote)
+                                Text(race.racedAt.formatted(date: .numeric, time: .shortened))
                                     .foregroundColor(.secondary)
                             }
                         }
-                        HStack {
-                            Text("竞速时间")
-                            Spacer()
-                            Text(race.racedAt.formatted(date: .numeric, time: .shortened))
-                                .foregroundColor(.secondary)
-                        }
-                    }
 
-                    if !race.timings.isEmpty {
-                        Section("各线耗时") {
-                            ForEach(race.timings, id: \.kind) { timing in
-                                HStack {
-                                    Text(timing.kind)
-                                    Spacer()
-                                    if timing.kind == race.winnerLabel {
-                                        Text("首选")
-                                            .font(.caption)
-                                            .foregroundColor(.green)
+                        if !race.timings.isEmpty {
+                            Section("各线耗时") {
+                                ForEach(race.timings, id: \.kind) { timing in
+                                    HStack {
+                                        Text(timing.kind)
+                                        Spacer()
+                                        if timing.kind == race.winnerLabel {
+                                            Text("首选")
+                                                .font(.caption)
+                                                .foregroundColor(.green)
+                                        }
+                                        Text("\(timing.milliseconds)ms")
+                                            .foregroundColor(.secondary)
                                     }
-                                    Text("\(timing.milliseconds)ms")
-                                        .foregroundColor(.secondary)
+                                    .font(.subheadline)
                                 }
-                                .font(.subheadline)
                             }
                         }
-                    }
 
-                    Section {
+                        Section {
+                            Button {
+                                rerace()
+                            } label: {
+                                Label(racing ? "正在竞速…" : "重新竞速", systemImage: "bolt")
+                            }
+                            .disabled(racing)
+                            if let raceError {
+                                Text(raceError)
+                                    .font(.footnote)
+                                    .foregroundColor(.red)
+                            }
+                        } footer: {
+                            Text("进模块浏览时自动竞速一次（定本次首选线）；这里点一次即重测一次，结果记下来供下次参考。")
+                        }
+                    }
+                    .listStyle(.insetGrouped)
+                    .scrollContentBackground(.hidden)
+                } else {
+                    VStack(spacing: 16) {
+                        EmptyState(title: "尚未竞速", message: "进这个源的模块浏览一次，后台即自动竞速并记下结果；也可以直接点下面重测。")
                         Button {
                             rerace()
                         } label: {
                             Label(racing ? "正在竞速…" : "重新竞速", systemImage: "bolt")
                         }
+                        .buttonStyle(.bordered)
                         .disabled(racing)
                         if let raceError {
                             Text(raceError)
                                 .font(.footnote)
                                 .foregroundColor(.red)
+                                .padding(.horizontal)
                         }
-                    } footer: {
-                        Text("进模块浏览时自动竞速一次（定本次首选线）；这里点一次即重测一次，结果记下来供下次参考。")
-                    }
-                }
-                .listStyle(.insetGrouped)
-            } else {
-                VStack(spacing: 16) {
-                    EmptyState(title: "尚未竞速", message: "进这个源的模块浏览一次，后台即自动竞速并记下结果；也可以直接点下面重测。")
-                    Button {
-                        rerace()
-                    } label: {
-                        Label(racing ? "正在竞速…" : "重新竞速", systemImage: "bolt")
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(racing)
-                    if let raceError {
-                        Text(raceError)
-                            .font(.footnote)
-                            .foregroundColor(.red)
-                            .padding(.horizontal)
                     }
                 }
             }
