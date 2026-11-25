@@ -252,6 +252,9 @@ struct EmptyState: View {
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // 底部留白：iOS 26 的悬浮 Tab 栏盖在内容上面。窗口矮的时候（Duo 展开横屏、
+        // 浮动窗口）居中后的按钮会正好落到 Tab 栏底下被盖住，留 90pt 把内容顶上去。
+        .padding(.bottom, 90)
     }
 }
 

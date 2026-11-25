@@ -37,6 +37,14 @@ targets:
       - package: KSPlayer
     info:
       path: AdultAsianHD/Info.plist
+      # 启动屏（2026-11-25 根因：没有它 iOS 就把 App 跑在兼容模式的小窗口里，
+      # Duo 展开的大屏上四周全是大黑边；旧录屏看着满屏只是因为外屏尺寸恰好
+      # 跟兼容窗口一样大。UILaunchScreen 空字典 = 系统自动生成的启动屏，
+      # 浅/深色自适应；iOS 27 SDK 起启动屏是硬要求（ITMS-90870）。
+      # 注意：必须写在这里（info.properties），不能只改 Info.plist 文件——
+      # xcodegen 每次 generate 都会按这里重写 Info.plist，手改的 key 会被悄悄删掉。
+      properties:
+        UILaunchScreen: {}
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: com.liudehen.xiaoshipin
       PRODUCT_NAME: "$(TARGET_NAME)"
