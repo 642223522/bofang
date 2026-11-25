@@ -1,0 +1,256 @@
+# 小视频 · 原生 iOS v2 —— GitHub Actions 免费云构建（未签名 .ipa，供侧载）
+#
+# 2026-11-25 22:0x CST 起，构建从 Codemagic 迁到 GitHub Actions（用户令：停用 Codemagic，后面用 GitHub）。
+# 与 codemagic.yaml 等价的步骤：校验 → 工具链 → Bundle ID → 图标 → xcodegen →
+# 归档（未签名）→ 修已编好的 Info.plist → 打包 IPA → 上传产物。
+# 构建产物：未签名的 AdultAsianHD-unsigned.ipa（Payload/AdultAsianHD.app 打包）。
+# 未签名是故意的：安装时由 AltStore / Sideloadly / ESign 用用户自己的 Apple ID 重新签名。
+# 构建过程不需要任何 Apple 证书或 Apple ID。仓库只放软件，不放 JS 脚本。
+#
+# 费用（用户立规矩：全部走免费的）：macOS runner 按 10 倍分钟计费，免费额度每月 2000 分钟。
+# 一次构建约 2–5 分钟 runner 时间 ≈ 20–50 分钟额度；每月构建几次完全在免费额度内。
+# 触发只限 main 分支且只当源码/工作流变化时（paths 过滤），避免无关推送浪费额度。
+# 产物保留 7 天（免费存储 500MB，IPA 约 1.8MB）。
+
+name: iOS unsigned IPA (sideload)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'AdultAsianHD/**'
+      - '.github/workflows/ios-unsigned-ipa.yml'
+  workflow_dispatch:
+
+env:
+  BUNDLE_ID: com.liudehen.xiaoshipin
+  XCODE_PROJECT: AdultAsianHD/AdultAsianHD.xcodeproj
+  XCODE_SCHEME: AdultAsianHD
+  INFO_PLIST: AdultAsianHD/AdultAsianHD/Info.plist
+  APP_NAME: AdultAsianHD
+  IPA_NAME: AdultAsianHD-unsigned.ipa
+  BUILD_DIR: build
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify checkout（打印 HEAD 提交与 MARKETING_VERSION）
+        run: |
+          set -eo pipefail
+          echo "--- git ---"
+          git rev-parse HEAD
+          git log --oneline -3
+          echo "--- 源码版本号（应与本次提交一致） ---"
+          grep "MARKETING_VERSION" AdultAsianHD/project.yml
+          echo "--- 确认包里没有 .js（不内置源） ---"
+          if find AdultAsianHD -name '*.js' -print -quit | grep -q .; then
+            echo "❌ 仓库里发现 .js 文件，JS 脚本只放码云，不进 GitHub。"
+            exit 1
+          fi
+          echo "OK：没有 .js 文件。"
+
+      - name: Show toolchain（选最新的 Xcode）
+        run: |
+          set -eo pipefail
+          echo "--- 可用的 Xcode ---"
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          NEWEST_XCODE="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -n "$NEWEST_XCODE" ]; then
+            echo "选用最新的 Xcode：$NEWEST_XCODE"
+            sudo xcode-select -s "$NEWEST_XCODE/Contents/Developer"
+          fi
+          xcodebuild -version
+          echo "--- repo layout ---"
+          ls -la
+
+      - name: Set Bundle ID
+        run: |
+          set -eo pipefail
+          echo "Bundle ID: $BUNDLE_ID"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$INFO_PLIST"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$INFO_PLIST"
+
+      - name: Generate AppIcon PNGs from source（base64 还原 + sips 切 12 个尺寸）
+        run: |
+          set -eo pipefail
+          # 图标源图只以 base64 文本进仓（icon-source.jpg.b64），12 张 PNG 在构建机上现切，
+          # 不进 GitHub。源图：兔子+熊猫骑小摩托、红字“老司机带带我”。
+          ICONSET="AdultAsianHD/AdultAsianHD/Assets.xcassets/AppIcon.appiconset"
+          B64="$ICONSET/icon-source.jpg.b64"
+          JPG="$ICONSET/icon-source.jpg"
+          if [ ! -f "$B64" ]; then
+            echo "❌ 找不到图标 base64 源：$B64"
+            exit 1
+          fi
+          openssl base64 -d -in "$B64" -out "$JPG"
+          echo "--- 源图已还原 ---"
+          sips -g pixelWidth -g pixelHeight "$JPG"
+          for SIZE in 20 29 40 58 60 80 87 120 152 167 180 1024; do
+            sips -z "$SIZE" "$SIZE" "$JPG" --out "$ICONSET/icon-$SIZE.png" >/dev/null
+          done
+          echo "--- 生成的图标 PNG ---"
+          ls -lh "$ICONSET"/icon-*.png
+          for SIZE in 20 29 40 58 60 80 87 120 152 167 180 1024; do
+            if [ ! -f "$ICONSET/icon-$SIZE.png" ]; then
+              echo "❌ 缺少图标 PNG：icon-$SIZE.png"
+              exit 1
+            fi
+          done
+          echo "OK：12 个尺寸图标 PNG 已生成。"
+
+      - name: Generate Xcode project (xcodegen)
+        run: |
+          set -eo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            echo "安装 xcodegen..."
+            brew install xcodegen
+          fi
+          xcodegen --version
+          cd AdultAsianHD
+          xcodegen generate
+          echo "--- 生成的工程 ---"
+          ls -la AdultAsianHD.xcodeproj/
+
+      - name: Build (archive, unsigned)
+        run: |
+          set -eo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/$BUILD_DIR"
+          # 强制干净构建：删掉 DerivedData，杜绝增量编译复用旧目标文件。
+          rm -rf ~/Library/Developer/Xcode/DerivedData
+          echo "--- DerivedData 已清空 ---"
+          xcodebuild archive \
+            -project "$XCODE_PROJECT" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$GITHUB_WORKSPACE/$BUILD_DIR/AdultAsianHD.xcarchive" \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            "CODE_SIGN_IDENTITY[sdk=iphoneos*]=" \
+            CODE_SIGN_STYLE=Manual \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            DEVELOPMENT_TEAM="" \
+            ONLY_ACTIVE_ARCH=NO 2>&1 | tee "$GITHUB_WORKSPACE/$BUILD_DIR/xcodebuild.log"
+          echo "--- archived app ---"
+          ls -lh "$GITHUB_WORKSPACE/$BUILD_DIR/AdultAsianHD.xcarchive/Products/Applications/"
+
+      - name: Fix built Info.plist（显示名 + 版本 + ATS + 后台模式）
+        run: |
+          set -eo pipefail
+          # 直接在已编好的 .app 上用 PlistBuddy 改最终产物，不依赖构建配置
+          # 是否采纳了源码 Info.plist / project.yml 的 INFOPLIST_KEY_*。
+          # App 未签名，改 plist 不会破坏签名（安装时由侧载工具重签）。
+          # 版本号只从 project.yml 的 MARKETING_VERSION / CURRENT_PROJECT_VERSION 读，不写死，防漂移。
+          VERSION="$(grep "MARKETING_VERSION" AdultAsianHD/project.yml | grep -oE '1\.[0-9]*\.[0-9]*' | head -1)"
+          BUILD_NUM="$(grep "CURRENT_PROJECT_VERSION" AdultAsianHD/project.yml | grep -oE '[0-9]+' | head -1)"
+          if [ -z "$VERSION" ] || [ -z "$BUILD_NUM" ]; then
+            echo "❌ project.yml 里没找到 MARKETING_VERSION 或 CURRENT_PROJECT_VERSION。"
+            exit 1
+          fi
+          echo "写入版本：$VERSION ($BUILD_NUM)"
+          APP_PATH="$GITHUB_WORKSPACE/$BUILD_DIR/AdultAsianHD.xcarchive/Products/Applications/$APP_NAME.app"
+          PLIST="$APP_PATH/Info.plist"
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string 我的私人影院" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName 我的私人影院" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUM" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoads bool true" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Set :NSAppTransportSecurity:NSAllowsArbitraryLoads true" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsArbitraryLoadsInWebContent bool true" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Set :NSAppTransportSecurity:NSAllowsArbitraryLoadsInWebContent true" "$PLIST"
+          # 后台模式：只留 fetch（后台刷新），不要 audio。
+          # audio 后台模式会让 AVPlayer 自动向系统注册 Now Playing，
+          # 播放一开始 iOS 就在灵动岛弹出那个带播放/暂停的媒体大卡片（还会进控制中心），
+          # 用户要的就是去掉它。反正离开详情页就停播，后台音频本来就不需要。
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string fetch" "$PLIST" 2>/dev/null || true
+          # 支持方向：竖屏 + 左右横屏。源码 Info.plist 与 project.yml 的
+          # INFOPLIST_KEY_UISupportedInterfaceOrientations 里都有，但构建管线会把这个 key
+          # 弄丢（#45、#47 产物里都没有），iPhone 上缺它默认只竖屏，自定义播放器的
+          # 全屏（要 .landscape）会被 app 级竖屏掩码挡住转不过去。这里跟后台模式一样，
+          # 在已编好的 .app 上直接补，保证进最终 IPA。
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations array" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations:0 string UIInterfaceOrientationPortrait" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations:1 string UIInterfaceOrientationLandscapeLeft" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations:2 string UIInterfaceOrientationLandscapeRight" "$PLIST" 2>/dev/null || true
+          echo "--- 修复后的 Info.plist ---"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :UISupportedInterfaceOrientations" "$PLIST"
+
+      - name: Package IPA
+        run: |
+          set -eo pipefail
+          APP_PATH="$GITHUB_WORKSPACE/$BUILD_DIR/AdultAsianHD.xcarchive/Products/Applications/$APP_NAME.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "❌ 找不到 .app：$APP_PATH"
+            echo "   先看上一步的 xcodebuild.log 找报错。"
+            exit 1
+          fi
+          echo "--- 主屏显示名（应为 我的私人影院，否则停止打包） ---"
+          DISPLAY_NAME="$(/usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$APP_PATH/Info.plist" 2>/dev/null || echo MISSING)"
+          echo "显示名：$DISPLAY_NAME"
+          if [ "$DISPLAY_NAME" != "我的私人影院" ]; then
+            echo "❌ 主屏显示名不是 我的私人影院（当前：$DISPLAY_NAME），停止打包。"
+            exit 1
+          fi
+          echo "OK：主屏显示名是 我的私人影院。"
+          echo "--- binary arch (expect arm64) ---"
+          lipo -info "$APP_PATH/$APP_NAME" || true
+          echo "--- 二进制里的版本串（应与 MARKETING_VERSION 一致，否则构建用的还是旧代码，直接失败） ---"
+          EXPECTED_VERSION="$(grep "MARKETING_VERSION" AdultAsianHD/project.yml | grep -oE '1\.[0-9]*\.[0-9]*' | head -1)"
+          if [ -z "$EXPECTED_VERSION" ]; then
+            echo "❌ project.yml 里没找到 MARKETING_VERSION，停止打包。"
+            exit 1
+          fi
+          echo "源码版本（MARKETING_VERSION）：$EXPECTED_VERSION"
+          PLIST_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_PATH/Info.plist" 2>/dev/null || echo MISSING)"
+          echo "包里版本号（Info.plist）：$PLIST_VERSION"
+          if [ "$PLIST_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "❌ 包里版本号 $PLIST_VERSION 与源码 $EXPECTED_VERSION 不一致，停止打包。"
+            exit 1
+          fi
+          echo "OK：包里版本与源码一致。"
+          echo "--- 二进制里的版本串（仅供参考，不作门禁） ---"
+          grep -a -oE '1\.[0-9]*\.[0-9]*' "$APP_PATH/$APP_NAME" | sort | uniq | tr '\n' ' ' || true
+          echo "--- codesign check (expect: not signed) ---"
+          if codesign --verify "$APP_PATH" 2>/dev/null; then
+            echo "⚠️ 注意：.app 带签名（预期是未签名），继续打包。"
+          else
+            echo "OK：.app 未签名，符合预期（安装时由侧载工具重签）。"
+          fi
+          echo "--- AppIcon 检查（Assets.car 应在 .app 里，否则桌面图标空白） ---"
+          if [ -f "$APP_PATH/Assets.car" ]; then
+            echo "OK：Assets.car 在包里（AppIcon 已编入）。"
+            ls -lh "$APP_PATH/Assets.car"
+          else
+            echo "❌ .app 里没有 Assets.car，AppIcon 没编进去，桌面图标会是空白。"
+            exit 1
+          fi
+          rm -rf Payload "$IPA_NAME"
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qr "$IPA_NAME" Payload
+          rm -rf Payload
+          echo "--- ipa ---"
+          ls -lh "$IPA_NAME"
+          unzip -l "$IPA_NAME" | head -20
+          shasum -a 256 "$IPA_NAME"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AdultAsianHD-unsigned
+          path: AdultAsianHD-unsigned.ipa
+          retention-days: 7
