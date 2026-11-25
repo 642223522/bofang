@@ -137,7 +137,8 @@ final class CustomPlayerController: ObservableObject {
             .sink { [weak self] _ in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    self.load(url: self.viewModel.currentURL, headers: self.viewModel.currentHeaders)
+                    // playerURL：代理时为回环地址，否则为线路原地址。
+                    self.load(url: self.viewModel.playerURL, headers: self.viewModel.currentHeaders)
                 }
             }
             .store(in: &cancellables)
@@ -158,13 +159,16 @@ final class CustomPlayerController: ObservableObject {
 
     // MARK: - 换项与自动播
 
-    /// 新 URL 到达时调（DetailView 传进来的 currentURL/headers 变化）。
+    /// 新 URL 到达时调（DetailView 传进来的 playerURL/headers 变化）。
     /// URL/请求头/引擎没变不重建，避免 SwiftUI 刷新打断正在播的 play()。
     /// 非原生引擎（hlsjs/dash/软解/webView）不归 AVPlayer：拆掉当前 item，
     /// 由视图层按 currentEngine 显示对应播放器。
+    /// .proxy 时只认回环地址：监听就绪前 playerURL 还是原始 https 地址，
+    /// 此时不建 asset（等 proxyURL 到来再建），免得裸播原地址、把代理绕过去；
+    /// 代理时头由代理统一带，不挂到回环 asset 上。
     func load(url: URL?, headers: [String: String]?) {
         let engine = viewModel.currentEngine
-        guard engine == .native || engine == .nativeIntercepted else {
+        guard engine == .native || engine == .nativeIntercepted || engine == .proxy else {
             unloadCurrentItem()
             return
         }
@@ -175,8 +179,14 @@ final class CustomPlayerController: ObservableObject {
             replaceItem(nil, headers: nil, resumeAt: nil)
             return
         }
+        if engine == .proxy, url.host != "127.0.0.1" {
+            return
+        }
+        // 代理时头由代理统一带（UA/Referer/模块头/Cookie），不挂到回环 asset 上；
+        // 回环地址不需要头，挂了反而把身份暴露给 AVPlayer 的日志。
+        let effectiveHeaders = engine == .proxy ? nil : headers
         let engineChanged = lastEngine != engine
-        guard lastURL != url || lastHeaders != headers || engineChanged else { return }
+        guard lastURL != url || lastHeaders != effectiveHeaders || engineChanged else { return }
         if engineChanged {
             // 同一 URL 换引擎：失败只认一次的标记要清掉，
             // 否则同一 URL 换路径后的第二次失败报不上去（markFailed 会认成重复）。
@@ -196,11 +206,11 @@ final class CustomPlayerController: ObservableObject {
         }
         shouldPlay = true
         lastURL = url
-        lastHeaders = headers
+        lastHeaders = effectiveHeaders
         lastEngine = engine
         refreshQualityOptions()
         let loader = engine == .nativeIntercepted ? viewModel.resourceLoader : nil
-        replaceItem(url, headers: headers, resumeAt: resumeAt, resourceLoader: loader)
+        replaceItem(url, headers: effectiveHeaders, resumeAt: resumeAt, resourceLoader: loader)
     }
 
     /// 拆掉当前 AVPlayerItem（引擎切走时调）：清掉 URL/头/引擎记忆，
@@ -378,6 +388,14 @@ final class CustomPlayerController: ObservableObject {
             // 真正出帧 → markPlaying（“正在解析播放线路…”由此消失）。
             if let url = lastURL, didMarkPlayingURL != url {
                 didMarkPlayingURL = url
+                // 账本：首帧时把 AVPlayer 自身的 accessLog 记下来
+                //（实际连到了哪台 IP、有没有换过服务器）。
+                let accessEvent = currentItem?.accessLog()?.events.last
+                viewModel.recordPlayerLogs(
+                    errorURI: nil,
+                    serverAddress: accessEvent?.serverAddress,
+                    addressChanges: Int(accessEvent?.numberOfServerAddressChanges ?? 0)
+                )
                 viewModel.markPlaying()
             }
             showControlsTemporarily()
@@ -484,19 +502,30 @@ final class CustomPlayerController: ObservableObject {
     /// 播失败只认一次（同一条 URL）：KVO .failed 和失败通知可能先后都到，
     /// 重复报会把刚切上的下一条线也误标失败。走 viewModel.markFailed() 自动切下一条线。
     /// -12881 检测（分片需头信号）：拦截器只拦播单+key，分片是 AVPlayer 直接拉的；
-    /// 分片要头时这里报 -12881，记 LoopbackProxy.segmentNeedsHeaders（回环代理触发条件），
-    /// 并以 .segmentFetch 分层报给 markFailed，由它回退 hls.js。
+    /// 分片要头时这里报 -12881，以 .segmentFetch 分层报给 markFailed，
+    /// 由它回退 hls.js / 升级回环代理（见 markFailed 的 D → P → J）。
+    /// 账本：失败时把 AVPlayer 自身的 errorLog URI 与 accessLog 记下来
+    ///（绕过判定与分层诊断用），先记日志、再报失败。
     private func handleItemFailure(_ item: AVPlayerItem?) {
         guard let url = lastURL, didMarkFailedURL != url else { return }
         didMarkFailedURL = url
-        // FairPlay（skd://）：拦截器已在播单里见到，报明确错误，不走通用失败文案。
-        if viewModel.resourceLoader?.encounteredFairPlay == true {
+        // 账本：把 AVPlayer 自身的 errorLog/accessLog 记下来（绕过判定与分层诊断用）。
+        // errorLog 的 URI 是 AVPlayer 实际请求失败的地址；accessLog 的 serverAddress
+        // 说明实际连到了哪台 IP、有没有换过服务器。
+        let errorEvent = item?.errorLog()?.events.last
+        let accessEvent = item?.accessLog()?.events.last
+        viewModel.recordPlayerLogs(
+            errorURI: errorEvent?.uri,
+            serverAddress: accessEvent?.serverAddress,
+            addressChanges: Int(accessEvent?.numberOfServerAddressChanges ?? 0)
+        )
+        // FairPlay（skd://）：拦截器或代理已在播单里见到，报明确错误，不走通用失败文案。
+        if viewModel.resourceLoader?.encounteredFairPlay == true || viewModel.proxyEncounteredFairPlay {
             viewModel.markFailed("这条线路用了 FairPlay 加密（skd://），当前播放器不支持，请换一条线路")
             return
         }
         let nsError = item?.error as NSError?
         if nsError?.code == -12881 {
-            LoopbackProxy.segmentNeedsHeaders = true
             viewModel.markFailed("分片拉取失败（分片可能需要请求头，拦截器覆盖不了）", stage: .segmentFetch)
             return
         }

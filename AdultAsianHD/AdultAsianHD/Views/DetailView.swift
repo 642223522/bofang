@@ -53,13 +53,15 @@ struct DetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 // 播放器按当前引擎分流（currentEngine 由 PlayerViewModel 的路由表设，
-                // 按 hint × URL 形态定；A 路新增的 @Published 属性）：
+                // 按内容事实 > URL 形态 > hint 定；A 路新增的 @Published 属性）：
                 // .hlsjs/.dash 走对应的 HLS.js / DASH 播放器（B 路建，同款 viewModel 契约）；
                 // .softDecoder 走软解播放器（C 路 Wave 2 的 SoftDecoderPlayerView：
-                // KSPlayer/FFmpeg，同一 16:9 盒子）；.native/.nativeIntercepted 走现有直链自定义
+                // KSPlayer/FFmpeg，同一 16:9 盒子）；.native/.nativeIntercepted/.proxy 走现有直链自定义
                 // 播放器（AVPlayerLayer + 自绘底条，一字不动）；.webView 走现有嵌入页
                 // 播放器（一字不动）。webViewURL 尚未到达时（路由先行、URL 随后），
                 // .webView 分支退回直链播放器，和旧逻辑（webViewURL 为 nil 时显示直链）一致。
+                // 直链播放器拿的是 playerURL：代理时为回环地址，否则为线路原地址
+                //（代理时 AVPlayer 只能看到回环地址，原始 https 地址只留在 ViewModel 里）。
                 switch playerVM.currentEngine {
                 case .hlsjs:
                     HLSJSPlayerView(viewModel: playerVM)
@@ -88,8 +90,8 @@ struct DetailView: View {
                             .background(Color.black)
                             .clipShape(RoundedRectangle(cornerRadius: 8))
                     }
-                case .native, .nativeIntercepted:
-                    CustomPlayerView(player: player, url: playerVM.currentURL, headers: playerVM.currentHeaders, viewModel: playerVM, isFullscreen: $isFullscreen)
+                case .native, .nativeIntercepted, .proxy:
+                    CustomPlayerView(player: player, url: playerVM.playerURL, headers: playerVM.currentHeaders, viewModel: playerVM, isFullscreen: $isFullscreen)
                         .aspectRatio(16.0 / 9.0, contentMode: .fit)
                         .background(Color.black)
                         .clipShape(RoundedRectangle(cornerRadius: 8))

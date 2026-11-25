@@ -3,15 +3,32 @@ import Foundation
 enum PlayerEngine: Equatable {
     case native
     case nativeIntercepted
+    case proxy
     case hlsjs
     case dash
     case softDecoder
     case webView
+
+    var displayName: String {
+        switch self {
+        case .native: return "原生"
+        case .nativeIntercepted: return "拦截器"
+        case .proxy: return "回环代理"
+        case .hlsjs: return "HLS.js"
+        case .dash: return "dash.js"
+        case .softDecoder: return "软解"
+        case .webView: return "嵌页"
+        }
+    }
 }
 /// 能力注册表。各引擎模块把自己的旗置 true；路由表只读它。
 enum PlaybackCapabilities {
     static var hasHLSJS = false
     static var hasDASH = false
+    /// 回环代理：第一次成功起监听后置 true（能力已证实，见 LoopbackProxyServer）。
+    static var hasLoopbackProxy = false
+    /// 回环代理起监听失败过（sticky）：起不来就不再试 P，直接走 J/下一条线。
+    static var loopbackProxyBindFailed = false
     #if canImport(KSPlayer)
     static let hasSoftwareDecoder = true
     #else
@@ -50,18 +67,9 @@ enum PlaybackFailureStage: String {
     case playback
 }
 
-/// 回环代理扩展点（stub，本轮不实现，不要把拦截器写成唯一手段）。
-/// 决策顺序：拦截器（只拦 playlist+key）→ 回环代理 → hls.js。
-/// - 拦截器触发条件：key 需头、分片不需头（探针已证实三站的分片不要头，黄果 .ts 无头也 206）。
-/// - 拦截器退出条件：分片也需头（分片 403 或 AVPlayerItem 报 -12881）。
-/// - 回环代理触发条件：分片也需头。
-/// - 回环代理退出条件：AirPlay/后台播放不可接受（本机回环代理与 AirPlay/后台播放冲突）。
-/// 实现形态（以后）：本机 HTTP 代理（127.0.0.1 随机端口），AVPlayer 经代理拉流，
-/// 代理给每个子请求（播单/密钥/分片）补头；须处理代理生命周期与端口冲突。
-/// TODO(回环代理)：分片需头被证实且 hls.js 回退也失败时，再实现本扩展点。
-enum LoopbackProxy {
-    /// 是否已实现回环代理（实现它的那路把旗置 true；路由表/回退逻辑只读它）。
-    static var isAvailable = false
-    /// 分片需头的信号已出现（分片 403 或 -12881，由 CustomPlayerController 的检测置位）。
-    static var segmentNeedsHeaders = false
-}
+/// 回环代理（LoopbackProxy，梯子 D → P → J 里的一级）：实现在
+/// LoopbackProxy.swift。能力旗在 PlaybackCapabilities 里：
+/// hasLoopbackProxy（第一次成功起监听后 true）、loopbackProxyBindFailed
+///（起监听失败过，sticky，失败了就不再试 P）。
+/// 触发条件：D 失败且分片需头（.segmentFetch / -12881）或拦截被绕过；
+/// 退出条件：AirPlay/后台播放不可接受（本机回环代理与 AirPlay/后台播放冲突）。

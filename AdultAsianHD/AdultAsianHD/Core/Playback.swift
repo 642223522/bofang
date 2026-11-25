@@ -139,12 +139,16 @@ enum PlaybackEngine {
         return hint.contains("hlsjs") && isSignedURL(line.url)
     }
 
-    /// 路由表：hint 优先于 URL 后缀。
-    /// - hint 含 embed/webview，或 URL 是嵌页 → .webView（hlsjs+嵌页也是 .webView）。
+    /// 路由表（Q5：证据优先——内容事实 > URL 形态 > hint > 默认）。
+    /// 内容事实（首响应状态、重定向落点、首字节签名）只有取过才知道，路由时
+    /// 只能按形态 + hint 判；取过之后的内容事实记进账本/不匹配记录，下次同模块
+    /// 同模板走路线记忆。hint 只调梯子方向与升级 P 的先验，绝不强制指定播放器。
     /// - .mpd → .dash（绝不再往 AVPlayer 送）。
     /// - 非原生容器（.mkv/.flv/.avi/.webm）→ .softDecoder；没集成软解时路由到
     ///   .nativeIntercepted，失败时由 markFailed 报明确错误，不无意义重试。
-    /// - hint=hlsjs：优先走 hls.js（PlaybackCapabilities.hasHLSJS 为 true 时 → .hlsjs），
+    /// - 媒体形态（.m3u8/.mp4/.mov）：内容优先——hint=embed/webview + 媒体 URL
+    ///   不再直接进 WebView（是 HLS 先走 D/P；“须在页上下文里取”的含义记到
+    ///   不匹配日志里，梯度里再考虑 WebView）。hint=hlsjs 的 HLS 优先 hls.js，
     ///   其次才是拦截器那条（.nativeIntercepted，标明为 Native HLS 兼容实现，
     ///   不要把拦截器说成 hls.js）；hls.js 失败 → 回退到 .nativeIntercepted（一步，不循环）。
     ///   hlsjs+MP4 也可能需要 Cookie/Referer，走 .nativeIntercepted，不直接丢给 AVPlayer 裸播。
@@ -152,6 +156,7 @@ enum PlaybackEngine {
     /// - hint=native+明文 → .native；未知 hint 先按 URL 形态判，判不出走 .nativeIntercepted 试播。
     /// - 签名/token/加密/有自定义头/Cookie 的线直接走拦截器，不试裸连；
     ///   只有明文静态、无加密、无自定义头的线才先裸连、失败再升级拦截器（见 markFailed）。
+    /// - 非媒体形态（嵌页）→ .webView（不管 hint 写什么；hint=native+嵌页是 hint_vs_content）。
     static func route(for line: PlayLine) -> PlayerEngine {
         let hint = (line.playerHint ?? "").lowercased()
         let lower = line.url.lowercased()
@@ -161,12 +166,8 @@ enum PlaybackEngine {
             // 走拦截器试播，不直接报错。
             return .nativeIntercepted
         }
-        // 1. hint 明确标嵌入 → WebView。
-        if hint.contains("embed") || hint.contains("webview") {
-            return .webView
-        }
         let ext = url.pathExtension.lowercased()
-        // 2. .mpd → DASH（在 isEmbedURL 之前判：.mpd 已不是 AVPlayer 直链，
+        // 1. .mpd → DASH（在 isEmbedURL 之前判：.mpd 已不是 AVPlayer 直链，
         //    isEmbedURL 会把它误判成嵌页）。
         //    能力判定：有 dash.js → .dash；无 dash.js 但有软解 → .softDecoder；
         //    两者都没有 → 仍返回 .dash（不静默丢线），由 routeLine 的 fast-fail
@@ -184,41 +185,39 @@ enum PlaybackEngine {
             }
             return .dash
         }
-        // 3. 非原生容器 → 软解（无软解则拦截器试播，失败报明确错误）。
+        // 2. 非原生容器 → 软解（无软解则拦截器试播，失败报明确错误）。
         if ["mkv", "flv", "avi", "webm"].contains(ext) {
             return PlaybackCapabilities.hasSoftwareDecoder ? .softDecoder : .nativeIntercepted
         }
-        // 4. 嵌页 URL → WebView（hlsjs+嵌页也是 WebView）。
+        // 3. 媒体形态（m3u8/mp4/mov）：内容优先，hint 只调起手路线。
+        //    hint=embed/webview + 媒体 URL 不再直接进 WebView（Q5：内容优先，是 HLS 先走 D/P；
+        //    “须在页上下文里取”的含义记到不匹配日志里，梯度里再考虑 WebView）。
+        let isMediaForm = ["m3u8", "mp4", "mov"].contains(ext)
+            || lower.contains(".m3u8") || lower.contains(".mp4")
+        if isMediaForm {
+            if hint.contains("hlsjs") {
+                if ext == "m3u8" || lower.contains(".m3u8") {
+                    return PlaybackCapabilities.hasHLSJS ? .hlsjs : .nativeIntercepted
+                }
+                // hlsjs+MP4 也可能需要 Cookie/Referer，走拦截器，不裸播。
+                return .nativeIntercepted
+            }
+            let needsIntercept = isSignedURL(line.url)
+                || line.headers?.isEmpty == false
+                || line.cookie?.isEmpty == false
+            if needsIntercept { return .nativeIntercepted }
+            if hint.contains("native") || hint.isEmpty { return .native }
+            // 未知 hint 的媒体 URL：形态判得出，走拦截器试播。
+            return .nativeIntercepted
+        }
+        // 4. 非媒体形态（嵌页）→ WebView（不管 hint 写什么；hint=native+嵌页是 hint_vs_content）。
         if isEmbedURL(line.url, playerHint: line.playerHint) {
             return .webView
         }
-        // 5. hlsjs：优先 hls.js，其次 Native HLS 兼容实现（拦截器）。
-        if hint.contains("hlsjs") {
-            if ext == "m3u8" || lower.contains(".m3u8") {
-                return PlaybackCapabilities.hasHLSJS ? .hlsjs : .nativeIntercepted
-            }
-            // hlsjs+MP4 也可能需要 Cookie/Referer，走拦截器，不裸播。
-            return .nativeIntercepted
-        }
-        // 6. 拦截条件：签名 token / 自定义头 / Cookie。
-        let needsIntercept = isSignedURL(line.url)
-            || line.headers?.isEmpty == false
-            || line.cookie?.isEmpty == false
-        if ext == "m3u8" || lower.contains(".m3u8") {
-            if needsIntercept { return .nativeIntercepted }
-            if hint.contains("native") || hint.isEmpty { return .native }
-            // 未知 hint 的 .m3u8：形态判得出是 HLS 但 hint 不认得，走拦截器试播。
-            return .nativeIntercepted
-        }
-        if ext == "mp4" || lower.contains(".mp4") {
-            if needsIntercept { return .nativeIntercepted }
-            return .native
-        }
-        // 7. 无后缀 / 不透明 URL：形态判不出，走拦截器试播，不直接报错。
+        // 5. 不透明 URL → 拦截器试播。
         if ext.isEmpty {
             return .nativeIntercepted
         }
-        // 其他已知直链后缀（如 .mov）→ 原生。
         return .native
     }
 
@@ -306,10 +305,366 @@ final class PlayerViewModel: ObservableObject {
     private var embedExtractor: EmbedStreamExtractor?
     private var embedTask: Task<Void, Never>?
 
-    /// 该线路实际走的引擎：有强制覆盖（回退/升级）用覆盖，其余走路由表。
+    /// 回环代理实例（currentEngine == .proxy 时持有；换线/停播时释放，见 releaseProxy）。
+    private var proxyServer: LoopbackProxyServer?
+    /// 回环播放地址（.proxy 时为 127.0.0.1 入口 URL，否则 nil）。
+    @Published var proxyURL: URL?
+    /// 播放用的实际地址：代理时为回环 URL，否则为线路原地址。
+    /// DetailView 把它传给 CustomPlayerView（不是 currentURL——代理时播放器
+    /// 只能看到回环地址，原始 https 地址只留在 ViewModel 里作线路身份）。
+    var playerURL: URL? { proxyURL ?? currentURL }
+    /// 代理是否在播单里见过 skd://（FairPlay）：CustomPlayerController 读它报明确错误。
+    var proxyEncounteredFairPlay: Bool { proxyServer?.hasEncounteredFairPlay() == true }
+
+    /// 当前播放尝试的账本 id（routeLine 起新线时开，markPlaying/markFailed 终局时结）。
+    private var ledgerAttemptId: UUID?
+    /// 当前账本尝试对应的线路 URL（换引擎重进 routeLine 时不另开账本）。
+    private var ledgerAttemptLineURL: String?
+    /// 当前片/当前集是否在播放时刻现铸过（账本 stage 用）。
+    private var ledgerRecastAtPlay = false
+    /// 播放器自身日志（errorLog/accessLog，CustomPlayerController 回传）：
+    /// errorLog 的 URI 是 AVPlayer 实际请求失败的地址（绕过判定用），
+    /// accessLog 的 serverAddress 说明实际连到了哪台 IP、有没有换过服务器。
+    private var lastPlayerErrorURI: String?
+    private var lastPlayerServerAddress: String?
+    private var lastPlayerAddressChanges: Int = 0
+    /// 绕过信号：errorLog 指向原始 https 地址且在期望账本里
+    /// （宿主改写过它，AVPlayer 却直接去取了原地址）——升级 P 的条件之一。
+    private var lastBypassSignal = false
+    /// 路由时记的不匹配记录 id（终局时把 outcome 与嗅探结果补上去）。
+    private var pendingMismatchId: UUID?
+    /// 当前片的 item id（账本/不匹配记录用；play(item:) 里记）。
+    private var currentItemId: String?
+
+    /// 当前片的模块 id（账本/路线记忆用；host 的 stream 模块 id）。
+    private var currentModuleId: String {
+        guard let host = currentHost else { return "" }
+        return host.modules.first(where: { $0.type == "stream" })?.id
+            ?? host.modules.first?.id ?? ""
+    }
+
+    // MARK: - 回环代理（P 路）生命周期
+
+    /// 释放代理：停监听、清入口 URL。换线/切引擎/停播时调。
+    private func releaseProxy() {
+        proxyServer?.stop()
+        proxyServer = nil
+        proxyURL = nil
+    }
+
+    /// 给一条线起回环代理：建 server（身份头与拦截器同款），异步起监听；
+    /// 就绪后生成入口 URL 交给播放器（playerURL），播放器视图随 proxyURL 变而重建 item。
+    /// 起不来：记 sticky 失败（以后不再试 P），直接报失败走梯子（markFailed 继续到 J/下一条线）。
+    private func startProxy(for line: PlayLine) {
+        releaseProxy()
+        guard let originalURL = URL(string: line.url) else {
+            failureReason = "这条线路的地址不对，播不了"
+            status = .failed(failureReason!)
+            return
+        }
+        let server = LoopbackProxyServer(headers: interceptedHeaders(for: line))
+        proxyServer = server
+        server.setRestartHandler { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.proxyServerRestarted()
+            }
+        }
+        // start 的 completion 在监听队列上调：跳回主线程再碰 ViewModel 的状态。
+        server.start { [weak self] ok in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                // 换线/停播后才就绪的监听：server 已被释放，不认（不复活旧代理）。
+                guard self.proxyServer === server else { return }
+                if ok {
+                    self.proxyURL = server.entryURL(for: originalURL)
+                    if self.proxyURL == nil {
+                        self.markFailed("回环代理启动失败")
+                    }
+                } else {
+                    PlaybackCapabilities.loopbackProxyBindFailed = true
+                    self.releaseProxy()
+                    self.markFailed("回环代理启动失败")
+                }
+            }
+        }
+    }
+
+    /// 监听重启（进程挂起后端口变了）：同一 server、同一 token，只换端口；
+    /// 重新生成入口 URL，播放器看到新 URL 重建 item，同 generation 下按当前进度续播。
+    private func proxyServerRestarted() {
+        guard let server = proxyServer, let url = currentURL else { return }
+        proxyURL = server.entryURL(for: url)
+    }
+
+    /// 播放器自身日志回传（CustomPlayerController 在失败/首帧时调）：
+    /// errorLog 的 URI 是 AVPlayer 实际请求失败的地址，accessLog 的 serverAddress
+    /// 说明实际连到了哪台 IP、有没有换过服务器。顺带算绕过信号：
+    /// errorLog 指向原始 https 地址且在期望账本里，即宿主改写过它、AVPlayer 却直接取了原地址。
+    func recordPlayerLogs(errorURI: String?, serverAddress: String?, addressChanges: Int) {
+        lastPlayerErrorURI = errorURI
+        lastPlayerServerAddress = serverAddress
+        lastPlayerAddressChanges = addressChanges
+        lastBypassSignal = false
+        if let errorURI, let errorURL = URL(string: errorURI),
+           (errorURL.scheme == "http" || errorURL.scheme == "https"),
+           errorURL.host != "127.0.0.1" {
+            var expectedHashes = Set<String>()
+            if let loader = resourceLoader {
+                expectedHashes.formUnion(loader.knownKeyURLStrings().map { PlaybackLedger.templateHash(for: $0) })
+                if let current = currentURL?.absoluteString {
+                    expectedHashes.insert(PlaybackLedger.templateHash(for: current))
+                }
+            }
+            if let server = proxyServer {
+                expectedHashes.formUnion(server.expectedTemplateHashes())
+            }
+            if expectedHashes.contains(PlaybackLedger.templateHash(for: errorURI)) {
+                lastBypassSignal = true
+            }
+        }
+    }
+
+    // MARK: - 账本 / 不匹配 / 路线记忆
+
+    /// 路线记忆的键（模块 + host + URL 模板哈希 + hint + 网络类）。
+    private func routeMemoryKey(for line: PlayLine) -> RouteMemoryKey {
+        RouteMemoryKey(
+            moduleId: currentModuleId,
+            host: URL(string: line.url)?.host ?? "",
+            urlTemplateHash: PlaybackLedger.templateHash(for: line.url),
+            hint: line.playerHint ?? "",
+            networkClass: PlaybackLedger.networkClass
+        )
+    }
+
+    /// 身份配方摘要（路线记忆里记“这次走通用了哪套身份”，供下次复用）：
+    /// UA + Referer 是底，Cookie/模块自定义头有才加。
+    private func identityRecipe(for line: PlayLine) -> String {
+        var parts = ["UA", "Referer"]
+        if line.cookie?.isEmpty == false { parts.append("Cookie") }
+        if line.headers?.isEmpty == false { parts.append("模块头") }
+        return parts.joined(separator: "+")
+    }
+
+    /// 嗅探类型（路线记忆里记“这次靠什么内容事实判的”）：
+    /// 代理首取 / 拦截器预检 / JS 的 XHR / 页内 WebView / 无。
+    private func currentSniffType() -> String {
+        switch currentEngine {
+        case .proxy: return "proxy-first-fetch"
+        case .nativeIntercepted: return "loader-preflight"
+        case .hlsjs, .dash: return "js-xhr"
+        case .webView: return "webview"
+        case .native, .softDecoder: return "none"
+        }
+    }
+
+    /// 嗅探结果摘要（终局时写进不匹配记录）：代理/拦截器各自首取的状态与种类。
+    private func sniffDescription() -> String {
+        var parts: [String] = []
+        if let server = proxyServer {
+            let (_, actual) = server.bookSnapshot()
+            if let first = actual.first {
+                parts.append("代理首取 \(first.upstreamStatus.map(String.init) ?? "无响应")（\(first.kindLabel)）")
+            }
+        }
+        if let loader = resourceLoader {
+            let book = loader.requestBookSnapshot()
+            if let first = book.first {
+                parts.append("拦截器首取 \(first.statusCode.map(String.init) ?? "无响应")（\(first.kind)）")
+            }
+        }
+        if parts.isEmpty { return "无实际请求" }
+        return parts.joined(separator: "；")
+    }
+
+    /// 起一条新账本（routeLine 进新线时调；同线换引擎重进不另开）。
+    /// 播放器日志与绕过信号按线清零（上一条线的信号不能带到下一条线）。
+    private func beginLedgerAttempt(for line: PlayLine) {
+        ledgerAttemptId = PlaybackLedger.shared.beginAttempt(
+            moduleId: currentModuleId,
+            itemId: currentItemId ?? line.name,
+            lineURL: line.url,
+            hint: line.playerHint ?? "",
+            recastAtPlay: ledgerRecastAtPlay
+        )
+        ledgerAttemptLineURL = line.url
+        ledgerRecastAtPlay = false
+        lastPlayerErrorURI = nil
+        lastPlayerServerAddress = nil
+        lastPlayerAddressChanges = 0
+        lastBypassSignal = false
+    }
+
+    /// 梯子每走一级记一级（连续重复去重）。
+    private func noteLedgerEngine(_ engine: PlayerEngine) {
+        guard let id = ledgerAttemptId else { return }
+        PlaybackLedger.shared.noteEngine(engine, attemptId: id)
+    }
+
+    /// 路由时记不匹配（hint 与 URL 形态不一致即记；一致的不记，免得账本被“无不匹配”淹没）。
+    /// 终局时把 outcome 与嗅探结果补上去（见 finalizeLedgerAttempt）。
+    private func noteRoutingMismatch(for line: PlayLine, engine: PlayerEngine) {
+        let hint = (line.playerHint ?? "").lowercased()
+        let lower = line.url.lowercased()
+        let url = URL(string: line.url)
+        let ext = url?.pathExtension.lowercased() ?? ""
+        let urlForm: String
+        if ext == "mpd" || lower.contains(".mpd") {
+            urlForm = "DASH(.mpd)"
+        } else if ext == "m3u8" || lower.contains(".m3u8") {
+            urlForm = "HLS(.m3u8)"
+        } else if ext == "mp4" || lower.contains(".mp4") {
+            urlForm = "MP4"
+        } else if PlaybackEngine.isEmbedURL(line.url, playerHint: line.playerHint) {
+            urlForm = "嵌页"
+        } else if ext.isEmpty {
+            urlForm = "不透明 URL"
+        } else {
+            urlForm = ".\(ext)"
+        }
+        let knownHints = ["native", "hlsjs", "embed", "webview", "dash"]
+        let mismatch: MismatchKind
+        let evidence: String
+        if hint.isEmpty {
+            mismatch = .hintAbsent
+            evidence = "无 hint，按 URL 形态 \(urlForm) 判"
+        } else if !knownHints.contains(where: { hint.contains($0) }) {
+            mismatch = .hintUnknown
+            evidence = "未知 hint「\(line.playerHint ?? "")」，按 URL 形态 \(urlForm) 判"
+        } else if (hint.contains("embed") || hint.contains("webview"))
+                    && (urlForm == "HLS(.m3u8)" || urlForm == "MP4" || urlForm.hasPrefix("DASH")) {
+            mismatch = .hintVsForm
+            evidence = "hint 称嵌页，但 URL 形态是 \(urlForm)（内容优先，走媒体路线）"
+        } else if hint.contains("hlsjs") && urlForm == "嵌页" {
+            mismatch = .hintVsForm
+            evidence = "hint 称 hlsjs，但 URL 形态是嵌页（走 WebView 解流）"
+        } else if hint.contains("native") && urlForm == "嵌页" {
+            mismatch = .hintVsForm
+            evidence = "hint 称原生，但 URL 形态是嵌页（走 WebView 解流）"
+        } else {
+            return // hint 与形态一致：不记。
+        }
+        let record = RouteMismatch(
+            at: Date(), moduleId: currentModuleId, itemId: currentItemId ?? line.name,
+            hintDeclared: line.playerHint ?? "", urlForm: urlForm, sniff: "路由时未嗅探",
+            evidenceUsed: evidence, decision: engine.displayName, mismatch: mismatch,
+            ladderSteps: [engine.displayName], outcome: "待定"
+        )
+        PlaybackLedger.shared.recordMismatch(record)
+        pendingMismatchId = record.id
+    }
+
+    /// 终局：合并拦截器/代理的账本快照，定 stage 与三路判定；不匹配记录收尾。
+    /// 已终局的尝试再次终局是空操作（markPlaying 可能被多次触发）。
+    private func finalizeLedgerAttempt(outcome: String, playedOK: Bool) {
+        guard let id = ledgerAttemptId else { return }
+        ledgerAttemptId = nil
+        ledgerAttemptLineURL = nil
+        // 合并本次的账本：拦截器 + 回环代理各自记的实际请求。
+        var expected: [LedgerBookEntry] = []
+        var actual: [LedgerBookEntry] = []
+        if let loader = resourceLoader {
+            for item in loader.requestBookSnapshot() {
+                actual.append(LedgerBookEntry(
+                    token: String(PlaybackLedger.templateHash(for: item.url).prefix(8)),
+                    kind: BookKind(rawValue: item.kind) ?? .segment,
+                    host: URL(string: item.url)?.host ?? "",
+                    pathTemplateHash: PlaybackLedger.templateHash(for: item.url),
+                    upstreamStatus: item.statusCode,
+                    bytes: nil,
+                    servedFromCache: false
+                ))
+            }
+            for keyURL in loader.knownKeyURLStrings() {
+                expected.append(LedgerBookEntry(
+                    token: String(PlaybackLedger.templateHash(for: keyURL).prefix(8)),
+                    kind: .key,
+                    host: URL(string: keyURL)?.host ?? "",
+                    pathTemplateHash: PlaybackLedger.templateHash(for: keyURL),
+                    upstreamStatus: nil,
+                    bytes: nil,
+                    servedFromCache: false
+                ))
+            }
+            if let current = currentURL?.absoluteString {
+                expected.append(LedgerBookEntry(
+                    token: String(PlaybackLedger.templateHash(for: current).prefix(8)),
+                    kind: .playlist,
+                    host: URL(string: current)?.host ?? "",
+                    pathTemplateHash: PlaybackLedger.templateHash(for: current),
+                    upstreamStatus: loader.preflightPlaylistStatusCode,
+                    bytes: nil,
+                    servedFromCache: false
+                ))
+            }
+        }
+        if let server = proxyServer {
+            let (exp, act) = server.bookSnapshot()
+            expected.append(contentsOf: exp)
+            actual.append(contentsOf: act)
+        }
+        PlaybackLedger.shared.mergeBooks(expected: expected, actual: actual, attemptId: id)
+        let gaps = proxyServer?.rewriteGapCount() ?? 0
+        PlaybackLedger.shared.finalizeAttempt(
+            id, outcome: outcome, playedOK: playedOK,
+            errorURI: lastPlayerErrorURI, serverAddress: lastPlayerServerAddress,
+            addressChanges: lastPlayerAddressChanges, rewriteGaps: gaps
+        )
+        // 不匹配记录收尾：路由时记的把 outcome、嗅探结果、完整梯子补上；
+        // 终局判定是被绕过/上游拒绝/播放器拒收、路由时又没记过不匹配的，
+        // 再补一条内容事实层面的不匹配（路由的假设被内容证伪了）。
+        let sniff = sniffDescription()
+        let attempt = PlaybackLedger.shared.attempts.first(where: { $0.id == id })
+        let ladderSteps = attempt?.ladder.map { $0.displayName } ?? []
+        if let mismatchId = pendingMismatchId {
+            pendingMismatchId = nil
+            PlaybackLedger.shared.updateMismatch(id: mismatchId, outcome: outcome, sniff: sniff, ladderSteps: ladderSteps, kind: nil)
+        } else {
+            let verdict = attempt?.verdict ?? .unknown
+            let kind: MismatchKind?
+            let evidence: String
+            switch verdict {
+            case .bypassed:
+                kind = .hintVsContent
+                evidence = "路由按 hint/形态选了 \(attempt?.ladder.first?.displayName ?? "")，内容事实：AVPlayer 直接取了原始 https 地址，拦截/代理未命中"
+            case .rejectedUpstream:
+                kind = .formVsContent
+                evidence = "URL 形态称可播，内容事实：上游返回 4xx/5xx"
+            case .avPlayerRejected:
+                kind = .formVsContent
+                evidence = "URL 形态称可播，内容事实：代理/拦截器拿到 2xx，播放器仍拒收"
+            default:
+                kind = nil
+                evidence = ""
+            }
+            if let kind {
+                PlaybackLedger.shared.recordMismatch(RouteMismatch(
+                    at: Date(), moduleId: attempt?.moduleId ?? currentModuleId,
+                    itemId: attempt?.itemId ?? "", hintDeclared: attempt?.hint ?? "",
+                    urlForm: "", sniff: sniff, evidenceUsed: evidence,
+                    decision: attempt?.ladder.first?.displayName ?? "",
+                    mismatch: kind, ladderSteps: ladderSteps, outcome: outcome
+                ))
+            }
+        }
+    }
+
+    /// 该线路实际走的引擎：有强制覆盖（回退/升级）用覆盖；否则先查路线记忆
+    /// （同一模块+host+模板+hint 之前走通过的起手路线），没有才走路由表。
     private func engine(for line: PlayLine) -> PlayerEngine {
         if let override = engineOverrides[line.url] {
             return override
+        }
+        // 路线记忆（内容事实 rung）：之前同一模块+host+模板+hint 走通的起手路线，
+        // 直接用它起手，省掉重新判；7 天内有效、2 次一致失败才过期（见 PlaybackLedger）。
+        if let cached = PlaybackLedger.shared.cachedRoute(
+            moduleId: currentModuleId,
+            host: URL(string: line.url)?.host ?? "",
+            urlTemplateHash: PlaybackLedger.templateHash(for: line.url),
+            hint: line.playerHint ?? "",
+            networkClass: PlaybackLedger.networkClass
+        ) {
+            return cached
         }
         return PlaybackEngine.route(for: line)
     }
@@ -383,6 +738,8 @@ final class PlayerViewModel: ObservableObject {
             lines.insert(first, at: 0)
         }
         failedURLs.remove(first.url)
+        // 账本：这条线是播放时刻现铸的（密钥 403 后的重铸），stage 至少到 mint。
+        ledgerRecastAtPlay = true
         routeLine(first)
         return true
     }
@@ -393,7 +750,12 @@ final class PlayerViewModel: ObservableObject {
     /// currentEngine == .nativeIntercepted 时建拦截器并挂到 resourceLoader：
     /// currentURL 保持 https 原地址（线路身份、失败去重、画质匹配都按它认），
     /// scheme 改写只发生在 CustomPlayerView 建 asset 那一步。
-    /// 发布顺序：先建好拦截器、再设 currentURL/currentHeaders、最后设 currentEngine——
+    /// currentEngine == .proxy 时起回环代理（异步监听）：currentURL 同样保持
+    /// https 原地址，播放用的回环地址另存 proxyURL，playerURL 供播放器视图读；
+    /// 监听就绪前 playerURL 还是原地址，但控制器对 .proxy 只认回环地址
+    ///（见 CustomPlayerController.load），就绪前不建 asset、不裸播原地址；
+    /// proxyURL 一到，视图随之重建 item 走回环。
+    /// 发布顺序：先建好拦截器/起好代理、再设 currentURL/currentHeaders、最后设 currentEngine——
     /// 控制器的引擎监听触发 load() 时拦截器已经在位，不会先建出裸 asset。
     @discardableResult
     private func setCurrent(_ line: PlayLine, engine: PlayerEngine? = nil) -> Bool {
@@ -407,13 +769,20 @@ final class PlayerViewModel: ObservableObject {
         isResolvingEmbed = false
         if resolvedEngine == .nativeIntercepted {
             resourceLoader = makeResourceLoader(for: line)
+            releaseProxy()
+        } else if resolvedEngine == .proxy {
+            resourceLoader = nil
+            startProxy(for: line)
         } else {
             resourceLoader = nil
+            releaseProxy()
         }
         currentURL = url
-        if resolvedEngine == .nativeIntercepted {
-            // 拦截线路：Referer/UA/模块头/Cookie 全给拦截器（子请求用），
-            // currentHeaders 同步一份，供 HLS.js 回退的播放器复用。
+        if resolvedEngine == .nativeIntercepted || resolvedEngine == .proxy {
+            // 拦截/代理线路：Referer/UA/模块头/Cookie 全给拦截器或代理（子请求用），
+            // currentHeaders 同步一份，供 HLS.js 回退的播放器复用；
+            // 代理时 CustomPlayerView 不把 currentHeaders 挂到回环 asset 上
+            //（回环地址不需要头，头由代理统一带——见 CustomPlayerController.load）。
             currentHeaders = interceptedHeaders(for: line)
         } else if let referer = line.referer, !referer.isEmpty {
             // 解流得到的直链带了 Referer（嵌入页）：AVPlayer 取流时带上，CDN 要这个。
@@ -429,10 +798,12 @@ final class PlayerViewModel: ObservableObject {
     }
 
     /// 播一条线：先调路由表定引擎，再分流。
-    /// .native/.nativeIntercepted → setCurrent（AVPlayer，拦截器线挂 delegate）；
-    /// .webView → 现有 playEmbedLine；
+    /// .native/.nativeIntercepted/.proxy → setCurrent（AVPlayer，拦截器线挂 delegate，
+    /// 代理线起回环监听）；.webView → 现有 playEmbedLine；
     /// .hlsjs/.dash/.softDecoder → 只设 currentURL/currentHeaders/currentEngine/status=.loading，
     ///   不建 AVPlayer（视图层按 currentEngine 显示对应播放器，D 路负责）。
+    /// 账本：进新线开一条尝试（同线换引擎重进不另开），梯子每走一级记一级，
+    /// 路由时把 hint 与形态的不一致记下来（终局时补 outcome 与嗅探结果）。
     /// 返回 true 表示这条线已被接手（直链已设、嵌入流程已启动，或已交给对应播放器视图）。
     @discardableResult
     private func routeLine(_ line: PlayLine) -> Bool {
@@ -440,8 +811,16 @@ final class PlayerViewModel: ObservableObject {
         // 首选引擎即记为已试：回退只去没试过的引擎，不 ping-pong
         //（hlsjs → 拦截器是一步，拦截器失败不再回 hls.js——hls.js 首选时已试过）。
         markFallbackTried(url: line.url, engine: engine)
+        // 账本：进新线开一条尝试（同线换引擎重进只记梯子）；路由时记 hint 与形态的不一致。
+        // 换线时先把上一条线的尝试终局（切线），不留没终局的孤儿账本。
+        if ledgerAttemptLineURL != line.url {
+            finalizeLedgerAttempt(outcome: "切线", playedOK: false)
+            beginLedgerAttempt(for: line)
+            noteRoutingMismatch(for: line, engine: engine)
+        }
+        noteLedgerEngine(engine)
         switch engine {
-        case .native, .nativeIntercepted:
+        case .native, .nativeIntercepted, .proxy:
             return setCurrent(line, engine: engine)
         case .webView:
             currentEngine = engine
@@ -455,9 +834,11 @@ final class PlayerViewModel: ObservableObject {
             webViewURL = nil
             isResolvingEmbed = false
             resourceLoader = nil
+            releaseProxy()
             guard let url = URL(string: line.url) else {
                 failureReason = "这条线路的地址不对，播不了"
                 status = .failed("这条线路的地址不对，播不了")
+                finalizeLedgerAttempt(outcome: "线路地址不对", playedOK: false)
                 return false
             }
             // DASH 能力缺失 fast-fail：设备不支持 dash.js 且无软解时，
@@ -472,6 +853,7 @@ final class PlayerViewModel: ObservableObject {
                 }
                 failureReason = "这条线路是 DASH 格式，当前设备不支持 dash.js 播放"
                 status = .failed(failureReason!)
+                finalizeLedgerAttempt(outcome: "DASH 不支持", playedOK: false)
                 return true
             }
             currentURL = url
@@ -500,6 +882,7 @@ final class PlayerViewModel: ObservableObject {
         webViewURL = nil
         currentURL = nil
         currentHeaders = nil
+        releaseProxy()
         failureReason = nil
         // Fix B wall-first：嵌页 host 属于 playmogo/dood 等墙后家族时，URLSession
         // 解流注定过不了 CF 挑战（探针：playmogo 403 + Cf-Mitigated: challenge），
@@ -560,6 +943,7 @@ final class PlayerViewModel: ObservableObject {
         webViewURL = nil
         isResolvingEmbed = false
         resourceLoader = nil
+        releaseProxy()
         currentEngine = .native
         status = .idle
         failureReason = nil
@@ -573,6 +957,8 @@ final class PlayerViewModel: ObservableObject {
     func play(item: VideoItem, host: WidgetHost) async {
         // 开始播放：后台自动自检立刻停（让路），下次断点续跑。
         SourceStore.shared.cancelAutoCheck()
+        // 上一场的账本尝试若还开着（同一 ViewModel 重播），先按停播终局。
+        finalizeLedgerAttempt(outcome: "停播", playedOK: false)
         let generation = UUID()
         playGeneration = generation
         failedURLs = []
@@ -588,7 +974,9 @@ final class PlayerViewModel: ObservableObject {
         currentHeaders = nil
         currentEngine = .native
         resourceLoader = nil
+        releaseProxy()
         currentItemLink = item.link
+        currentItemId = item.id
         status = .loading
         // 同一 ViewModel 重播时，旧的解流/WebView 不能残留
         embedTask?.cancel()
@@ -706,6 +1094,8 @@ final class PlayerViewModel: ObservableObject {
                     self.lines.insert(first, at: 0)
                 }
                 self.failedURLs.remove(first.url)
+                // 账本：这条线是播放时刻现铸的（分集点播的重铸），stage 至少到 mint。
+                self.ledgerRecastAtPlay = true
                 _ = self.routeLine(first)
             }
             return
@@ -724,10 +1114,11 @@ final class PlayerViewModel: ObservableObject {
     /// 则缺头/缺 cookie 不可能是首要根因；VPN 下仍不可播，才是头/cookie/解析问题；
     /// 明文流（pornjav）在 B 上也要代理，几乎一定在网络层，与 playerHint 无关。
     /// 恢复顺序（有限，不循环）：过期/一次性 URL 不自动重试同一条线 →
-    /// hls.js ⇄ Native HLS 兼容实现（拦截器）各试一次 → 裸连升级拦截器 →
+    /// hls.js ⇄ Native HLS 兼容实现（拦截器）各试一次 → 回环代理（P，
+    /// 只在分片需头/拦截被绕过时升级）→ 裸连升级拦截器 →
     /// 切下一条线 → 报 failed。key 403 的链是：重拉播单一次 → 重铸一次 →
     /// 再失败即报失败切线（重拉+重铸在拦截器里，见 HLSResourceLoader）。
-    /// - FairPlay（skd://）：拦截器在播单里见到了，直接报明确错误，不切线重试。
+    /// - FairPlay（skd://）：拦截器或代理已在播单里见到 skd://，直接报明确错误，不切线重试。
     /// - hlsjs 线：每条线每个引擎最多试一次（路由首选的引擎即记为已试）——
     ///   首选 hls.js 时：hls.js 失败 → 回退 .nativeIntercepted（一步），拦截器再失败
     ///   直接切下一条线，不回 hls.js；首选拦截器时：拦截器失败 → 回退 .hlsjs（一步）。
@@ -736,6 +1127,7 @@ final class PlayerViewModel: ObservableObject {
     ///   明文线本来就没 token）；升级过的线不再升级，直接切下一条。
     /// - 非原生容器且没集成软解：报明确错误（需要软解播放器），不无意义重试。
     /// 先试下一条没失败过的线，都失败才报 failed。
+    /// 终局（切线/报 failed）时账本定 stage 与三路判定；分层明确的失败才写路线记忆。
     func markFailed(_ reason: String, stage: PlaybackFailureStage? = nil) {
         // 同一条 URL 只认一次失败：KVO .failed 和失败通知可能先后都到，
         // 不拦的话第二次会把刚切上的下一条线也误标失败。
@@ -743,11 +1135,12 @@ final class PlayerViewModel: ObservableObject {
         // 分层：调用方传来的 stage 优先，否则用拦截器记的分层。
         let failureStage = stage ?? resourceLoader?.lastFailureStage
         let failureStatusCode = resourceLoader?.lastFailureStatusCode
-        // FairPlay：拦截器已在播单里见到 skd://，直接明确报错。
-        if resourceLoader?.encounteredFairPlay == true {
+        // FairPlay：拦截器或代理已在播单里见到 skd://，直接明确报错。
+        if resourceLoader?.encounteredFairPlay == true || proxyServer?.hasEncounteredFairPlay() == true {
             failedURLs.insert(current)
             failureReason = "这条线路用了 FairPlay 加密（skd://），当前播放器不支持，请换一条线路"
             status = .failed(failureReason!)
+            finalizeLedgerAttempt(outcome: "FairPlay 加密，不支持", playedOK: false)
             return
         }
         let currentLine = lines.first(where: { $0.url == current })
@@ -759,11 +1152,13 @@ final class PlayerViewModel: ObservableObject {
             expiredTokenURLs.insert(current)
             failedURLs.insert(current)
             if let next = lines.first(where: { !failedURLs.contains($0.url) }) {
+                finalizeLedgerAttempt(outcome: "密钥过期/一次性 token 失效", playedOK: false)
                 routeLine(next)
                 return
             }
             failureReason = layeredReason(stage: .keyFetch, statusCode: failureStatusCode, fallback: reason)
             status = .failed(failureReason!)
+            finalizeLedgerAttempt(outcome: "密钥过期/一次性 token 失效", playedOK: false)
             return
         }
         if hintIsHLSJS {
@@ -784,9 +1179,42 @@ final class PlayerViewModel: ObservableObject {
                 markFallbackTried(url: current, engine: .hlsjs)
                 engineOverrides[current] = .hlsjs
                 resourceLoader = nil
+                noteLedgerEngine(.hlsjs)
                 currentEngine = .hlsjs
                 status = .loading
                 failureReason = nil
+                return
+            }
+        }
+        // P 失败 → J：代理也失败了，hlsjs 线、hls.js 可用、还没试过 hls.js 时，
+        // 切 hls.js 再试一次（一步）；不是 hlsjs 线或 hls.js 已试过，直接走下面切线。
+        if currentEngine == .proxy,
+           hintIsHLSJS,
+           PlaybackCapabilities.hasHLSJS,
+           !hasTriedFallback(url: current, engine: .hlsjs) {
+            markFallbackTried(url: current, engine: .hlsjs)
+            engineOverrides[current] = .hlsjs
+            resourceLoader = nil
+            releaseProxy()
+            noteLedgerEngine(.hlsjs)
+            currentEngine = .hlsjs
+            status = .loading
+            failureReason = nil
+            return
+        }
+        // D 失败 → P：回环代理升级（梯子 D → P → J 里的一级）。
+        // 只在代理能帮上忙的信号下升级：分片需头（.segmentFetch / -12881，
+        // 拦截器覆盖不了分片）或拦截被绕过（errorLog 指向原始 https 地址）；
+        // 其他失败直接切线，不白跑代理。代理起监听失败过（sticky）也不再试。
+        // 升级后由 routeLine 走 setCurrent(.proxy) 起监听；监听就绪才交回环地址给播放器。
+        if (currentEngine == .nativeIntercepted || currentEngine == .hlsjs),
+           !PlaybackCapabilities.loopbackProxyBindFailed,
+           !hasTriedFallback(url: current, engine: .proxy),
+           (failureStage == .segmentFetch || lastBypassSignal) {
+            markFallbackTried(url: current, engine: .proxy)
+            engineOverrides[current] = .proxy
+            if let line = currentLine {
+                routeLine(line)
                 return
             }
         }
@@ -803,6 +1231,11 @@ final class PlayerViewModel: ObservableObject {
         }
         failedURLs.insert(current)
         if let next = lines.first(where: { !failedURLs.contains($0.url) }) {
+            finalizeLedgerAttempt(outcome: "失败，切下一条线", playedOK: false)
+            if let line = currentLine {
+                // 分层明确的失败才写路线记忆（分层不明不写，避免把偶然失败记成路线）。
+                PlaybackLedger.shared.recordRouteFailure(key: routeMemoryKey(for: line), clearClass: failureStage != nil)
+            }
             routeLine(next)
             return
         }
@@ -810,10 +1243,15 @@ final class PlayerViewModel: ObservableObject {
             let ext = URL(string: current)?.pathExtension.lowercased() ?? ""
             failureReason = "这条线路是 .\(ext) 格式，需要软解播放器，当前版本未集成软解"
             status = .failed(failureReason!)
+            finalizeLedgerAttempt(outcome: failureReason!, playedOK: false)
             return
         }
         failureReason = layeredReason(stage: failureStage, statusCode: failureStatusCode, fallback: reason)
         status = .failed(failureReason!)
+        finalizeLedgerAttempt(outcome: failureReason!, playedOK: false)
+        if let line = currentLine {
+            PlaybackLedger.shared.recordRouteFailure(key: routeMemoryKey(for: line), clearClass: failureStage != nil)
+        }
     }
 
     /// 分层错误文案：播单/key/分片 + HTTP 状态码；没分层信息时退回原 reason。
@@ -833,22 +1271,35 @@ final class PlayerViewModel: ObservableObject {
             if let statusCode {
                 return "分片拉取失败（HTTP \(statusCode)，分片可能需要请求头）"
             }
-            return "分片拉取失败（分片可能需要请求头，已回退 hls.js）"
+            return "分片拉取失败（分片可能需要请求头）"
         case .playback, nil:
             return fallback
         }
     }
 
     /// 播放器出首帧后调（Views 层监听 AVPlayerItem status / 开始播放）。
+    /// 终局：账本记“播放中”，走通的起手路线写进路线记忆（下次同模块+host+模板+hint 直接用它）。
     func markPlaying() {
         if case .failed = status { return }
         failureReason = nil
         status = .playing
+        finalizeLedgerAttempt(outcome: "播放中", playedOK: true)
+        if let current = currentURL?.absoluteString,
+           let line = lines.first(where: { $0.url == current }) {
+            PlaybackLedger.shared.recordRouteSuccess(
+                key: routeMemoryKey(for: line),
+                firstRoute: currentEngine,
+                identityRecipe: identityRecipe(for: line),
+                sniffType: currentSniffType()
+            )
+        }
     }
 
     /// 离开详情页即停播：清 URL 与线路，旧的后台备线任务回来也会被 generation 拦住。
     /// 正在跑的解流也取消、WebView 也清掉（嵌入页不继续在后台跑）。
+    /// 开着的账本尝试按停播终局（已终局过的是空操作）；代理随停播释放。
     func stop() {
+        finalizeLedgerAttempt(outcome: "停播", playedOK: false)
         embedTask?.cancel()
         embedTask = nil
         embedExtractor?.cancel()
@@ -860,9 +1311,11 @@ final class PlayerViewModel: ObservableObject {
         currentHeaders = nil
         currentEngine = .native
         resourceLoader = nil
+        releaseProxy()
         currentHost = nil
         currentRecastLink = nil
         currentRecastTitle = nil
+        currentItemId = nil
         engineOverrides = [:]
         triedEngineFallbacks = []
         expiredTokenURLs = []

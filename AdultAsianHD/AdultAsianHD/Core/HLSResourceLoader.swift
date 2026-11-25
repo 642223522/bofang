@@ -8,7 +8,8 @@ import Foundation
 /// 直接由 AVPlayer 发起。所以本拦截器只负责 playlist + key，不要写成能拦分片的样子：
 /// 播单改写时 key URI 改 scheme（走拦截器），分片/init 行一律改成绝对 https
 /// （AVPlayer 直接拉）；分片也需要头时拦截器覆盖不了，会报 -12881，
-/// 由上层检测到后回退 hls.js（再往后是回环代理扩展点，见 LoopbackProxy）。
+/// 由上层检测到后回退 hls.js，再往后是回环代理（LoopbackProxyServer，
+/// 梯子 D → P → J 里的一级，见 Playback.markFailed）。
 /// 探针已证实三站的分片不要头（黄果 .ts 无头也 206），所以黄果仍可用拦截器。
 ///
 /// 拦截器不“解密”：只负责把 key 字节喂给 AVPlayer（重写 EXT-X-KEY URI、
@@ -78,6 +79,40 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     private var knownKeyURLs: Set<String> = []
     private var playlistURL: URL?
     private var tasks: [ObjectIdentifier: Task<Void, Never>] = [:]
+    /// 本次拦截器实际代发的请求账本（播单/密钥/分片）：(URL, 上游状态码, 种类)。
+    /// 终局时由 ViewModel 取快照、合并进账本（期望 vs 实际对账用）。
+    /// 只记 URL 与状态码；账本只存 host + 路径模板哈希，不记 token/Cookie（见 PlaybackLedger）。
+    private var requestBook: [(url: String, statusCode: Int?, kind: String)] = []
+
+    /// 本次实际代发的请求快照（线程安全）。终局时由 ViewModel 取。
+    func requestBookSnapshot() -> [(url: String, statusCode: Int?, kind: String)] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return requestBook
+    }
+
+    /// 播单里见过的密钥 URL 快照（线程安全）：期望账本用——
+    /// 这些 URL 是宿主改写过、指望 AVPlayer 经拦截器取的；errorLog 若指向其中之一，
+    /// 即 AVPlayer 直接取了原始 https 地址（被绕过）。
+    func knownKeyURLStrings() -> [String] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return Array(knownKeyURLs)
+    }
+
+    private func appendRequestBook(url: URL, statusCode: Int?) {
+        let kind: String
+        if isKeyURL(url) {
+            kind = "key"
+        } else if url.pathExtension.lowercased() == "m3u8" {
+            kind = "playlist"
+        } else {
+            kind = "segment"
+        }
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        requestBook.append((url: url.absoluteString, statusCode: statusCode, kind: kind))
+    }
 
     /// 预检结果：拦截器第一次拉 playlist 的结果本身就是预检（直接用、不丢弃；
     /// 一次性 URL 不做额外 GET，额外 GET 会消费一次性 token）。
@@ -210,6 +245,8 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
             }
         } catch {
             if Task.isCancelled { return }
+            // 传输层就失败了（无响应）：记一条状态 nil 的实际账本，终局时分层记 .segmentFetch/.keyFetch。
+            appendRequestBook(url: originalURL, statusCode: nil)
             recordFailure(stage: isKey ? .keyFetch : (isPlaylistURL ? .playlistFetch : .segmentFetch), statusCode: nil)
             loadingRequest.finishLoading(with: error)
         }
@@ -247,7 +284,10 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
                 request.setValue("bytes=\(range.offset)-", forHTTPHeaderField: "Range")
             }
         }
-        return try await session.data(for: request)
+        let result = try await session.data(for: request)
+        // 记实际账本：每一次代发请求都记（成功/非 2xx 都记；抛错的由 handle 的 catch 记 nil）。
+        appendRequestBook(url: url, statusCode: (result.1 as? HTTPURLResponse)?.statusCode)
+        return result
     }
 
     /// 密钥 403/401 后的挽救：重拉一次播单，用刷新后播单里的新 key URI 再拉一次密钥。
