@@ -164,6 +164,14 @@ struct PlayLine: Hashable {
     /// 我们以前没接——解析时直接丢了）。嵌入页播放器恒开广告剥离，
     /// 这个标记记下来供以后按线精细控制。
     let adStrip: Bool
+    /// 模块给的自定义请求头（拦截器给播单/密钥子请求加头用；分片是 AVPlayer 直接拉的，
+    /// 拦截器管不到；朋友三模块现在不给，超集规则要求“模块给了就不能丢”）。nil = 模块没给。
+    /// 注意：声明处不给默认值（默认值在下方显式 init 的参数里）——
+    /// 声明处给了 `= nil` 又在 init 里赋值，Swift 会报 "immutable value may only be initialized once"（构建 #41 就是这么死的）。
+    let headers: [String: String]?
+    /// 模块给的 Cookie（拦截器给子请求带 Cookie 头用；朋友三模块现在不给）。
+    /// 与 headers 同款原因：声明处不给默认值。
+    let cookie: String?
 
     /// 显式 init（不依赖编译器合成的 memberwise init）：
 
@@ -171,13 +179,15 @@ struct PlayLine: Hashable {
     /// 构建 #38/#39 在 Xcode 27.2 上报 "extra argument 'playerHint' in call"，
     /// 而 Models.swift 明明有该字段、构建机签出与缓存都已核实无误；
     /// 显式写出 init 后调用点不再依赖合成行为。
-    init(name: String, url: String, description: String, playerHint: String? = nil, referer: String? = nil, adStrip: Bool = false) {
+    init(name: String, url: String, description: String, playerHint: String? = nil, referer: String? = nil, adStrip: Bool = false, headers: [String: String]? = nil, cookie: String? = nil) {
         self.name = name
         self.url = url
         self.description = description
         self.playerHint = playerHint
         self.referer = referer
         self.adStrip = adStrip
+        self.headers = headers
+        self.cookie = cookie
     }
 }
 
@@ -222,18 +232,29 @@ struct DetailEpisode: Identifiable, Hashable {
     let description: String
     /// 播放器提示（如 "hlsjs"，只存不用）
     let playerHint: String?
+    /// 该集播出时要带的 Referer（分集透传用；D 路 playEpisode 重建 PlayLine 时传上）。
+    let referer: String?
     /// 朋友桥标记：这集要求剥广告（同 PlayLine.adStrip，透传用）。
     let adStrip: Bool
+    /// 模块给的自定义请求头（同 PlayLine.headers，拦截器用；分集透传用）。
+    let headers: [String: String]?
+    /// 模块给的 Cookie（同 PlayLine.cookie，拦截器用；分集透传用）。
+    let cookie: String?
 
     /// 显式 init（PlayLine 同款原因）。
-    init(id: String, title: String, link: String, videoURL: String?, description: String, playerHint: String? = nil, adStrip: Bool = false) {
+    /// 参数顺序必须与 WidgetHost.parseDetailItem 的调用点一致：
+    /// id, title, link, videoURL, description, playerHint, referer, adStrip, headers, cookie。
+    init(id: String, title: String, link: String, videoURL: String?, description: String, playerHint: String? = nil, referer: String? = nil, adStrip: Bool = false, headers: [String: String]? = nil, cookie: String? = nil) {
         self.id = id
         self.title = title
         self.link = link
         self.videoURL = videoURL
         self.description = description
         self.playerHint = playerHint
+        self.referer = referer
         self.adStrip = adStrip
+        self.headers = headers
+        self.cookie = cookie
     }
 }
 

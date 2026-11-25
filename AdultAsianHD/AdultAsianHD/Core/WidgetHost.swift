@@ -212,14 +212,21 @@ final class WidgetHost: @unchecked Sendable {
 
     // MARK: - Widget 桥接
 
-    /// 注入全局 Widget 对象：Widget.http.get / post、Widget.storage.get / set，
-    /// 再加一个空的 console.log（有的模块会 log，没它会报异常）。
+    /// 注入全局 Widget 对象与 JS 全局 API：
+    /// Widget.http.get / post（回值 {status, data, headers, arrayBuffer}）、
+    /// Widget.storage.get / set / remove / clear、localStorage（getItem/setItem/removeItem/clear，
+    /// 前缀 fw.localstorage.）、全局 fetch（GET/POST 最小实现）、setTimeout / clearTimeout、
+    /// setInterval / clearInterval、console.log / info / debug / warn / error（多参数拼接）。
+    /// 模块发现三路超集、loadDetail/childItems/relatedItems 解析、分类拦截器都不在这里动。
     private static func installWidgetBridge(in context: JSContext, interceptor: CategoryRequestInterceptor) {
         let widget = JSValue(newObjectIn: context)!
         let http = JSValue(newObjectIn: context)!
         let storage = JSValue(newObjectIn: context)!
 
-        // Widget.http.get(url, {headers}) -> Promise<{status, data}>
+        // Widget.http.get(url, {headers}) -> Promise<{status, data, headers, arrayBuffer}>
+        // headers：响应头全量（原样 key + 全小写 key 各一份，至少含 set-cookie）；
+        // arrayBuffer：响应体原字节的 ArrayBuffer（16 MiB 以上或转换失败时该属性缺省，
+        // data 照旧是 JSON 对象/数组或文本——data 不是二进制安全的，二进制请用 arrayBuffer）。
         // JS 调它时得到一个真 Promise；Swift 在后台发请求，完事回主线程 resolve/reject。
         // 注意：JSValue 的 block 用 @convention(block)，resolve/reject 必须在主线程调，
         // 所以这里只在 executor 里收下它们，真正的 resolve/reject 包在 MainActor.run 里。
@@ -232,8 +239,8 @@ final class WidgetHost: @unchecked Sendable {
         }
         http.setValue(httpGet, forProperty: "get")
 
-        // Widget.http.post(url, body, {headers}) -> Promise<{status, data}>
-        // 与 get 同一套 Promise 机制；POST 不套分类拦截器（拦截只改 WP 帖子 GET）。
+        // Widget.http.post(url, body, {headers}) -> Promise<{status, data, headers, arrayBuffer}>
+        // 回值形状与 get 相同（见上面 get 的注释）；POST 不套分类拦截器（拦截只改 WP 帖子 GET）。
         // body 一般是字符串（huangguo 现铸签名传 "{}"）；是对象时转 JSON。
         let httpPost: @convention(block) (String, JSValue?, JSValue?) -> JSValue = { [weak context] urlString, body, options in
             guard let context else {
@@ -258,18 +265,89 @@ final class WidgetHost: @unchecked Sendable {
         let storageSet: @convention(block) (String, JSValue) -> Void = { key, value in
             UserDefaults.standard.set(value.toString(), forKey: "fw.storage." + key)
         }
+        // Widget.storage.remove(key) / clear()：与 get/set 同一套 UserDefaults 前缀。
+        // clear 只清 fw.storage. 前缀的 key，不动 localStorage（前缀不同）与别的 key。
+        let clearKeysWithPrefix: (String) -> Void = { prefix in
+            let keys = UserDefaults.standard.dictionaryRepresentation().keys.filter { $0.hasPrefix(prefix) }
+            for key in keys {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
+        let storageRemove: @convention(block) (String) -> Void = { key in
+            UserDefaults.standard.removeObject(forKey: "fw.storage." + key)
+        }
+        let storageClear: @convention(block) () -> Void = {
+            clearKeysWithPrefix("fw.storage.")
+        }
         storage.setValue(storageGet, forProperty: "get")
         storage.setValue(storageSet, forProperty: "set")
+        storage.setValue(storageRemove, forProperty: "remove")
+        storage.setValue(storageClear, forProperty: "clear")
         widget.setValue(storage, forProperty: "storage")
 
-        let console = JSValue(newObjectIn: context)!
-        let log: @convention(block) (JSValue) -> Void = { value in
+        // localStorage：与 Widget.storage 同款持久化（UserDefaults），前缀分开
+        //（fw.localstorage.，与 fw.storage. 互不干扰），值按字符串存。
+        // getItem 不存在返回 JS null（与 Widget.storage.get 同款，模块里 `if (raw)` 判空能正常工作）。
+        // 只实现 getItem/setItem/removeItem/clear（任务定的四件套）；length/key(index) 未实现。
+        let localStorage = JSValue(newObjectIn: context)!
+        let localStorageGetItem: @convention(block) (String) -> JSValue = { [weak context] key in
+            guard let context else {
+                fatalError("WidgetHost: JSContext 已释放")
+            }
+            if let value = UserDefaults.standard.string(forKey: "fw.localstorage." + key) {
+                return JSValue(object: value, in: context)!
+            }
+            return JSValue(nullIn: context)!
+        }
+        let localStorageSetItem: @convention(block) (String, JSValue) -> Void = { key, value in
+            UserDefaults.standard.set(value.toString(), forKey: "fw.localstorage." + key)
+        }
+        let localStorageRemoveItem: @convention(block) (String) -> Void = { key in
+            UserDefaults.standard.removeObject(forKey: "fw.localstorage." + key)
+        }
+        let localStorageClear: @convention(block) () -> Void = {
+            clearKeysWithPrefix("fw.localstorage.")
+        }
+        localStorage.setValue(localStorageGetItem, forProperty: "getItem")
+        localStorage.setValue(localStorageSetItem, forProperty: "setItem")
+        localStorage.setValue(localStorageRemoveItem, forProperty: "removeItem")
+        localStorage.setValue(localStorageClear, forProperty: "clear")
+        context.setObject(localStorage, forKeyedSubscript: "localStorage" as NSString)
+
+        // console.log / info / debug / warn / error：多参数拼接（朋友演示同款：
+        // Array.prototype.slice.call(arguments).map(String).join(' ')）。
+        // 裸 JSC 的 Swift block 只能按固定签名接参，接不到“任意多个参数”，
+        // 所以多参数拼接放在 JS 层做，Swift 只接拼好的一个字符串（__fwConsolePrint 内部桥）。
+        // error 加 "[error] " 前缀（warn 同款 "[warn] "）；只在 DEBUG 下打印
+        //（现有 #if DEBUG 保留；Release 下 JS 照调、Swift 不打印）。
+        // 每个参数的 String(v) 单独 try/catch：String(Symbol) 会抛 TypeError，
+        // 抛的那个参数记成 "[object Symbol]" 这类，不让一次 log 炸掉整个调用。
+        let consoleSink: @convention(block) (String, String) -> Void = { level, message in
             #if DEBUG
-            print("[JS]", value.toString())
+            switch level {
+            case "error": print("[JS] [error] \(message)")
+            case "warn": print("[JS] [warn] \(message)")
+            default: print("[JS] \(message)")
+            }
             #endif
         }
-        console.setValue(log, forProperty: "log")
-        context.setObject(console, forKeyedSubscript: "console" as NSString)
+        context.setObject(consoleSink as @convention(block) (String, String) -> Void, forKeyedSubscript: "__fwConsolePrint" as NSString)
+        context.evaluateScript("""
+            (function (g) {
+                var joinArgs = function (args) {
+                    return Array.prototype.slice.call(args).map(function (v) {
+                        try { return String(v); } catch (e) { return Object.prototype.toString.call(v); }
+                    }).join(' ');
+                };
+                var c = {};
+                c.log = function () { g.__fwConsolePrint('log', joinArgs(arguments)); };
+                c.info = function () { g.__fwConsolePrint('log', joinArgs(arguments)); };
+                c.debug = function () { g.__fwConsolePrint('log', joinArgs(arguments)); };
+                c.warn = function () { g.__fwConsolePrint('warn', joinArgs(arguments)); };
+                c.error = function () { g.__fwConsolePrint('error', joinArgs(arguments)); };
+                g.console = c;
+            })(this);
+            """)
 
         // setTimeout / clearTimeout：裸 JavaScriptCore 没有这两个（浏览器才有），
         // 但模块里常用来做超时兜底（比如 onlybokep 封面补全的 8 秒封顶）；
@@ -298,7 +376,131 @@ final class WidgetHost: @unchecked Sendable {
         context.setObject(setTimeout as @convention(block) (JSValue, Double) -> Int, forKeyedSubscript: "setTimeout" as NSString)
         context.setObject(clearTimeout as @convention(block) (Int) -> Void, forKeyedSubscript: "clearTimeout" as NSString)
 
+        // setInterval / clearInterval：与上面 setTimeout/clearTimeout 同款机制
+        //（主线程延时回调、数字 id、DispatchWorkItem，共用同一个 timerCounter/timers 表，
+        // 所以 clearTimeout 也能停 interval、clearInterval 也能停 timeout，与浏览器一致）。
+        // 每次 tick 都是一次新的 DispatchWorkItem：tick 触发时先看 id 是否还在表里
+        //（clearInterval 已把它拿掉就不触发也不重排），回调完、id 还在表里才排下一次，
+        // 所以回调里调 clearInterval（包括自己清自己）能停。delay 下限 4ms，
+        // 免得 setInterval(fn, 0) 在主线程空转（浏览器同款钳制；setTimeout 不动，仍按 0 算）。
+        let setInterval: @convention(block) (JSValue, Double) -> Int = { [weak context] callback, delayMs in
+            timerCounter += 1
+            let id = timerCounter
+            // delay 非数/没传时按 4ms 算（JSC 传过来的 NaN 与 setTimeout 同款处理，只是下限不同）。
+            let delay = delayMs.isFinite ? max(delayMs, 4) : 4
+            var scheduleNext: (() -> Void)!
+            scheduleNext = {
+                let work = DispatchWorkItem {
+                    // 已被 clear（注册表里没这个 id）就停，不触发也不重排。
+                    guard timers[id] != nil else { return }
+                    guard let context, !callback.isUndefined, !callback.isNull else {
+                        timers.removeValue(forKey: id)
+                        return
+                    }
+                    callback.call(withArguments: [])
+                    // 回调里可能调了 clearInterval；只有 id 还在表里才排下一次。
+                    if timers[id] != nil {
+                        scheduleNext()
+                    }
+                }
+                timers[id] = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay / 1000.0, execute: work)
+            }
+            scheduleNext()
+            return id
+        }
+        let clearInterval: @convention(block) (Int) -> Void = { id in
+            timers.removeValue(forKey: id)?.cancel()
+        }
+        context.setObject(setInterval as @convention(block) (JSValue, Double) -> Int, forKeyedSubscript: "setInterval" as NSString)
+        context.setObject(clearInterval as @convention(block) (Int) -> Void, forKeyedSubscript: "clearInterval" as NSString)
+
         context.setObject(widget, forKeyedSubscript: "Widget" as NSString)
+
+        // __fwArrayBufferFromBytes（内部助手，Widget.http 回值 .arrayBuffer 用）：
+        // JS 数字数组（0–255）→ ArrayBuffer。只在 Swift 侧的 jsArrayBuffer 里调，模块不用直接调它。
+        context.evaluateScript("""
+            (function (g) {
+                g.__fwArrayBufferFromBytes = function (bytes) { return new Uint8Array(bytes).buffer; };
+            })(this);
+            """)
+
+        // fetch(url, options?) -> Promise<{ok, status, headers, text(), json(), arrayBuffer()}>
+        // 最小实现：Widget.http.get/post 的 Promise 包装，不另起网络栈。
+        // options 支持 {method, headers, body}：headers 可以是对象或 [key, value] 对数组；
+        // body 原样交给 Widget.http.post（字符串直接发，对象转 JSON，与 httpBodyData 同款）。
+        // 只支持 GET/POST（Widget.http 只有这两条），别的 method 直接 reject，不假装支持。
+        // text()：data 是字符串就原样返回，是对象就 JSON.stringify；json()：data 是对象就原样返回，
+        // 是字符串就 JSON.parse（解析失败 reject）。headers 是普通对象，另带 get(name)/has(name)
+        //（大小写不敏感查）。url 只支持绝对地址（与 Widget.http 同款，无 base URL 概念）。
+        context.evaluateScript("""
+            (function (g) {
+                var normalizeHeaders = function (headers) {
+                    var out = {};
+                    if (!headers) { return out; }
+                    if (Array.isArray(headers)) {
+                        headers.forEach(function (pair) {
+                            if (pair && pair.length >= 2) { out[String(pair[0])] = String(pair[1]); }
+                        });
+                        return out;
+                    }
+                    if (typeof headers === 'object') {
+                        Object.keys(headers).forEach(function (k) { out[k] = String(headers[k]); });
+                    }
+                    return out;
+                };
+                var makeHeaders = function (plain) {
+                    var h = {};
+                    if (plain && typeof plain === 'object') {
+                        Object.keys(plain).forEach(function (k) { h[k] = plain[k]; });
+                    }
+                    h.get = function (name) {
+                        var want = String(name).toLowerCase();
+                        var keys = Object.keys(h);
+                        for (var i = 0; i < keys.length; i++) {
+                            if (keys[i] === 'get' || keys[i] === 'has') { continue; }
+                            if (keys[i].toLowerCase() === want) { return h[keys[i]]; }
+                        }
+                        return null;
+                    };
+                    h.has = function (name) { return h.get(name) !== null; };
+                    return h;
+                };
+                g.fetch = function (url, options) {
+                    options = options || {};
+                    var method = String(options.method || 'GET').toUpperCase();
+                    var headers = normalizeHeaders(options.headers);
+                    var requestURL = (url && typeof url === 'object' && url.url) ? String(url.url) : String(url);
+                    var httpCall;
+                    if (method === 'GET') {
+                        httpCall = Widget.http.get(requestURL, { headers: headers });
+                    } else if (method === 'POST') {
+                        httpCall = Widget.http.post(requestURL, options.body, { headers: headers });
+                    } else {
+                        return Promise.reject(new Error('fetch: 只支持 GET/POST，暂不支持 ' + method));
+                    }
+                    return httpCall.then(function (res) {
+                        var data = res.data;
+                        var textValue = (typeof data === 'string') ? data : JSON.stringify(data);
+                        return {
+                            ok: res.status >= 200 && res.status < 300,
+                            status: res.status,
+                            headers: makeHeaders(res.headers),
+                            url: requestURL,
+                            text: function () { return Promise.resolve(textValue); },
+                            json: function () {
+                                try {
+                                    return Promise.resolve((data !== null && typeof data === 'object') ? data : JSON.parse(textValue));
+                                } catch (e) {
+                                    return Promise.reject(e);
+                                }
+                            },
+                            arrayBuffer: function () { return Promise.resolve(res.arrayBuffer); }
+                        };
+                    });
+                };
+            })(this);
+            """)
     }
 
     /// 从 context 取 Promise 构造器，用 executor block 造一个 JS Promise。
@@ -319,12 +521,16 @@ final class WidgetHost: @unchecked Sendable {
             let box = JSCallbackBox(resolve: resolve, reject: reject)
             Task {
                 do {
-                    let (status, data) = try await Self.fetchHTTP(urlString: effectiveURL, headers: headers)
+                    let (status, data, responseHeaders, rawData) = try await Self.fetchHTTP(urlString: effectiveURL, headers: headers)
                     await MainActor.run {
                         guard let ctx = box.resolve.context else { return }
                         let result = JSValue(newObjectIn: ctx)!
                         result.setValue(status, forProperty: "status")
                         result.setValue(data, forProperty: "data")
+                        result.setValue(JSValue(object: responseHeaders, in: ctx) ?? JSValue(newObjectIn: ctx)!, forProperty: "headers")
+                        if let buffer = WidgetHost.jsArrayBuffer(from: rawData, in: ctx) {
+                            result.setValue(buffer, forProperty: "arrayBuffer")
+                        }
                         box.resolve.call(withArguments: [result])
                     }
                 } catch {
@@ -362,12 +568,16 @@ final class WidgetHost: @unchecked Sendable {
             let box = JSCallbackBox(resolve: resolve, reject: reject)
             Task {
                 do {
-                    let (status, data) = try await Self.fetchHTTP(urlString: urlString, method: "POST", body: bodyData, headers: headers)
+                    let (status, data, responseHeaders, rawData) = try await Self.fetchHTTP(urlString: urlString, method: "POST", body: bodyData, headers: headers)
                     await MainActor.run {
                         guard let ctx = box.resolve.context else { return }
                         let result = JSValue(newObjectIn: ctx)!
                         result.setValue(status, forProperty: "status")
                         result.setValue(data, forProperty: "data")
+                        result.setValue(JSValue(object: responseHeaders, in: ctx) ?? JSValue(newObjectIn: ctx)!, forProperty: "headers")
+                        if let buffer = WidgetHost.jsArrayBuffer(from: rawData, in: ctx) {
+                            result.setValue(buffer, forProperty: "arrayBuffer")
+                        }
                         box.resolve.call(withArguments: [result])
                     }
                 } catch {
@@ -415,10 +625,12 @@ final class WidgetHost: @unchecked Sendable {
     }
 
     /// 真正发请求。只在传输层失败时 throw（对应 Promise reject）；
-    /// HTTP 状态码是多少都 resolve 回去（{status, data}），让模块自己按 status 判断，
+    /// HTTP 状态码是多少都 resolve 回去（{status, data, headers, arrayBuffer}），让模块自己按 status 判断，
     /// pornjav 的 httpGetStatus 就是这么用的（404 也要看 status）。
     /// method/body 默认 GET/无 body，老的 GET 调用不用改。
-    private static func fetchHTTP(urlString: String, method: String = "GET", body: Data? = nil, headers: [String: String]) async throws -> (status: Int, data: Any) {
+    /// 返回四元组：status、data（JSON 对象/数组或文本，见 httpDataObject）、
+    /// responseHeaders（响应头全量）、rawData（响应体原字节，供 arrayBuffer 用）。
+    private static func fetchHTTP(urlString: String, method: String = "GET", body: Data? = nil, headers: [String: String]) async throws -> (status: Int, data: Any, responseHeaders: [String: String], rawData: Data) {
         guard let url = URL(string: urlString) else {
             throw WidgetHostError.callFailed("链接格式不对：\(urlString)")
         }
@@ -431,7 +643,44 @@ final class WidgetHost: @unchecked Sendable {
         }
         let (raw, response) = try await URLSession.shared.data(for: request)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        return (status, httpDataObject(from: raw))
+        return (status, httpDataObject(from: raw), responseHeaders(from: response), raw)
+    }
+
+    /// HTTPURLResponse.allHeaderFields 扁平成 [String: String]。
+    /// 原样 key 留一份（如 'Set-Cookie'），再补一份全小写 key（如 'set-cookie'），
+    /// 模块按哪种写法查都能查到；值一律转字符串。
+    /// 边界：allHeaderFields 是字典，同名响应头（如多条 Set-Cookie）会被合并成一个值，
+    /// 宿主侧分不开——需要逐条 cookie 的模块只能拿合并后的值自己拆。
+    private static func responseHeaders(from response: URLResponse?) -> [String: String] {
+        guard let http = response as? HTTPURLResponse else { return [:] }
+        var out: [String: String] = [:]
+        for (key, value) in http.allHeaderFields {
+            let keyString = "\(key)"
+            let valueString = "\(value)"
+            out[keyString] = valueString
+            let lower = keyString.lowercased()
+            if out[lower] == nil { out[lower] = valueString }
+        }
+        return out
+    }
+
+    /// Data → JS ArrayBuffer（供 Widget.http 回值 .arrayBuffer 与 fetch().arrayBuffer() 用）。
+    /// 只用本文件已验证过的 API：JSValue(object:in:) + 安装时注入的 JS 助手
+    /// __fwArrayBufferFromBytes（new Uint8Array(bytes).buffer），
+    /// 不引入未经验证的 ArrayBuffer 构造器。
+    /// 只在主线程调（调用点都在 MainActor.run 里，resolve/reject 与现有注释同款规矩）。
+    /// 边界：按字节数组过桥，O(n) 装箱；16 MiB 以上不建（避免一次巨额装箱冲内存），
+    /// 此时 .arrayBuffer 属性直接缺省，data（文本/JSON）不受影响。
+    /// 返回 nil = 没建出来，调用方直接不设该属性，不抛错。
+    private static func jsArrayBuffer(from raw: Data, in context: JSContext) -> JSValue? {
+        guard raw.count <= 16 * 1024 * 1024 else { return nil }
+        guard let helper = context.objectForKeyedSubscript("__fwArrayBufferFromBytes"),
+              !helper.isUndefined, !helper.isNull else { return nil }
+        let bytes: [Int] = raw.map { Int($0) }
+        guard let jsArray = JSValue(object: bytes, in: context) else { return nil }
+        guard let buffer = helper.call(withArguments: [jsArray]),
+              !buffer.isUndefined, !buffer.isNull else { return nil }
+        return buffer
     }
 
     /// 响应体能解析成 JSON 就给对象/数组，否则给文本。
@@ -1015,8 +1264,13 @@ final class WidgetHost: @unchecked Sendable {
                     videoURL: (child["videoUrl"] as? String).flatMap { $0.nilIfEmpty },
                     description: child["description"] as? String ?? "",
                     playerHint: child["playerHint"] as? String,
+                    // 共享契约（A 路 Models 侧字段）：模块给的 referer 透传进模型，没给/空串/非字符串就是 nil，不要丢。
+                    referer: (child["referer"] as? String).flatMap { $0.nilIfEmpty },
                     // 朋友桥标记透传（同 PlayLine.adStrip）。
-                    adStrip: (child["adStrip"] as? Bool) ?? false
+                    adStrip: (child["adStrip"] as? Bool) ?? false,
+                    // 共享契约（A 路 Models 侧字段）：模块给的 headers/cookie 透传进模型，没给就是 nil，不要丢。
+                    headers: Self.headersDict(from: child),
+                    cookie: Self.cookieString(from: child)
                 ))
             }
         }
@@ -1038,6 +1292,27 @@ final class WidgetHost: @unchecked Sendable {
             episodes: episodes,
             relatedItems: related
         )
+    }
+
+    /// 模块返回的 headers 字典 → [String: String]?（PlayLine/DetailEpisode.headers 用）。
+    /// 键/值一律转字符串；不是字典、空字典 → nil（“模块没给”与“给了空字典”都记 nil，
+    /// 调用方按 nil 走原有 headers 逻辑）。
+    private static func headersDict(from dict: [String: Any]) -> [String: String]? {
+        if let raw = dict["headers"] as? [String: Any], !raw.isEmpty {
+            var out: [String: String] = [:]
+            for (key, value) in raw { out[key] = "\(value)" }
+            return out.isEmpty ? nil : out
+        }
+        if let raw = dict["headers"] as? [String: String], !raw.isEmpty {
+            return raw
+        }
+        return nil
+    }
+
+    /// 模块返回的 cookie 字符串 → String?（不是字符串、空字符串 → nil）。
+    /// 只认字符串，不强转：cookie 必须是原值，拼错一个字符就鉴权失败。
+    private static func cookieString(from dict: [String: Any]) -> String? {
+        (dict["cookie"] as? String).flatMap { $0.isEmpty ? nil : $0 }
     }
 
     private func parsePlayLines(_ value: JSValue) -> [PlayLine] {
@@ -1063,7 +1338,10 @@ final class WidgetHost: @unchecked Sendable {
                 playerHint: dict["playerHint"] as? String,
                 referer: (dict["referer"] as? String).flatMap { $0.isEmpty ? nil : $0 },
                 // 朋友桥标记：模块说这条线要剥广告（onlybokep.js 透传），以前直接丢了。
-                adStrip: (dict["adStrip"] as? Bool) ?? false
+                adStrip: (dict["adStrip"] as? Bool) ?? false,
+                // 共享契约（A 路 Models 侧字段）：模块给的 headers/cookie 解析进模型，没给就是 nil，不要丢。
+                headers: Self.headersDict(from: dict),
+                cookie: Self.cookieString(from: dict)
             ))
         }
         return lines

@@ -74,6 +74,12 @@ final class CustomPlayerController: ObservableObject {
     private var shouldPlay = true
     private var lastURL: URL?
     private var lastHeaders: [String: String]?
+    /// 上次见到的引擎（viewModel.currentEngine）：变了=同一 URL 换了播放路径
+    /// （裸连→拦截器，或拦截器→HLS.js 回退再回来），要重建 item、清掉失败标记。
+    private var lastEngine: PlayerEngine?
+    /// 当前 item 在用的拦截器（强持有，item 活着它就活着；换项/拆项时释放）。
+    /// ViewModel 的 resourceLoader 只管“当前线路该用哪个”，这里管“当前 item 在用哪个”。
+    private var activeResourceLoader: HLSResourceLoader?
     /// 上次见到的播放会话代际（PlayerViewModel.playGeneration）：
     /// 变了=新片/新一集（从 0:00 起），没变=同片切线（保当前进度）。
     private var lastGeneration: UUID?
@@ -120,6 +126,21 @@ final class CustomPlayerController: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.refreshQualityOptions() }
             .store(in: &cancellables)
+        // 引擎监听：currentEngine 一变就跟进。
+        // 变成非原生引擎（hlsjs/dash/软解/webView）→ 对应播放器接手，拆掉 AVPlayerItem；
+        // 回到原生引擎 → 按当前 URL/头重建（同一 URL 换引擎时 onChange(of: url) 不触发，
+        // 全靠这里重建，如裸连失败升级拦截器）。
+        // .receive(on:) 让回调异步跑：setCurrent 里先建拦截器、再设 URL、最后设引擎，
+        // 回调跑到时拦截器与新 URL 都已就位。
+        viewModel.$currentEngine
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.load(url: self.viewModel.currentURL, headers: self.viewModel.currentHeaders)
+                }
+            }
+            .store(in: &cancellables)
         refreshQualityOptions()
     }
 
@@ -138,15 +159,30 @@ final class CustomPlayerController: ObservableObject {
     // MARK: - 换项与自动播
 
     /// 新 URL 到达时调（DetailView 传进来的 currentURL/headers 变化）。
-    /// URL/请求头没变不重建，避免 SwiftUI 刷新打断正在播的 play()。
+    /// URL/请求头/引擎没变不重建，避免 SwiftUI 刷新打断正在播的 play()。
+    /// 非原生引擎（hlsjs/dash/软解/webView）不归 AVPlayer：拆掉当前 item，
+    /// 由视图层按 currentEngine 显示对应播放器。
     func load(url: URL?, headers: [String: String]?) {
+        let engine = viewModel.currentEngine
+        guard engine == .native || engine == .nativeIntercepted else {
+            unloadCurrentItem()
+            return
+        }
         guard let url else {
             lastURL = nil
             lastHeaders = nil
+            lastEngine = engine
             replaceItem(nil, headers: nil, resumeAt: nil)
             return
         }
-        guard lastURL != url || lastHeaders != headers else { return }
+        let engineChanged = lastEngine != engine
+        guard lastURL != url || lastHeaders != headers || engineChanged else { return }
+        if engineChanged {
+            // 同一 URL 换引擎：失败只认一次的标记要清掉，
+            // 否则同一 URL 换路径后的第二次失败报不上去（markFailed 会认成重复）。
+            didMarkPlayingURL = nil
+            didMarkFailedURL = nil
+        }
         // 新片/新一集（generation 变了）从 0:00 起；同片切线保当前进度。
         let generation = viewModel.playGeneration
         let isNewSession = generation != lastGeneration
@@ -161,13 +197,32 @@ final class CustomPlayerController: ObservableObject {
         shouldPlay = true
         lastURL = url
         lastHeaders = headers
+        lastEngine = engine
         refreshQualityOptions()
-        replaceItem(url, headers: headers, resumeAt: resumeAt)
+        let loader = engine == .nativeIntercepted ? viewModel.resourceLoader : nil
+        replaceItem(url, headers: headers, resumeAt: resumeAt, resourceLoader: loader)
+    }
+
+    /// 拆掉当前 AVPlayerItem（引擎切走时调）：清掉 URL/头/引擎记忆，
+    /// 下次回到原生引擎、同一 URL 也会重建，不会被 load() 的去重 guard 拦住。
+    func unloadCurrentItem() {
+        lastURL = nil
+        lastHeaders = nil
+        lastEngine = nil
+        didMarkPlayingURL = nil
+        didMarkFailedURL = nil
+        shouldPlay = false
+        replaceItem(nil, headers: nil, resumeAt: nil)
     }
 
     /// 换播项：带请求头的 AVURLAsset（nmcorp 签名 MP4 用）或普通 item；
     /// 小 forward buffer + 不等待攒缓冲，首帧越快越好。
-    private func replaceItem(_ url: URL?, headers: [String: String]?, resumeAt: CMTime?) {
+    /// resourceLoader 非 nil 时（拦截线路）：URL 的 scheme 换成 hlsloader:// 建 asset
+    /// 并挂 delegate，播单/密钥走拦截器代发（分片 AVPlayer 直接拉，拦截器管不到）；nil 时走现有逻辑，
+    /// pornjav 的 native 线完全不受影响。拦截器接手后 headers 参数不再经
+    /// AVURLAssetHTTPHeaderFieldsKey 传（只作用于建 asset 那一次调用，管不到子请求），
+    /// 头由拦截器给每个子请求带。
+    private func replaceItem(_ url: URL?, headers: [String: String]?, resumeAt: CMTime?, resourceLoader: HLSResourceLoader? = nil) {
         itemStatusObservation?.invalidate()
         itemStatusObservation = nil
         loadedRangesObservation?.invalidate()
@@ -192,6 +247,7 @@ final class CustomPlayerController: ObservableObject {
         isLoading = url != nil
         guard let url else {
             currentItem = nil
+            activeResourceLoader = nil
             player.replaceCurrentItem(with: nil)
             isPlaying = false
             currentTime = 0
@@ -200,10 +256,27 @@ final class CustomPlayerController: ObservableObject {
             return
         }
         let item: AVPlayerItem
-        if let headers {
+        if let resourceLoader {
+            // 拦截线路：scheme 换成 hlsloader://，delegate 接管播单/密钥请求。
+            // asset 只认这个自定义 scheme 的 URL；currentURL 本身仍保持 https 原地址。
+            // UA 走公开 API（AVURLAssetHTTPUserAgentKey，等值字面量——该常量在
+            // Xcode 27.2 / iOS 27 SDK 的 Swift 接口里不可见，见下 headers 分支同款处理）：
+            // 分片是 AVPlayer 直接拉的，UA 必须在 asset 层换，拦截器管不到分片。
+            let loaderURL = HLSResourceLoader.loaderURL(for: url)
+            let asset = AVURLAsset(url: loaderURL, options: ["AVURLAssetHTTPUserAgentKey": PlaybackEngine.iPhoneUserAgent])
+            asset.resourceLoader.setDelegate(resourceLoader, queue: resourceLoader.delegateQueue)
+            activeResourceLoader = resourceLoader
+            item = AVPlayerItem(asset: asset)
+        } else if let headers {
             // AVURLAssetHTTPHeaderFieldsKey 在 Xcode 27.2 / iOS 27 SDK 的 Swift 接口里不可见，
             // 改用等值字面量（该常量的字符串值就是它自己的名字，运行时等价）。
-            let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+            // UA 同样走公开 API AVURLAssetHTTPUserAgentKey（等值字面量），不要只塞进
+            // header 字典——header 只作用于建 asset 那一次调用，UA 键才管 asset 全程请求。
+            let userAgent = headers["User-Agent"] ?? PlaybackEngine.iPhoneUserAgent
+            let asset = AVURLAsset(url: url, options: [
+                "AVURLAssetHTTPHeaderFieldsKey": headers,
+                "AVURLAssetHTTPUserAgentKey": userAgent,
+            ])
             item = AVPlayerItem(asset: asset)
         } else {
             item = AVPlayerItem(url: url)
@@ -365,10 +438,15 @@ final class CustomPlayerController: ObservableObject {
     /// accessLog 采样（DEBUG 日志用）：卡顿到底是带宽不够还是首字节延迟，
     /// 看 observedBitrate（实测带宽）和 numberOfStalls（卡顿次数）才知道，
     /// 不能只凭感觉加缓冲。采样本身不影响播放。
+    /// errorLog 也被动采（PlaybackPreflight 的一部分）：只在有错误事件时打印，
+    /// 供定位播单/key/分片是哪一层先死。
     private func sampleAccessLog(_ item: AVPlayerItem) {
         guard let event = item.accessLog()?.events.last else { return }
         #if DEBUG
         print("[HLS] observedBitrate=\(Int(event.observedBitrate)) indicatedBitrate=\(Int(event.indicatedBitrate)) stalls=\(event.numberOfStalls) uri=\(event.uri ?? "")")
+        if let errorEvent = item.errorLog()?.events.last, errorEvent.errorStatusCode != 0 {
+            print("[HLS] errorLog domain=\(errorEvent.errorDomain ?? "") code=\(errorEvent.errorStatusCode) comment=\(errorEvent.errorComment ?? "")")
+        }
         #endif
     }
 
@@ -405,9 +483,23 @@ final class CustomPlayerController: ObservableObject {
 
     /// 播失败只认一次（同一条 URL）：KVO .failed 和失败通知可能先后都到，
     /// 重复报会把刚切上的下一条线也误标失败。走 viewModel.markFailed() 自动切下一条线。
+    /// -12881 检测（分片需头信号）：拦截器只拦播单+key，分片是 AVPlayer 直接拉的；
+    /// 分片要头时这里报 -12881，记 LoopbackProxy.segmentNeedsHeaders（回环代理触发条件），
+    /// 并以 .segmentFetch 分层报给 markFailed，由它回退 hls.js。
     private func handleItemFailure(_ item: AVPlayerItem?) {
         guard let url = lastURL, didMarkFailedURL != url else { return }
         didMarkFailedURL = url
+        // FairPlay（skd://）：拦截器已在播单里见到，报明确错误，不走通用失败文案。
+        if viewModel.resourceLoader?.encounteredFairPlay == true {
+            viewModel.markFailed("这条线路用了 FairPlay 加密（skd://），当前播放器不支持，请换一条线路")
+            return
+        }
+        let nsError = item?.error as NSError?
+        if nsError?.code == -12881 {
+            LoopbackProxy.segmentNeedsHeaders = true
+            viewModel.markFailed("分片拉取失败（分片可能需要请求头，拦截器覆盖不了）", stage: .segmentFetch)
+            return
+        }
         let detail = item?.error?.localizedDescription ?? "未知错误"
         viewModel.markFailed("这条线路播放失败（\(detail)）")
     }

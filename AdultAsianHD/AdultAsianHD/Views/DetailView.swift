@@ -52,14 +52,43 @@ struct DetailView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                // 播放器：嵌入页 fallback 时显示 WebView 播放器（同一套自定义底条），
-                // 否则显示直链自定义播放器（AVPlayerLayer + 自绘底条）。
-                if let webViewURL = playerVM.webViewURL {
-                    WebViewPlayerView(url: webViewURL, onClose: { playerVM.closeWebView() })
+                // 播放器按当前引擎分流（currentEngine 由 PlayerViewModel 的路由表设，
+                // 按 hint × URL 形态定；A 路新增的 @Published 属性）：
+                // .hlsjs/.dash 走对应的 HLS.js / DASH 播放器（B 路建，同款 viewModel 契约）；
+                // .softDecoder 走软解播放器（C 路 Wave 2 的 SoftDecoderPlayerView：
+                // KSPlayer/FFmpeg，同一 16:9 盒子）；.native/.nativeIntercepted 走现有直链自定义
+                // 播放器（AVPlayerLayer + 自绘底条，一字不动）；.webView 走现有嵌入页
+                // 播放器（一字不动）。webViewURL 尚未到达时（路由先行、URL 随后），
+                // .webView 分支退回直链播放器，和旧逻辑（webViewURL 为 nil 时显示直链）一致。
+                switch playerVM.currentEngine {
+                case .hlsjs:
+                    HLSJSPlayerView(viewModel: playerVM)
                         .aspectRatio(16.0 / 9.0, contentMode: .fit)
                         .background(Color.black)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
-                } else {
+                case .dash:
+                    DASHPlayerView(viewModel: playerVM)
+                        .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                        .background(Color.black)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                case .softDecoder:
+                    SoftDecoderPlayerView(viewModel: playerVM)
+                        .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                        .background(Color.black)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                case .webView:
+                    if let webViewURL = playerVM.webViewURL {
+                        WebViewPlayerView(url: webViewURL, onClose: { playerVM.closeWebView() })
+                            .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                            .background(Color.black)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                    } else {
+                        CustomPlayerView(player: player, url: playerVM.currentURL, headers: playerVM.currentHeaders, viewModel: playerVM, isFullscreen: $isFullscreen)
+                            .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                            .background(Color.black)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                case .native, .nativeIntercepted:
                     CustomPlayerView(player: player, url: playerVM.currentURL, headers: playerVM.currentHeaders, viewModel: playerVM, isFullscreen: $isFullscreen)
                         .aspectRatio(16.0 / 9.0, contentMode: .fit)
                         .background(Color.black)
@@ -157,9 +186,11 @@ struct DetailView: View {
                                         }
                                     }
                                     Spacer()
+                                    // 勾只给正在播的那集：黄果非首集 videoURL 为 nil（"" 转 nil），
+                                    // nil == nil 在 Swift 里是 true，不加守卫会让所有没 URL 的集全勾上。
                                     if currentEpisodeId == ep.id
-                                        || playerVM.currentURL?.absoluteString == ep.videoURL
-                                        || playerVM.webViewURL?.absoluteString == ep.videoURL {
+                                        || (ep.videoURL != nil && playerVM.currentURL?.absoluteString == ep.videoURL)
+                                        || (ep.videoURL != nil && playerVM.webViewURL?.absoluteString == ep.videoURL) {
                                         Image(systemName: "checkmark")
                                             .foregroundColor(.accentColor)
                                     }
@@ -266,12 +297,24 @@ struct DetailView: View {
         currentEpisodeId = ep.id
         episodeError = nil
         if let urlString = ep.videoURL, !urlString.isEmpty {
+            // 重建 PlayLine 时把分集的字段一并传上，别丢了：以前只传 playerHint，
+            // referer/adStrip 被重置（referer 丢了会让需要 Referer 的 CDN 失败，
+            // adStrip 丢了会让该剥广告的线不剥）。headers/cookie 是 A 路按共享契约
+            // 给 PlayLine / DetailEpisode 补的字段（[String: String]? / String?），
+            // 按契约名引用；A 路未落地前这里编译不过，等 A 路字段到位即通，审计核对。
+            // 预铸直通分支：把该集 epLink 作 recastLink 传过去（A 路的
+            // playLine(_:recastLink:) 签名；只对 hlsjs 签名线现铸才生效，
+            // 其他线不受影响）。否则首集可能播预铸的旧签名（C 路 Wave 2）。
             playerVM.playLine(PlayLine(
                 name: ep.title,
                 url: urlString,
                 description: ep.description,
-                playerHint: ep.playerHint
-            ))
+                playerHint: ep.playerHint,
+                referer: ep.referer,
+                adStrip: ep.adStrip,
+                headers: ep.headers,
+                cookie: ep.cookie
+            ), recastLink: ep.link)
             return
         }
         Task {

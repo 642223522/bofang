@@ -14,6 +14,8 @@ struct ExtractedStream {
 /// dood/playmogo 要点一下播放按钮才去拉流：加载完就试着点播（只点 play 字样的按钮），
 /// 点完 8 秒还没抽到直链就提前收尾，不等满 15 秒；15 秒是绝对超时。
 /// 页内无 video、CF 一直拦 → 返回 nil，调用方 fallback 到页内 WebView 播放器。
+/// 页内走 MediaSource/blob 播（video.currentSrc 是 blob:）也返回 nil：
+/// blob: 是页内地址、抽不出直链，只剩 blob: 候选时 2 秒后直接收尾失败，不空转满 15 秒。
 /// 只在主线程用（WKWebView 只认主线程）；调用方（PlayerViewModel）本身就是 @MainActor。
 @MainActor
 final class EmbedStreamExtractor: NSObject {
@@ -24,7 +26,11 @@ final class EmbedStreamExtractor: NSObject {
 
     /// document-start 注入：hook fetch / XHR.open / video.src / source.src，
     /// 直链一出现就经 mediaFound 上报；再每秒扫一次页内 video/source。
-    /// 只上报，不改页面行为（原函数都原样调回）。
+    /// 只上报，不改页面行为（原函数都原样调回）——除了把页内 video 静音：
+    /// 解流用的 WebView 不出声（静音隔离），点播只是为了触发拉流，不是给人看的。
+    /// blob: 也上报（不作候选，只让 Swift 侧记下来）：页内 video 的 currentSrc
+    /// 一旦是 blob:，说明这页走 MediaSource 播、抽不出直链，Swift 侧见 blob:
+    /// 候选 2 秒后直接收尾失败，让调用方走 WebView 页内播，不空转满 15 秒。
     private static let captureScript = """
     (function(){
       function isMedia(u){
@@ -34,7 +40,11 @@ final class EmbedStreamExtractor: NSObject {
         return u.indexOf('.m3u8') >= 0 || u.indexOf('.mp4') >= 0 || u.indexOf('.mpd') >= 0;
       }
       function report(u){
-        try { if(isMedia(u)) window.webkit.messageHandlers.mediaFound.postMessage(String(u)); } catch(e){}
+        try {
+          if(!u) return;
+          var s = String(u);
+          if(isMedia(s) || s.toLowerCase().indexOf('blob:') === 0) window.webkit.messageHandlers.mediaFound.postMessage(s);
+        } catch(e){}
       }
       try {
         var ofetch = window.fetch;
@@ -73,7 +83,7 @@ final class EmbedStreamExtractor: NSObject {
       function scan(){
         try {
           var vs = document.querySelectorAll('video');
-          for(var i=0;i<vs.length;i++){ report(vs[i].currentSrc || vs[i].src); }
+          for(var i=0;i<vs.length;i++){ vs[i].muted = true; report(vs[i].currentSrc || vs[i].src); }
           var ss = document.querySelectorAll('source[src]');
           for(var j=0;j<ss.length;j++){ report(ss[j].src); }
         } catch(e){}
@@ -98,6 +108,11 @@ final class EmbedStreamExtractor: NSObject {
     private var clickAttempts = 0
     /// 快速失败检查：点播放后 8 秒还没抽到直链就提前收尾，不用等满 15 秒。
     private var settleTask: Task<Void, Never>?
+    /// 第一次见到 blob: 候选的时间（见 considerCandidate）：blob: 是页内
+    /// MediaSource 地址，交不出 AVPlayer；只剩 blob: 候选时 2 秒后直接收尾失败。
+    /// 2 秒宽限是给“先出广告 blob、主视频直链随后到”的情况留的观察窗；
+    /// 直链一旦出现会立即采用，宽限不会拖慢正常解流。
+    private var firstBlobAt: Date?
 
     /// 点播放脚本：dood/playmogo 这类嵌页要用户点一下播放按钮才去拉流，
     /// 不点就永远不出 .m3u8——以前的解流就是这么空等满 15 秒的。
@@ -108,7 +123,7 @@ final class EmbedStreamExtractor: NSObject {
     (function(){
       try {
         var v = document.querySelector('video');
-        if (v) { try { v.play(); } catch(e){} return 'video-play'; }
+        if (v) { try { v.muted = true; v.play(); } catch(e){} return 'video-play'; }
         var sels = ['.vjs-big-play-button', '.jw-display-icon', '[class*="big-play"]',
                     '[class*="play-button"]', 'button[aria-label*="Play" i]',
                     'button[title*="Play" i]', '.play-btn', '#playBtn',
@@ -178,6 +193,14 @@ final class EmbedStreamExtractor: NSObject {
                 ticks += 1
                 // 播按钮可能晚出现：每 2 秒补点一次（attemptClick 自己限 3 次）。
                 if ticks % 2 == 0 { self.attemptClick() }
+                // 只剩 blob: 候选：页内走 MediaSource 播、抽不出直链，2 秒观察窗
+                // 过了还没直链就明确记为解流失败收尾，让调用方走 WebView 页内播，
+                // 不空转满 15 秒（8 秒点播收尾仍在，是另一条 backstop）。
+                if let blobAt = self.firstBlobAt,
+                   Date().timeIntervalSince(blobAt) > 2 {
+                    self.finish(with: nil)
+                    return
+                }
                 if let clicked = self.firstClickAt, let settled = self.lastSettledAt {
                     let since = Date().timeIntervalSince(max(clicked, settled))
                     if since > 8 {
@@ -216,12 +239,17 @@ final class EmbedStreamExtractor: NSObject {
     // MARK: - 候选直链
 
     /// 收到一个候选地址：是直链（.m3u8/.mp4/.mpd，非 blob）就抽走收尾。
-    /// 相对地址按嵌入页补全；第一个命中的直链即采用。
+    /// blob: 本身不要当候选（它是页内 MediaSource 地址，交不出 AVPlayer），
+    /// 只记下第一次见到的时间：只剩 blob: 候选时 settle 循环 2 秒后收尾失败，
+    /// 调用方走 WebView 页内播。相对地址按嵌入页补全；第一个命中的直链即采用。
     fileprivate func considerCandidate(_ urlString: String) {
         guard !finished else { return }
         let lower = urlString.lowercased()
+        if lower.hasPrefix("blob:") {
+            if firstBlobAt == nil { firstBlobAt = Date() }
+            return
+        }
         guard lower.contains(".m3u8") || lower.contains(".mp4") || lower.contains(".mpd") else { return }
-        guard !lower.hasPrefix("blob:") else { return }
         let resolved = URL(string: urlString, relativeTo: embedURL)?.absoluteURL
         guard let url = resolved, url.scheme == "http" || url.scheme == "https" else { return }
         finish(with: ExtractedStream(url: url, referer: embedURL))

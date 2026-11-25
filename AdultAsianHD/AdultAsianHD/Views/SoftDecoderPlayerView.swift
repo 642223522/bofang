@@ -1,0 +1,731 @@
+import Combine
+import SwiftUI
+import UIKit
+
+#if canImport(KSPlayer)
+import KSPlayer
+#endif
+
+// MARK: - 软解播放器（C 路 Wave 2，KSPlayer / FFmpeg）
+//
+// 选型：KSPlayer（kingslay/KSPlayer，SPM，product / module 名均为 KSPlayer，
+// 与 PlayerEngine.swift 的 `#if canImport(KSPlayer)` 判断一致；project.yml
+// 里 `from: "2.7.3"`——AngelLive 的 Package.resolved 钉死 KSPlayer 2.7.3
+// exact，证明该 tag 存在且可解；KSPlayer 官方 README 只给 `.branch("main")`，
+// 若 2.7.3 在 Codemagic 解析失败，退回 branch main 再试）。
+//  - KSPlayer：SPM 原生、Swift 编写、FFmpeg 7.0.2（GPL 版 6.1.0）、iOS 13+，
+//    维护活跃（配套 TracyPlayer 在 App Store 持续更新）；API 有据可查：
+//    KSPlayerLayer(url:options:delegate:) / play() / pause() / seek(time:) /
+//    stop() / prepareToPlay()、KSPlayerLayerDelegate 四个回调、
+//    KSOptions.isAutoPlay / isLoopPlay / startPlayTime / hardwareDecode /
+//    registerRemoteControll / referer / userAgent / appendHeader、
+//    KSOptions.firstPlayerType / secondPlayerType = KSMEPlayer.self。
+//  - ijkplayer 否决：无 SPM（只有 CocoaPods + 手工编译 FFmpeg）、
+//    上游最后稳定版 0.8.8 基于 FFmpeg 3.4（2018 年）、事实上停更；
+//    CocoaPods 本身 2024-08 已进维护模式、trunk 2026-12-02 只读，
+//    接它还要改 codemagic.yaml 加 pod install，侵入大、收益为负。
+//  - 许可证（必须让用户知道）：KSPlayer 默认 GPL v3（README 原话）。
+//    本软件只侧载给用户自己用、不对外分发，不触发 GPL 的源码公开义务；
+//    若以后要分发给别人，须开源本软件源码或向作者买 LGPL/商业授权
+//    （kingslay@icloud.com）。FFmpeg 本体是 LGPL，GPL 来自 KSPlayer 这一层。
+//
+// 定位：只在路由表判给 .softDecoder 时挂载（非原生容器 .mkv/.flv/.avi/
+// .webm，或无 dash.js 时的 .mpd）。不是默认回退：没有软解内核时路由不会
+// 选它；软解失败直接 markFailed 切线，不无意义重试。
+//
+// 结构（对标 CustomPlayerController / HLSJSPlayerController）：
+// 只用 KSPlayer 最底层的 KSPlayerLayer（CALayer 子类），不用
+// KSVideoPlayerView（它自带控制条/AirPlay/PiP 按钮，会破坏本软件统一外观
+// 与“不要 AirPlay/画中画/灵动岛”的铁律）；画面用 layer.player.view 挂进
+// 容器 UIView（用法与 KSPlayer 官方示例一致），控制条复用 PlayerControlBar。
+// 不用 KSComplexPlayerLayer（PiP 与后台/远程控制都在那一层）。
+//
+// 外观与行为（与原生播放器一致，不发明新 UI）：
+// 16:9 内嵌在详情页顶部小窗口，自绘底条复用 PlayerControlBar（播放/暂停、
+// 进度条、时间、画质菜单、全屏）；不用 AVPlayerViewController，不触发系统
+// Now Playing（无灵动岛）；KSOptions.registerRemoteControll=false 再保一层；
+// 不走 AirPlay、不开画中画；每次新片/新一集从 0:00 起播，不自动续播；
+// 同片切线保当前进度（playGeneration 语义与 CustomPlayerController 一致）；
+// 失败调 viewModel.markFailed 自动切线；离页停播（onDisappear/dismantle
+// 停层销毁，不后台继续播）。automaticallyWaitsToMinimizeStalling=true 只
+// 约束 AVPlayer，本播放器是 FFmpeg，不要去碰它；缓冲由 FFmpeg 自己管。
+//
+// 画质：KSPlayer 不像 hls.js/dash.js 那样暴露码率档位列表（tracks 只是音视频
+// 轨，不是清晰度档），所以画质菜单复用原生做法——从 viewModel.lines 推导
+// （切画质=切线路，同片同 generation 保进度）；只有“自动”一档时按钮自动隐藏
+// （PlayerControlBar 要求选项 >= 2 才显示）。
+//
+// 已核实的 API（核实来源写在各调用处注释里；本地无 Xcode，只能人工审，
+// Codemagic 构建是确认关口）：
+//  - KSPlayerLayer(url:options:delegate:) / play() / pause() / seek(time:) /
+//    stop() / prepareToPlay()、KSPlayerLayerDelegate 的
+//    player(layer:state:) / player(layer:currentTime:totalTime:) /
+//    player(layer:finish:) / player(layer:bufferedCount:consumeTime:)——
+//    均见 KSPlayer 官方 README 与 Streamyfin 的 KSPlayerLayer 文档示例原文。
+//  - state == .readyToPlay、state.isPlaying——.readyToPlay 见官方示例原文；
+//    isPlaying 见 Streamyfin FullPlayerView 示例（coordinator.state.isPlaying）。
+//    除此二者外不依赖 KSPlayerState 的任何其他 case；.error / 播完都走
+//    finish(error:)（error 非空=失败，空=自然播完）。
+//  - layer.player.view（UIView?）——见官方示例原文；player 本身非可选。
+
+#if canImport(KSPlayer)
+
+// MARK: - 控制器（状态机，对标 CustomPlayerController）
+
+/// 软解播放器的状态机（ObservableObject，@MainActor）。
+/// 只管 KSPlayerLayer：换片、自动播、播放/暂停、快进、画质、缓冲、失败上报、
+/// 全屏与控制条显隐。线路、路由、markPlaying/markFailed 仍走 PlayerViewModel，
+/// 这里不重写。播放状态以 KSPlayerLayerDelegate 回调为准，不用本地旗子猜——
+/// 与原生播放器“状态跟真实 timeControlStatus”的做法同源。
+@MainActor
+final class SoftDecoderPlayerController: ObservableObject {
+    let viewModel: PlayerViewModel
+
+    /// 真实播放状态：KSPlayerState.isPlaying 为 true 才为 true（按钮据此显示暂停/播放）。
+    @Published var isPlaying = false
+    /// 当前播放秒数（currentTime 回调；拖进度条时由 scrub 直接改，松手后回调接管）。
+    @Published var currentTime: Double = 0
+    /// 总时长秒数（未知为 0）。
+    @Published var duration: Double = 0
+    /// 已缓冲到的秒数（bufferedCount 回调估算，进度条浅灰段）。
+    @Published var bufferedEnd: Double = 0
+    /// 正在等数据/缓冲（画面中央转圈；与 PlayerControlBar 的 isBuffering 同义）。
+    @Published var isLoading = false
+    /// 控制条是否可见（播时 3 秒无操作自动藏，暂停时常显，点画面切换）。
+    @Published var controlsVisible = true
+    /// 是否在全屏（按钮图标据此切全屏/退出全屏；画面 view 的挂载门控也认它）。
+    @Published var isFullscreen = false
+    /// 画质选项（从 viewModel.lines 推导，与原生同款）与当前档位。
+    @Published var qualityOptions: [QualityOption] = []
+    @Published var currentQualityLabel: String = "自动"
+
+    /// 用户意图：true=想播（自动播/点播放），false=点了暂停。
+    /// 新 URL 时重置为 true；只有用户点暂停才变 false。
+    private var shouldPlay = true
+    private var lastURL: URL?
+    private var lastHeaders: [String: String]?
+    /// 上次见到的播放会话代际（PlayerViewModel.playGeneration）：
+    /// 变了=新片/新一集（从 0:00 起），没变=同片切线（保当前进度）。
+    private var lastGeneration: UUID?
+    private var didMarkPlayingURL: URL?
+    private var didMarkFailedURL: URL?
+    /// 拖进度条前是不是在播（松手后据此恢复）。
+    private var wasPlayingBeforeScrub = false
+    private var hideTask: Task<Void, Never>?
+    /// 加载超时兜底：15 秒未出帧即按失败走切线（KSPlayer 有些失败只停住
+    /// 不调 finish，不能让界面永远卡在“正在解析播放线路…”）。
+    private var loadTimeoutTask: Task<Void, Never>?
+    private var playerLayer: KSPlayerLayer?
+    /// delegate 转接对象（KSPlayerLayer 的 delegate 是弱引用，controller
+    /// 强持有，层活着它就活着；换层/拆层时释放）。
+    private var layerDelegate: SoftDecoderLayerDelegate?
+    private var cancellables = Set<AnyCancellable>()
+
+    init(viewModel: PlayerViewModel) {
+        self.viewModel = viewModel
+        // 线路表是后台慢慢补的（loadResource），变了就重算画质选项（与原生同款）。
+        viewModel.$lines
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.refreshQualityOptions() }
+            .store(in: &cancellables)
+        refreshQualityOptions()
+    }
+
+    deinit {
+        hideTask?.cancel()
+        loadTimeoutTask?.cancel()
+        playerLayer?.stop()
+    }
+
+    // MARK: - 换片与自动播
+
+    /// 新 URL 到达时调（SoftDecoderPlayerView 传进来的 currentURL/headers 变化）。
+    /// URL/请求头没变不重建，避免 SwiftUI 刷新打断正在播的片。
+    /// 非软解引擎不归 KSPlayer：拆层（视图只在 .softDecoder 时挂载；
+    /// 引擎切走时视图卸载也会调 teardown，这里是第二道）。
+    func load(url: URL?, headers: [String: String]?) {
+        guard viewModel.currentEngine == .softDecoder else {
+            teardown()
+            return
+        }
+        guard let url else {
+            lastURL = nil
+            lastHeaders = nil
+            teardownLayer()
+            isPlaying = false
+            isLoading = false
+            currentTime = 0
+            duration = 0
+            bufferedEnd = 0
+            return
+        }
+        guard lastURL != url || lastHeaders != headers else { return }
+        // 新片/新一集（generation 变了）从 0:00 起；同片切线保当前进度。
+        let generation = viewModel.playGeneration
+        let isNewSession = generation != lastGeneration
+        lastGeneration = generation
+        var resumeAt: Double = 0
+        if !isNewSession, currentTime > 1 {
+            resumeAt = currentTime
+        }
+        shouldPlay = true
+        lastURL = url
+        lastHeaders = headers
+        didMarkPlayingURL = nil
+        didMarkFailedURL = nil
+        isLoading = true
+        currentTime = 0
+        duration = 0
+        bufferedEnd = 0
+        refreshQualityOptions()
+        buildLayer(url: url, headers: headers, resumeAt: resumeAt)
+    }
+
+    /// 建新层：旧层先停掉释放；新层用 SoftDecoderSupport 的选项
+    /// （Referer/UA/头、续播点、硬解优先、不注册远程控制）。
+    /// KSPlayerLayer(url:options:delegate:) 的签名见官方示例原文。
+    private func buildLayer(url: URL, headers: [String: String]?, resumeAt: Double) {
+        teardownLayer()
+        let options = SoftDecoderSupport.makeOptions(headers: headers, startPlayTime: resumeAt)
+        let delegate = SoftDecoderLayerDelegate(controller: self)
+        let layer = KSPlayerLayer(url: url, options: options, delegate: delegate)
+        layerDelegate = delegate
+        playerLayer = layer
+        layer.prepareToPlay()
+        scheduleLoadTimeout()
+    }
+
+    /// 拆层（换片/停播时调）：停播销毁，不后台继续播；画面 view 一并摘掉。
+    private func teardownLayer() {
+        loadTimeoutTask?.cancel()
+        loadTimeoutTask = nil
+        playerLayer?.player.view?.removeFromSuperview()
+        playerLayer?.stop()
+        playerLayer = nil
+        layerDelegate = nil
+    }
+
+    /// 15 秒未出帧即按失败走切线。只认当前 URL（换片后旧任务不烧新片）。
+    private func scheduleLoadTimeout() {
+        loadTimeoutTask?.cancel()
+        guard let url = lastURL else { return }
+        loadTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            if self.didMarkPlayingURL != url, self.lastURL == url {
+                self.handleFatalError("软解播放器加载超时（15 秒未出帧）")
+            }
+        }
+    }
+
+    // MARK: - KSPlayerLayerDelegate 回调（经 SoftDecoderLayerDelegate 转接）
+
+    /// 状态变化：只认当前层（旧层残留的回调不算数）。
+    /// .readyToPlay 时补一次 play()（isAutoPlay=true 是第一道，就绪回调是第二道，
+    /// 与原生“就绪后再 play”的双保险同源）；其余状态只认 isPlaying，不枚举
+    /// 其他 case（见文件头：除 .readyToPlay 与 isPlaying 外不依赖任何 case）。
+    func handleState(layer: KSPlayerLayer, state: KSPlayerState) {
+        guard layer === playerLayer else { return }
+        if state == .readyToPlay {
+            if shouldPlay { layer.play() }
+            return
+        }
+        let playing = state.isPlaying
+        isPlaying = playing
+        if playing {
+            isLoading = false
+            loadTimeoutTask?.cancel()
+            // 真正出帧 → markPlaying（“正在解析播放线路…”由此消失）。
+            if let url = lastURL, didMarkPlayingURL != url {
+                didMarkPlayingURL = url
+                viewModel.markPlaying()
+            }
+            showControlsTemporarily()
+        } else {
+            // 没在播：用户想播（shouldPlay）且片还在 → 等缓冲/加载中（转圈）；
+            // 用户点了暂停 → 不转圈，控制条常显。
+            isLoading = shouldPlay && lastURL != nil
+            if !shouldPlay { controlsVisible = true }
+        }
+    }
+
+    /// 进度回调：直接记当前时间与总时长（与原生周期观察同义）。
+    func handleTime(currentTime: TimeInterval, totalTime: TimeInterval) {
+        self.currentTime = currentTime
+        if totalTime.isFinite, totalTime > 0 { duration = totalTime }
+    }
+
+    /// 缓冲回调：bufferedCount 是 KSPlayer 回传的已缓冲秒数（整秒），
+    /// bufferedCount == 0 表示首次加载（README 的 PlayerControllerDelegate
+    /// 注释原话）。进度条浅灰段用它估算，只进不退；这是估算值，不是
+    /// AVPlayer 的 loadedTimeRanges 精确值——外观一致即可，不宣称精确。
+    func handleBuffered(count: Int, consumeTime: TimeInterval) {
+        if count > 0 {
+            bufferedEnd = max(bufferedEnd, Double(count))
+        }
+    }
+
+    /// 播完/失败：error 非空=失败（走 markFailed 切线）；空=自然播完，
+    /// 停在 0:00（不循环、不续播），控制条常显，等用户再点播放（与原生一致）。
+    func handleFinish(layer: KSPlayerLayer, error: Error?) {
+        guard layer === playerLayer else { return }
+        if let error {
+            handleFatalError("软解播放失败（\(error.localizedDescription)）")
+            return
+        }
+        isPlaying = false
+        isLoading = false
+        controlsVisible = true
+        currentTime = 0
+        playerLayer?.seek(time: 0)
+    }
+
+    /// fatal 级失败：同一条 URL 只认一次（finish 与超时兜底可能先后都到），
+    /// 调 viewModel.markFailed 走正常切线。
+    func handleFatalError(_ message: String) {
+        guard let url = lastURL, didMarkFailedURL != url else { return }
+        didMarkFailedURL = url
+        loadTimeoutTask?.cancel()
+        viewModel.markFailed(message)
+    }
+
+    // MARK: - 播放 / 暂停 / 快进
+
+    func togglePlayPause() {
+        if isPlaying {
+            pauseByUser()
+        } else {
+            playByUser()
+        }
+    }
+
+    func pauseByUser() {
+        shouldPlay = false
+        playerLayer?.pause()
+        controlsVisible = true
+    }
+
+    func playByUser() {
+        shouldPlay = true
+        playerLayer?.play()
+        showControlsTemporarily()
+    }
+
+    /// 开始拖进度条：记下拖之前用户是不是想播，拖动期间先停播（seek 干净不卡）。
+    /// 用 shouldPlay（用户意图）记，不用 isPlaying（瞬时状态）：
+    /// 播着的片在等缓冲时会短暂不 playing，用它记就会把“在播”记成“暂停”，
+    /// 松手不续播；shouldPlay 只有用户点暂停才变 false（与原生同款）。
+    func beginScrub() {
+        wasPlayingBeforeScrub = shouldPlay
+        playerLayer?.pause()
+    }
+
+    /// 拖动中：实时 seek（FFmpeg 跳转到该位置），进度条跟手。
+    func scrub(to seconds: Double) {
+        guard duration > 0 else { return }
+        let clamped = min(max(seconds, 0), duration)
+        currentTime = clamped
+        playerLayer?.seek(time: clamped)
+    }
+
+    /// 松手：精确定位到拖到的位置；拖之前在播就恢复播放（不拖完停在暂停态）。
+    func endScrub(to seconds: Double) {
+        guard duration > 0 else { return }
+        let clamped = min(max(seconds, 0), duration)
+        currentTime = clamped
+        let resume = wasPlayingBeforeScrub
+        playerLayer?.seek(time: clamped)
+        if resume {
+            shouldPlay = true
+            playerLayer?.play()
+        }
+    }
+
+    // MARK: - 画质
+
+    /// 与原生同款：从 viewModel.lines 推导画质选项（切画质=切线路，
+    /// 同片同 generation 保当前进度，不回 0:00）。
+    func refreshQualityOptions() {
+        let lines = viewModel.lines
+        var seen = Set<String>()
+        var options: [QualityOption] = []
+        for line in lines {
+            let label = qualityLabel(for: line)
+            guard !seen.contains(label) else { continue }
+            seen.insert(label)
+            options.append(QualityOption(id: line.url, label: label, line: line))
+        }
+        qualityOptions = options
+        if let current = viewModel.currentURL?.absoluteString,
+           let line = lines.first(where: { $0.url == current }) {
+            currentQualityLabel = qualityLabel(for: line)
+        } else if let first = options.first {
+            currentQualityLabel = first.label
+        } else {
+            currentQualityLabel = "自动"
+        }
+    }
+
+    /// 切画质=切线路（同片同 generation，load 时保当前进度，不回 0:00）。
+    func switchQuality(to option: QualityOption) {
+        viewModel.switchLine(option.line)
+        showControlsTemporarily()
+    }
+
+    // MARK: - 画面挂载与控制条显隐、全屏、停播
+
+    /// 把当前层的画面 view 挂到指定容器（内嵌/全屏二选一，由 isFullscreen 门控）。
+    /// 内嵌容器与全屏容器同时存在（全屏是 overFullScreen 盖上去，底下详情页
+    /// 不卸载），只有与 isFullscreen 一致的那边才挂画面，另一边摘掉；
+    /// 同一个 view 在两个容器间搬家，不重建层、不重播、不丢进度。
+    func attachVideoView(to container: UIView, fullscreenContainer: Bool) {
+        guard let layer = playerLayer, let videoView = layer.player.view else { return }
+        let shouldAttach = (fullscreenContainer == isFullscreen)
+        if shouldAttach {
+            if videoView.superview !== container {
+                videoView.removeFromSuperview()
+                videoView.frame = container.bounds
+                videoView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+                container.addSubview(videoView)
+            }
+        } else if videoView.superview === container {
+            videoView.removeFromSuperview()
+        }
+    }
+
+    /// 播时显示控制条，3 秒无操作自动藏；暂停时常显。
+    func showControlsTemporarily() {
+        controlsVisible = true
+        hideTask?.cancel()
+        guard isPlaying else { return }
+        hideTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            if self.isPlaying { self.controlsVisible = false }
+        }
+    }
+
+    func toggleControls() {
+        controlsVisible.toggle()
+        if controlsVisible { showControlsTemporarily() }
+    }
+
+    func enterFullscreen() {
+        isFullscreen = true
+    }
+
+    /// 离页停播：停层销毁 + 状态复位。幂等（onDisappear 与引擎切走都会调）。
+    /// 全屏开着时一并关掉全屏 VC（失败切线可能让引擎先切走、视图先卸载，
+    /// 全屏 VC 是盖在顶层的模态，不主动关会飘在详情页上面播黑屏）。
+    /// URL/代际记忆也清掉：同 URL 重挂载时 load() 的去重 guard 才不会
+    /// 把“层已拆、需重建”误判成“没变、不重建”。
+    func teardown() {
+        hideTask?.cancel()
+        hideTask = nil
+        teardownLayer()
+        if isFullscreen {
+            isFullscreen = false
+            SoftDecoderFullscreenPresenter.dismissActive()
+        }
+        lastURL = nil
+        lastHeaders = nil
+        lastGeneration = nil
+        didMarkPlayingURL = nil
+        didMarkFailedURL = nil
+        isPlaying = false
+        isLoading = false
+        currentTime = 0
+        duration = 0
+        bufferedEnd = 0
+    }
+}
+
+// MARK: - KSPlayerLayerDelegate 转接
+
+/// KSPlayerLayer 的 delegate 回调不一定在主线程跑（KSPlayer 内部线程），
+/// 这里只做转接：收到就 hop 到 @MainActor 再调 controller 的处理方法，
+/// 与 CustomPlayerController 把 KVO 回调包进 Task { @MainActor in … }
+/// 的做法同源。四个方法签名照 KSPlayerLayerDelegate 的文档示例逐字写。
+final class SoftDecoderLayerDelegate: NSObject, KSPlayerLayerDelegate {
+    weak var controller: SoftDecoderPlayerController?
+
+    init(controller: SoftDecoderPlayerController) {
+        self.controller = controller
+    }
+
+    func player(layer: KSPlayerLayer, state: KSPlayerState) {
+        Task { @MainActor [weak self] in
+            self?.controller?.handleState(layer: layer, state: state)
+        }
+    }
+
+    func player(layer: KSPlayerLayer, currentTime: TimeInterval, totalTime: TimeInterval) {
+        Task { @MainActor [weak self] in
+            self?.controller?.handleTime(currentTime: currentTime, totalTime: totalTime)
+        }
+    }
+
+    func player(layer: KSPlayerLayer, finish error: Error?) {
+        Task { @MainActor [weak self] in
+            self?.controller?.handleFinish(layer: layer, error: error)
+        }
+    }
+
+    func player(layer: KSPlayerLayer, bufferedCount: Int, consumeTime: TimeInterval) {
+        Task { @MainActor [weak self] in
+            self?.controller?.handleBuffered(count: bufferedCount, consumeTime: consumeTime)
+        }
+    }
+}
+
+// MARK: - KSPlayer 画面的 UIView 容器
+
+/// 只负责装画面：黑底容器，画面 view 由 controller.attachVideoView 挂进来。
+/// 换片不重建容器（层在 controller 手里换，画面 view 搬家即可）。
+struct SoftDecoderKSView: UIViewRepresentable {
+    let controller: SoftDecoderPlayerController
+    /// true=全屏容器，false=内嵌容器（门控见 attachVideoView）。
+    let isFullscreenContainer: Bool
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.backgroundColor = .black
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        controller.attachVideoView(to: uiView, fullscreenContainer: isFullscreenContainer)
+    }
+
+    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) {
+        // 容器销毁时把画面 view 摘掉（层还在 controller 手里，全屏/切线时还会再挂）。
+        uiView.subviews.forEach { $0.removeFromSuperview() }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator {}
+}
+
+// MARK: - 软解播放器（SwiftUI：KSPlayerLayer + 同一套底条，16:9 内嵌）
+
+/// 软解播放器：KSPlayerLayer（FFmpeg）播 viewModel.currentURL
+///（.mkv/.flv/.avi/.webm 等 AVPlayer 播不了的封装/编码，或无 dash.js 时的 .mpd）。
+/// 构造契约：`SoftDecoderPlayerView(viewModel: PlayerViewModel)`。
+/// 外观与原生播放器一致：16:9 内嵌在详情页顶部小窗口，不弹全屏；全屏靠底条上的
+/// 全屏按钮（横屏呈现，退出回原位）。离开页面 onDisappear 即停播。
+struct SoftDecoderPlayerView: View {
+    @ObservedObject var viewModel: PlayerViewModel
+
+    @StateObject private var controller: SoftDecoderPlayerController
+
+    init(viewModel: PlayerViewModel) {
+        self.viewModel = viewModel
+        _controller = StateObject(wrappedValue: SoftDecoderPlayerController(viewModel: viewModel))
+    }
+
+    var body: some View {
+        ZStack {
+            SoftDecoderKSView(controller: controller, isFullscreenContainer: false)
+                .onTapGesture { controller.toggleControls() }
+            if controller.isLoading {
+                ProgressView()
+                    .tint(.white)
+                    .scaleEffect(1.2)
+            }
+            VStack {
+                Spacer()
+                if controller.controlsVisible {
+                    PlayerControlBar(
+                        isPlaying: controller.isPlaying,
+                        isBuffering: controller.isLoading,
+                        currentTime: controller.currentTime,
+                        duration: controller.duration,
+                        bufferedEnd: controller.bufferedEnd,
+                        showsProgress: true,
+                        qualityLabel: controller.currentQualityLabel,
+                        qualityOptions: controller.qualityOptions,
+                        onQualitySelected: { controller.switchQuality(to: $0) },
+                        isFullscreen: false,
+                        onFullscreen: { controller.enterFullscreen() },
+                        onClose: nil,
+                        statusText: nil,
+                        onPlayPause: { controller.togglePlayPause() },
+                        onScrubStart: { controller.beginScrub() },
+                        onScrub: { controller.scrub(to: $0) },
+                        onScrubEnd: { controller.endScrub(to: $0) }
+                    )
+                }
+            }
+        }
+        .background(Color.black)
+        .onAppear { controller.load(url: viewModel.currentURL, headers: viewModel.currentHeaders) }
+        .onChange(of: viewModel.currentURL) { _, newURL in controller.load(url: newURL, headers: viewModel.currentHeaders) }
+        .onChange(of: viewModel.currentHeaders) { _, newHeaders in controller.load(url: viewModel.currentURL, headers: newHeaders) }
+        .onChange(of: controller.isFullscreen) { _, fullscreen in
+            if fullscreen {
+                SoftDecoderFullscreenPresenter.present(
+                    controller: controller,
+                    viewModel: viewModel
+                ) {
+                    controller.isFullscreen = false
+                }
+            }
+        }
+        .onDisappear { controller.teardown() }
+    }
+}
+
+// MARK: - 全屏呈现（横屏，同一 KSPlayerLayer、同一 controller）
+
+/// 全屏版播放器内容：同一层、同一 controller、同一套底条，只是铺满横屏
+///（全屏按钮显示“退出全屏”图标）。画面 view 由门控从内嵌容器搬过来。
+struct SoftDecoderFullscreenContent: View {
+    @ObservedObject var controller: SoftDecoderPlayerController
+    let viewModel: PlayerViewModel
+    let onExit: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            SoftDecoderKSView(controller: controller, isFullscreenContainer: true)
+                .ignoresSafeArea()
+                .onTapGesture { controller.toggleControls() }
+            if controller.isLoading {
+                ProgressView()
+                    .tint(.white)
+                    .scaleEffect(1.2)
+            }
+            VStack {
+                Spacer()
+                if controller.controlsVisible {
+                    PlayerControlBar(
+                        isPlaying: controller.isPlaying,
+                        isBuffering: controller.isLoading,
+                        currentTime: controller.currentTime,
+                        duration: controller.duration,
+                        bufferedEnd: controller.bufferedEnd,
+                        showsProgress: true,
+                        qualityLabel: controller.currentQualityLabel,
+                        qualityOptions: controller.qualityOptions,
+                        onQualitySelected: { controller.switchQuality(to: $0) },
+                        isFullscreen: true,
+                        onFullscreen: { onExit() },
+                        onClose: nil,
+                        statusText: nil,
+                        onPlayPause: { controller.togglePlayPause() },
+                        onScrubStart: { controller.beginScrub() },
+                        onScrub: { controller.scrub(to: $0) },
+                        onScrubEnd: { controller.endScrub(to: $0) }
+                    )
+                }
+            }
+            .ignoresSafeArea()
+        }
+        .onAppear { controller.showControlsTemporarily() }
+    }
+}
+
+/// 全屏播放控制器：横屏承载全屏版播放器；只能用全屏按钮退出（不手势滑掉），
+/// 退出后内嵌播放器还在同一进度（同一 KSPlayerLayer、同一 controller）。
+/// 与原生全屏同款：overFullScreen（不是 fullScreen），盖全屏时底下的详情页
+/// 不从层级里摘掉，DetailView 的 onDisappear/onAppear 不触发，播放器不被拆、不重播。
+final class SoftDecoderFullscreenViewController: UIViewController {
+    private let controller: SoftDecoderPlayerController
+    private let viewModel: PlayerViewModel
+    private let onExit: () -> Void
+
+    init(controller: SoftDecoderPlayerController, viewModel: PlayerViewModel, onExit: @escaping () -> Void) {
+        self.controller = controller
+        self.viewModel = viewModel
+        self.onExit = onExit
+        super.init(nibName: nil, bundle: nil)
+        modalPresentationStyle = .overFullScreen
+        isModalInPresentation = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .landscape }
+    override var shouldAutorotate: Bool { true }
+    override var prefersStatusBarHidden: Bool { true }
+    override var preferredInterfaceOrientationForPresentation: UIInterfaceOrientation { .landscapeRight }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+        let content = SoftDecoderFullscreenContent(controller: controller, viewModel: viewModel, onExit: { [weak self] in
+            self?.dismiss(animated: true, completion: nil)
+            self?.onExit()
+        })
+        let hosting = UIHostingController(rootView: content)
+        hosting.view.backgroundColor = .black
+        hosting.view.translatesAutoresizingMaskIntoConstraints = false
+        addChild(hosting)
+        view.addSubview(hosting.view)
+        NSLayoutConstraint.activate([
+            hosting.view.topAnchor.constraint(equalTo: view.topAnchor),
+            hosting.view.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            hosting.view.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            hosting.view.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+        ])
+        hosting.didMove(toParent: self)
+    }
+}
+
+/// 全屏呈现器：从最顶层控制器 present 横屏全屏播放器（与原生同款写法）。
+enum SoftDecoderFullscreenPresenter {
+    private static weak var activeVC: SoftDecoderFullscreenViewController?
+
+    @MainActor
+    static func present(controller: SoftDecoderPlayerController, viewModel: PlayerViewModel, onExit: @escaping () -> Void) {
+        guard let top = topViewController() else { return }
+        if top is SoftDecoderFullscreenViewController { return }
+        let vc = SoftDecoderFullscreenViewController(controller: controller, viewModel: viewModel, onExit: onExit)
+        activeVC = vc
+        top.present(vc, animated: true, completion: nil)
+    }
+
+    /// 引擎切走/离页时主动关掉还开着的全屏（teardown 调；退出按钮走 VC
+    /// 自己的 onExit，不走这里，不会重复关）。
+    @MainActor
+    static func dismissActive() {
+        guard let vc = activeVC else { return }
+        activeVC = nil
+        vc.dismiss(animated: true, completion: nil)
+    }
+
+    private static func topViewController() -> UIViewController? {
+        guard let scene = UIApplication.shared.connectedScenes.first(where: { $0.activationState == .foregroundActive }) as? UIWindowScene,
+              let window = scene.windows.first(where: { $0.isKeyWindow }),
+              var vc = window.rootViewController else { return nil }
+        while let presented = vc.presentedViewController { vc = presented }
+        return vc
+    }
+}
+
+#else
+
+// MARK: - KSPlayer 未接入时的占位（构建不坏）
+//
+// hasSoftwareDecoder 为 false 时路由表不会选软解，本分支基本走不到；
+// 万一走到（如 .mpd 无 dash.js 又无软解时路由仍返回 .dash，不走这里），
+// 显示与原来占位视图同一文案的提示，不静默空白。
+struct SoftDecoderPlayerView: View {
+    @ObservedObject var viewModel: PlayerViewModel
+
+    init(viewModel: PlayerViewModel) {
+        self.viewModel = viewModel
+    }
+
+    var body: some View {
+        Text("该视频编码需要软解播放器，暂未集成")
+            .font(.subheadline)
+            .foregroundColor(.secondary)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+#endif

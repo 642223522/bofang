@@ -127,6 +127,7 @@ enum AdStripScript {
         try {
           var t = (document.title || '').toLowerCase();
           if (t.indexOf('just a moment') >= 0) return true;
+          if (t.indexOf('checking your browser') >= 0) return true;
           if (document.querySelector('iframe[src*="challenges.cloudflare.com"]')) return true;
           if (document.querySelector('[id*="cf-"], [class*="cf-challenge"], [class*="challenge-running"], [class*="turnstile"]')) return true;
         } catch(e){}
@@ -200,8 +201,12 @@ enum AdStripScript {
 /// 探不到 video（跨域 iframe、还没加载出 video）时 hasVideo=false，外层只显示状态文案。
 /// 嵌页自己的播放控制不动（页内播放器照常用）；外层底条只是多一套统一外观的操作入口。
 /// 底条显隐也放这里管（@MainActor 类，Task 写起来安全；View struct 里写 Task 容易踩并发坑）。
-/// 另管 CF 卡死兜底：挑战 continuous 25 秒还在、又一直没 video，就当是屏蔽规则
-/// 误伤了验证资源——关掉内容规则、重载一次（豆包的兜底；只做一次）。
+/// 另管 CF 卡死兜底：标题已明确是质询页（"Just a moment" / "Checking your browser"）
+/// 就立即关掉内容规则、重载一次，不等 25 秒探针超时；标题之外的质询信号
+/// （挑战 iframe / cf- 标记）仍走 25 秒兜底。只重载一次。
+/// challengeRunning：质询在跑且还没出 video 时为 true，WebViewPlayerView 用它
+/// 盖一层原生 Loading 遮罩（WebView 本身保持全尺寸在屏，只盖住不隐藏，
+/// 否则质询会判 headless 无限刷新）。
 @MainActor
 final class EmbedProbeState: ObservableObject {
     @Published var hasVideo = false
@@ -209,6 +214,8 @@ final class EmbedProbeState: ObservableObject {
     @Published var duration: Double = 0
     /// 页内 video 是不是停着（没 video 时为 true）。
     @Published var paused = true
+    /// CF 质询是不是正在跑（还没出 video）：外层用它显示原生 Loading 遮罩。
+    @Published var challengeRunning = false
     /// 底条是否可见（播时 3 秒无操作自动藏，暂停/没 video 时常显，点画面切换）。
     @Published var controlsVisible = true
 
@@ -232,6 +239,7 @@ final class EmbedProbeState: ObservableObject {
         timer = nil
         hideTask?.cancel()
         hideTask = nil
+        challengeRunning = false
     }
 
     private func probe() {
@@ -241,14 +249,15 @@ final class EmbedProbeState: ObservableObject {
             (function(){
               var v = document.querySelector('video');
               var cf = false;
+              var cfTitle = false;
               try {
                 var t = (document.title || '').toLowerCase();
-                if (t.indexOf('just a moment') >= 0) cf = true;
+                if (t.indexOf('just a moment') >= 0 || t.indexOf('checking your browser') >= 0) { cf = true; cfTitle = true; }
                 if (document.querySelector('iframe[src*="challenges.cloudflare.com"]')) cf = true;
                 if (document.querySelector('[id*="cf-"], [class*="cf-challenge"], [class*="challenge-running"]')) cf = true;
               } catch(e){}
-              if (!v) return JSON.stringify({cf: cf});
-              return JSON.stringify({t: v.currentTime, d: v.duration, p: v.paused, cf: cf});
+              if (!v) return JSON.stringify({cf: cf, cfTitle: cfTitle});
+              return JSON.stringify({t: v.currentTime, d: v.duration, p: v.paused, cf: cf, cfTitle: cfTitle});
             })();
             """
         ) { [weak self] result, _ in
@@ -259,24 +268,33 @@ final class EmbedProbeState: ObservableObject {
                 self.hasVideo = false
                 return
             }
-            // CF 卡死兜底：挑战在、一直没 video，25 秒后关规则重载一次。
+            // CF 质询处理：标题已明确是质询页就立即关规则重载一次，不等 25 秒；
+            // 标题之外的质询信号（挑战 iframe / cf- 标记）仍走 25 秒兜底。只重载一次。
             let cfRunning = (json["cf"] as? Bool) ?? false
+            let cfTitle = (json["cfTitle"] as? Bool) ?? false
             if cfRunning && !self.hasVideo {
-                if self.challengeSince == nil { self.challengeSince = Date() }
-                if let since = self.challengeSince,
-                   !self.challengeReloaded,
-                   Date().timeIntervalSince(since) > 25 {
+                if cfTitle && !self.challengeReloaded {
                     self.challengeReloaded = true
+                    self.challengeSince = nil
                     self.reloadWithoutRules()
+                } else if !self.challengeReloaded {
+                    if self.challengeSince == nil { self.challengeSince = Date() }
+                    if let since = self.challengeSince,
+                       Date().timeIntervalSince(since) > 25 {
+                        self.challengeReloaded = true
+                        self.reloadWithoutRules()
+                    }
                 }
             } else {
                 self.challengeSince = nil
             }
             guard json["t"] != nil else {
                 self.hasVideo = false
+                self.challengeRunning = cfRunning
                 return
             }
             self.hasVideo = true
+            self.challengeRunning = false
             self.currentTime = (json["t"] as? Double) ?? 0
             let d = (json["d"] as? Double) ?? 0
             self.duration = (d.isFinite && d > 0) ? d : 0
@@ -363,12 +381,11 @@ final class EmbedProbeState: ObservableObject {
 
 // MARK: - 嵌入页 WKWebView（只负责播嵌页，不带按钮）
 
-/// dood 家嵌页的域名（playmogo/dood 各门面）：主框架导航只放行这些 host，
-/// 广告点一下跳去别的站时拦住；子框架导航一律放行（播放器 iframe 要加载）。
-private let embedAllowedHosts = [
-    "playmogo.com", "doodstream.com", "dood.watch", "doodstream.co",
-    "d0o0d.com", "bysebuho.com", "lplaygo.com"
-]
+/// dood/playmogo 系嵌页家族域名见 PlayerEngine.swift 的 wallEmbedHostFamilies
+/// （共用一张表）：主框架导航放行“当前播的嵌页自己的 host（含子域）+ 这些家族
+/// host”，广告点一下跳去别的站时拦住；子框架导航一律放行（播放器 iframe 要加载）。
+/// 旧版是写死的 7 个 host 全名单：名单外的新嵌页主框架会被拦；现在以模块返回的
+/// 嵌页 host（传进来的 url.host，即当前播的 line.url 的 host）为准，家族表只作补充。
 
 /// 嵌入页播放器的 UIViewController：WKWebView 全铺，不带任何按钮。
 /// 按钮/底条都在外层 SwiftUI（和直链自定义播放器同一套 PlayerControlBar）。
@@ -413,6 +430,11 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
             config.userContentController.addUserScript(script)
         }
 
+        // 在屏铁律：解流/过墙用的 WebView 必须全尺寸在屏——四边约束铺满父视图，
+        // 绝不宽高 0、绝不移出视图树、绝不 alpha=0（隐藏会被质询判 headless 而
+        // 无限刷新）。frame 用 .zero 只是建视图时的占位，约束会把它撑满；
+        // 要遮住质询页用上层原生 Loading 遮罩（WebViewPlayerView 的 challengeRunning
+        // 层）盖住它，而不是隐藏它。只在 teardown 时才移出视图（停播/离开页）。
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.customUserAgent = NetConstants.iPhoneUserAgent
         webView.navigationDelegate = self
@@ -461,7 +483,7 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
         return nil
     }
 
-    /// 主框架导航：只放行嵌页自己（同 host）或 dood 家各门面；
+    /// 主框架导航：只放行嵌页自己（当前播的嵌页 host 及其子域）或 dood 家各门面；
     /// 广告点一下想把主框架跳去别的站时拦住。子框架导航一律放行（播放器 iframe 要加载）。
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         guard let targetFrame = navigationAction.targetFrame, targetFrame.isMainFrame,
@@ -470,7 +492,9 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
             return
         }
         let embedHost = url.host?.lowercased() ?? ""
-        if host == embedHost || embedAllowedHosts.contains(where: { host == $0 || host.hasSuffix("." + $0) }) {
+        if host == embedHost
+            || (!embedHost.isEmpty && host.hasSuffix("." + embedHost))
+            || isWalledEmbedHost(host) {
             decisionHandler(.allow)
             return
         }
@@ -511,8 +535,9 @@ struct EmbedWebView: UIViewControllerRepresentable {
 /// 深色半透明底条（播放/暂停、进度条、当前时间/总时间、全屏、关闭），点画面显示/隐藏。
 /// 探不到页内 video 时只显示“嵌入播放中”状态文案 + 全屏/关闭。
 /// 只在混合解流抽不出直链时用（解出直链优先走 AVPlayer）。
-/// 广告剥离三层全开（规则 + 代理拦弹窗 + CF 通过后删 DOM）；CF 卡死时
-/// 探针会关规则重载一次。关闭/离开时停掉 WebView、释放资源。
+/// 广告剥离三层全开（规则 + 代理拦弹窗 + CF 通过后删 DOM）；标题一读到是 CF 质询页
+/// 就立即关规则重载一次（25 秒兜底仍在），质询进行中盖一层原生 Loading 遮罩
+/// （WebView 本身保持全尺寸在屏、不隐藏）。关闭/离开时停掉 WebView、释放资源。
 struct WebViewPlayerView: View {
     let url: URL
     let onClose: () -> Void
@@ -525,6 +550,21 @@ struct WebViewPlayerView: View {
         ZStack {
             EmbedWebView(url: url, probe: probe, adStrip: adStrip)
                 .onTapGesture { probe.toggleControls() }
+            // 质询进行中：原生 Loading 遮罩盖住 WebView（只盖住、不隐藏它——
+            // WebView 保持全尺寸在屏，质询才能正常跑完；出 video 后自动撤掉）。
+            // 遮罩在控制条之下，关闭/全屏按钮始终可点。
+            if probe.challengeRunning {
+                ZStack {
+                    Color.black.opacity(0.85)
+                    VStack(spacing: 12) {
+                        ProgressView()
+                            .tint(.white)
+                        Text("正在验证，请稍候…")
+                            .font(.subheadline)
+                            .foregroundColor(.white)
+                    }
+                }
+            }
             VStack {
                 Spacer()
                 if probe.controlsVisible {

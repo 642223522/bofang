@@ -62,6 +62,11 @@ struct AdultAsianHDApp: App {
             .onAppear {
                 // 启动时：闲置 12 小时一轮轻检 / 7 天一轮深探针（到期才跑）。
                 store.maybeRunAutoCheck()
+                // 异步探测 hls.js / dash.js 在本机 WebView 里是否可用
+                // （ManagedMediaSource + Hls.isSupported()，运行时实测，不用版本号判断），
+                // 不阻塞启动；探到可用才置 PlaybackCapabilities.hasHLSJS/hasDASH，
+                // 路由才选这两路（B 路 WebPlayerCapabilityProbe，探完即释放隐藏 WebView）。
+                WebPlayerCapabilityProbe.start()
             }
             .onChange(of: scenePhase) { _, newPhase in
                 if newPhase == .active {
