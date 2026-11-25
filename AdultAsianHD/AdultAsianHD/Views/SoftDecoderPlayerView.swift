@@ -10,9 +10,10 @@ import KSPlayer
 //
 // 选型：KSPlayer（kingslay/KSPlayer，SPM，product / module 名均为 KSPlayer，
 // 与 PlayerEngine.swift 的 `#if canImport(KSPlayer)` 判断一致；project.yml
-// 里 `from: "2.7.3"`——AngelLive 的 Package.resolved 钉死 KSPlayer 2.7.3
-// exact，证明该 tag 存在且可解；KSPlayer 官方 README 只给 `.branch("main")`，
-// 若 2.7.3 在 Codemagic 解析失败，退回 branch main 再试）。
+// 里 `from: "5.6.2"`（2026-11-25 实测：KSPlayer 根本没有 2.7.3 这个 tag，
+// 现有 tag 只有 2.0.7–2.3.4 与 5.6.2，5.6.2 为最新；#56 即因 2.7.3 不存在
+// 而解析失败。KSPlayer 官方 README 只给 `.branch("main")`，
+// 若 5.6.2 在 Codemagic 解析失败，退回 branch main 再试）。
 //  - KSPlayer：SPM 原生、Swift 编写、FFmpeg 7.0.2（GPL 版 6.1.0）、iOS 13+，
 //    维护活跃（配套 TracyPlayer 在 App Store 持续更新）；API 有据可查：
 //    KSPlayerLayer(url:options:delegate:) / play() / pause() / seek(time:) /
