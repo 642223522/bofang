@@ -30,10 +30,11 @@ enum SoftDecoderSupport {
         KSOptions.secondPlayerType = KSAVPlayer.self
     }
 
-    /// 给一条软解线路建 KSOptions。属性名均按 KSPlayer README 里贴出的
-    /// `open class KSOptions` 逐字取用（isAutoPlay / isLoopPlay /
-    /// isSeekedAutoPlay / startPlayTime / hardwareDecode /
-    /// registerRemoteControll / referer / userAgent / appendHeader）。
+    /// 给一条软解线路建 KSOptions。属性名均按 2.3.4 的 KSOptions.swift
+    /// 逐字取用（isLoopPlay / isSeekedAutoPlay / startPlayTime /
+    /// hardwareDecode / registerRemoteControll / referer / userAgent /
+    /// appendHeader 都是实例成员；isAutoPlay 在 2.3.4 里只有 static，
+    /// 见 makeOptions 里 KSOptions.isAutoPlay = true）。
     /// - headers：viewModel.currentHeaders（Referer + iPhone UA + 模块头 +
     ///   Cookie）。Referer / User-Agent 走 KSOptions 的专用属性（FFmpeg 的
     ///   http 层认它们）；其余头（含 Cookie）走 appendHeader 透传给 FFmpeg。
@@ -42,7 +43,10 @@ enum SoftDecoderSupport {
         configurePlayerTypes()
         let options = KSOptions()
         // 详情页点封面进来即播，不用用户再点一下（与原生 / hls.js 路一致）。
-        options.isAutoPlay = true
+        // 2.3.4 实测：KSOptions 没有实例 isAutoPlay，只有 static
+        // isAutoPlay（默认 true）；KSPlayerLayer.init 的 isAutoPlay 参数
+        // 默认值就是 KSOptions.isAutoPlay，这里显式置 true 保住这道防线。
+        KSOptions.isAutoPlay = true
         // 不循环：播到片尾停在 0:00，等用户再点播放（与原生一致）。
         options.isLoopPlay = false
         // seek 后不自动续播，续播由 SoftDecoderPlayerController 自己决定

@@ -238,7 +238,11 @@ struct SourcesView: View {
             case .failed:
                 VStack(alignment: .leading, spacing: 2) {
                     let step = result.failedStep.map { "死在\($0)步" } ?? "自检失败"
-                    Text(step + "：" + (result.failedReason ?? result.failedLines.sorted(by: { $0.key < $1.key }).first.map { "\($0.key)：\($0.value)" } ?? "") + (result.checkedAt.map { " · \($0.formatted(date: .numeric, time: .shortened))" } ?? ""))
+                    // 拆成三段再拼：整句一次拼完类型检查超时（GitHub Actions
+                    // 首次运行报错：unable to type-check in reasonable time）。
+                    let reason = result.failedReason ?? result.failedLines.sorted(by: { $0.key < $1.key }).first.map { "\($0.key)：\($0.value)" } ?? ""
+                    let checked = result.checkedAt.map { " · \($0.formatted(date: .numeric, time: .shortened))" } ?? ""
+                    Text("\(step)：\(reason)\(checked)")
                         .font(.caption)
                         .foregroundColor(.red)
                         .lineLimit(1)

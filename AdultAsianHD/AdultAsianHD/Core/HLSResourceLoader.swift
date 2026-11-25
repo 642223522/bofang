@@ -357,7 +357,7 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
             if let totalLength {
                 info.contentLength = Int64(totalLength)
             }
-            info.byteRangeAccessSupported = byteRangeAccessSupported
+            info.isByteRangeAccessSupported = byteRangeAccessSupported
         }
         loadingRequest.dataRequest?.respond(with: data)
         loadingRequest.finishLoading()

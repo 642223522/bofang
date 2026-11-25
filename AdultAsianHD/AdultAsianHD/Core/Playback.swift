@@ -357,8 +357,12 @@ final class PlayerViewModel: ObservableObject {
     /// 密钥 403 重铸回调挂到 handleKeyAuthFailure。
     private func makeResourceLoader(for line: PlayLine) -> HLSResourceLoader {
         let loader = HLSResourceLoader(headers: interceptedHeaders(for: line), cookie: line.cookie)
+        // PlaybackEngine 本身是 @MainActor，handleKeyAuthFailure() 也是
+        // MainActor 隔离：直接 await 就会跳回主线程，不需要 MainActor.run
+        // 包一层（且本工具链的 MainActor.run 只有同步 body 的重载，
+        // 传 async 闭包编不过，见 GitHub Actions 首次运行报错）。
         loader.onKeyAuthFailed = { [weak self] in
-            await MainActor.run { await self?.handleKeyAuthFailure() ?? false }
+            await self?.handleKeyAuthFailure() ?? false
         }
         return loader
     }

@@ -10,14 +10,15 @@ import KSPlayer
 //
 // 选型：KSPlayer（kingslay/KSPlayer，SPM，product / module 名均为 KSPlayer，
 // 与 PlayerEngine.swift 的 `#if canImport(KSPlayer)` 判断一致；project.yml
-// 里 `from: "5.6.2"`（2026-11-25 实测：KSPlayer 根本没有 2.7.3 这个 tag，
-// 现有 tag 只有 2.0.7–2.3.4 与 5.6.2，5.6.2 为最新；#56 即因 2.7.3 不存在
-// 而解析失败。KSPlayer 官方 README 只给 `.branch("main")`，
-// 若 5.6.2 在 Codemagic 解析失败，退回 branch main 再试）。
+// 里 `from: "2.3.4"`（2026-11-25 实测：KSPlayer 根本没有 2.7.3 这个 tag，
+// 现有 tag 只有 2.0.7–2.3.4 与 5.6.2；5.6.2 是预编译 xcframework 且无 iOS
+// 切片，#57 归档失败，改用源码版 2.3.4；#56 即因 2.7.3 不存在而解析失败。
+// KSPlayer 官方 README 只给 `.branch("main")`，若 2.3.4 解析失败再试 main）。
 //  - KSPlayer：SPM 原生、Swift 编写、FFmpeg 7.0.2（GPL 版 6.1.0）、iOS 13+，
 //    维护活跃（配套 TracyPlayer 在 App Store 持续更新）；API 有据可查：
-//    KSPlayerLayer(url:options:delegate:) / play() / pause() / seek(time:) /
-//    stop() / prepareToPlay()、KSPlayerLayerDelegate 四个回调、
+//    KSPlayerLayer(url:options:delegate:) / play() / pause() /
+//    seek(time:autoPlay:completion:) / stop() / prepareToPlay()、
+//    KSPlayerLayerDelegate 四个回调、
 //    KSOptions.isAutoPlay / isLoopPlay / startPlayTime / hardwareDecode /
 //    registerRemoteControll / referer / userAgent / appendHeader、
 //    KSOptions.firstPlayerType / secondPlayerType = KSMEPlayer.self。
@@ -58,8 +59,9 @@ import KSPlayer
 //
 // 已核实的 API（核实来源写在各调用处注释里；本地无 Xcode，只能人工审，
 // Codemagic 构建是确认关口）：
-//  - KSPlayerLayer(url:options:delegate:) / play() / pause() / seek(time:) /
-//    stop() / prepareToPlay()、KSPlayerLayerDelegate 的
+//  - KSPlayerLayer(url:options:delegate:) / play() / pause() /
+//    seek(time:autoPlay:completion:) / stop() / prepareToPlay()、
+//    KSPlayerLayerDelegate 的
 //    player(layer:state:) / player(layer:currentTime:totalTime:) /
 //    player(layer:finish:) / player(layer:bufferedCount:consumeTime:)——
 //    均见 KSPlayer 官方 README 与 Streamyfin 的 KSPlayerLayer 文档示例原文。
@@ -278,7 +280,10 @@ final class SoftDecoderPlayerController: ObservableObject {
         isLoading = false
         controlsVisible = true
         currentTime = 0
-        playerLayer?.seek(time: 0)
+        // 2.3.4 实测：KSPlayerLayer 只有 seek(time:autoPlay:completion:)，
+        // 单参 seek(time:) 是 internal，调不到。自然播完停在 0:00，
+        // autoPlay 必须 false（不能播完又自己播起来）。
+        playerLayer?.seek(time: 0, autoPlay: false) { _ in }
     }
 
     /// fatal 级失败：同一条 URL 只认一次（finish 与超时兜底可能先后都到），
@@ -326,7 +331,8 @@ final class SoftDecoderPlayerController: ObservableObject {
         guard duration > 0 else { return }
         let clamped = min(max(seconds, 0), duration)
         currentTime = clamped
-        playerLayer?.seek(time: clamped)
+        // 拖动期间停播（beginScrub 已 pause），seek 后不自动播。
+        playerLayer?.seek(time: clamped, autoPlay: false) { _ in }
     }
 
     /// 松手：精确定位到拖到的位置；拖之前在播就恢复播放（不拖完停在暂停态）。
@@ -335,7 +341,9 @@ final class SoftDecoderPlayerController: ObservableObject {
         let clamped = min(max(seconds, 0), duration)
         currentTime = clamped
         let resume = wasPlayingBeforeScrub
-        playerLayer?.seek(time: clamped)
+        // autoPlay 必须 false：续播由下面 if resume { play() } 显式决定，
+        // 不能让 seek 自己播（否则拖之前是暂停也会被播起来）。
+        playerLayer?.seek(time: clamped, autoPlay: false) { _ in }
         if resume {
             shouldPlay = true
             playerLayer?.play()
