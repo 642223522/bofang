@@ -55,6 +55,58 @@ struct NetworkDiagEvent: Identifiable, Codable, Sendable {
     let ttfbMs: Int?
     let totalMs: Int
 
+    /// 显式成员初始化器：新增带默认值的字段时，合成的 memberwise init
+    /// 在本工程的 Swift 6 编译下不接受该字段的显式传参（run #14 构建报错
+    /// extra argument 'originalHost'），写死一份最稳妥；originalHost 默认 nil，
+    /// 不传它的旧调用点（WebViewPlayer）不受影响。
+    init(
+        id: UUID,
+        at: Date,
+        source: String,
+        method: String,
+        host: String,
+        originalHost: String? = nil,
+        sanitizedPath: String,
+        networkClass: String,
+        phase: NetworkDiagPhase,
+        statusCode: Int?,
+        errorDomain: String?,
+        errorCode: Int?,
+        errorSummary: String?,
+        remoteAddress: String?,
+        protocolName: String?,
+        reusedConnection: Bool,
+        proxyConnection: Bool,
+        dnsMs: Int?,
+        tcpMs: Int?,
+        tlsMs: Int?,
+        ttfbMs: Int?,
+        totalMs: Int
+    ) {
+        self.id = id
+        self.at = at
+        self.source = source
+        self.method = method
+        self.host = host
+        self.originalHost = originalHost
+        self.sanitizedPath = sanitizedPath
+        self.networkClass = networkClass
+        self.phase = phase
+        self.statusCode = statusCode
+        self.errorDomain = errorDomain
+        self.errorCode = errorCode
+        self.errorSummary = errorSummary
+        self.remoteAddress = remoteAddress
+        self.protocolName = protocolName
+        self.reusedConnection = reusedConnection
+        self.proxyConnection = proxyConnection
+        self.dnsMs = dnsMs
+        self.tcpMs = tcpMs
+        self.tlsMs = tlsMs
+        self.ttfbMs = ttfbMs
+        self.totalMs = totalMs
+    }
+
     var timingSummary: String {
         var parts: [String] = []
         if let dnsMs { parts.append("DNS \(dnsMs)ms") }

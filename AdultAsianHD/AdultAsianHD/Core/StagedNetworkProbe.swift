@@ -255,7 +255,7 @@ final class StagedNetworkProbe: NSObject, URLSessionDataDelegate {
                                 return
                             }
                             let resStr = report.resolutions.map { r in
-                                "src=\(r.source) dur=\(Int(r.duration * 1000))ms ep=\(r.resolvedEndpoint) cnt=\(r.endpointCount)"
+                                "src=\(r.source) dur=\(Int(r.duration * 1000))ms cnt=\(r.endpointCount)"
                             }.joined(separator: "; ")
                             let hsStr = report.handshakes.map { h in
                                 "\(h.definition.name):dur=\(Int(h.handshakeDuration * 1000))ms,rtt=\(Int(h.handshakeRTT * 1000))ms"
