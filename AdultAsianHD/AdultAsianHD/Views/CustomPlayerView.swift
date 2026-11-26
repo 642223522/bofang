@@ -118,15 +118,28 @@ final class CustomPlayerController: ObservableObject {
     private var seekLifecycleObservers: [NSObjectProtocol] = []
     /// 精确 seek 的前台超时（秒）：超过仍未恢复播放即按两阶段重试（重试 → 重建 item）。
     private static let seekTimeoutSeconds: TimeInterval = 10
+    /// Stage 1 playImmediately 踢活的观察窗口（秒）：给异步切到 .playing 留时间，
+    /// 绝不紧接着同步重 seek 把踢活打断。
+    private static let seekKickGraceSeconds: TimeInterval = 2.5
+    /// 从后台回前台时的最小宽限秒数：避免刚回前台网络/解码器未苏醒就被 0.1 秒剩余时间误杀。
+    private static let foregroundResumeMinGraceSeconds: TimeInterval = 3.0
     /// 精确 seek 的容差（秒）：±1s 让 CoreMedia 落在最近关键帧，不做逐帧精确查找。
     private static let seekToleranceSeconds: Double = 1.0
+    /// performExactSeek 的 5 秒兜底：seek 回调 5 秒不回就强制 completeSeek
+    ///（CoreMedia 卡住时回调可能永远不来）；completeSeek 里取消它。
+    private var seekCompleteFallbackTask: Task<Void, Never>?
 
-    /// Seek 恢复阶段：初次 seek → 重试 seek → 等重建 item → 重建后 seek。
+    /// Seek 恢复完整阶段：
+    /// initialSeek -> (finished) waitingForPlayback(1)
+    /// -> (timeout) kickingPlayback（仅已缓冲）-> retrySeek -> waitingForPlayback(2)
+    /// -> waitingForReplacement -> rebuiltSeek -> waitingForPlayback(3) -> 终端。
     private enum SeekPhase: Equatable {
         case initialSeek
+        case kickingPlayback
         case retrySeek
         case waitingForReplacement
         case rebuiltSeek
+        case waitingForPlayback(attempt: Int)
     }
 
     private var timeObserver: Any?
@@ -194,6 +207,7 @@ final class CustomPlayerController: ObservableObject {
         hideTask?.cancel()
         stallKickTask?.cancel()
         capLiftTask?.cancel()
+        seekCompleteFallbackTask?.cancel()
         seekWatchdogWorkItem?.cancel()
         for observer in seekLifecycleObservers {
             NotificationCenter.default.removeObserver(observer)
@@ -338,8 +352,10 @@ final class CustomPlayerController: ObservableObject {
                 "AVURLAssetHTTPHeaderFieldsKey": headers,
                 "AVURLAssetHTTPUserAgentKey": userAgent,
             ])
+            activeResourceLoader = nil
             item = AVPlayerItem(asset: asset)
         } else {
+            activeResourceLoader = nil
             item = AVPlayerItem(url: url)
         }
         // 前向缓冲 10 秒（约 2~3 个分片）：memojav 分片 4~8 秒、码率约 2.1Mbps，
@@ -403,14 +419,12 @@ final class CustomPlayerController: ObservableObject {
                 let recoveryAttempt = pendingSeekRecoveryAttempt
                 pendingSeekRecoveryAttempt = nil
                 if resumeAt.seconds > 1 || recoveryAttempt != nil {
-                    if recoveryAttempt == nil {
-                        // 切线恢复是新一次 seek 操作，代际号 +1 使旧 seek 回调失效。
-                        seekGeneration &+= 1
-                    }
+                    // 不管是不是重建恢复，代际号都要 +1：重建恢复不 +1 时，
+                    // 重建前那次 seek 的旧回调还能对上号、误触 completeSeek。
+                    seekGeneration &+= 1
                     performExactSeek(
                         to: resumeAt,
                         shouldResume: shouldPlay,
-                        attempt: recoveryAttempt ?? 1,
                         phase: recoveryAttempt != nil ? .rebuiltSeek : .initialSeek
                     )
                 } else if shouldPlay {
@@ -450,10 +464,20 @@ final class CustomPlayerController: ObservableObject {
         switch player.timeControlStatus {
         case .playing:
             isPlaying = true
-            isLoading = false
             stallKickTask?.cancel()
-            // 真正恢复播放 → 解除 seek 看门狗
-            playbackDidBecomeActive()
+            // 仅在“seek 完成等起播”或“Stage 1 踢活”阶段解除看门狗，拦截拖动前排队的过时 .playing KVO
+            //（旧代码无条件 playbackDidBecomeActive()，一次旧 .playing 就能把刚发起的 seek 误杀）。
+            if let phase = seekPhase {
+                switch phase {
+                case .waitingForPlayback, .kickingPlayback:
+                    playbackDidBecomeActive()
+                case .initialSeek, .retrySeek, .waitingForReplacement, .rebuiltSeek:
+                    break
+                }
+            }
+            if !isSeekingInFlight {
+                isLoading = false
+            }
             // 真正出帧 → markPlaying（“正在解析播放线路…”由此消失）。
             if let url = lastURL, didMarkPlayingURL != url {
                 didMarkPlayingURL = url
@@ -556,7 +580,12 @@ final class CustomPlayerController: ObservableObject {
             // 这里每 0.25 秒扫一次也能发现，立刻走失败切线；handleItemFailure
             // 自带“同一 URL 只认一次” guard，重复调无害。
             if item.status == .failed {
-                handleItemFailure(item)
+                // Stage 2 重建的 item 也失败：seek 恢复已穷尽，终端失败，不再走切线。
+                if seekPhase == .waitingForReplacement {
+                    failSeek("Replacement item failed")
+                } else {
+                    handleItemFailure(item)
+                }
             }
             // 每 2 秒采一次 accessLog（8 次 × 0.25 秒）。
             accessLogSampleCount += 1
@@ -598,13 +627,19 @@ final class CustomPlayerController: ObservableObject {
     /// 账本：失败时把 AVPlayer 自身的 errorLog URI 与 accessLog 记下来
     ///（绕过判定与分层诊断用），先记日志、再报失败。
     private func handleItemFailure(_ item: AVPlayerItem?) {
+        // 拦截旧 item 的迟到失败回调；Stage 2 重建失败由 failSeek 接管，不误触发切线。
+        guard let item, item === currentItem else { return }
+        if seekPhase == .waitingForReplacement {
+            failSeek("Replacement item failed")
+            return
+        }
         guard let url = lastURL, didMarkFailedURL != url else { return }
         didMarkFailedURL = url
         // 账本：把 AVPlayer 自身的 errorLog/accessLog 记下来（绕过判定与分层诊断用）。
         // errorLog 的 URI 是 AVPlayer 实际请求失败的地址；accessLog 的 serverAddress
         // 说明实际连到了哪台 IP、有没有换过服务器。
-        let errorEvent = item?.errorLog()?.events.last
-        let accessEvent = item?.accessLog()?.events.last
+        let errorEvent = item.errorLog()?.events.last
+        let accessEvent = item.accessLog()?.events.last
         viewModel.recordPlayerLogs(
             errorURI: errorEvent?.uri,
             serverAddress: accessEvent?.serverAddress,
@@ -615,13 +650,18 @@ final class CustomPlayerController: ObservableObject {
             viewModel.markFailed("这条线路用了 FairPlay 加密（skd://），当前播放器不支持，请换一条线路")
             return
         }
-        let nsError = item?.error as NSError?
+        let nsError = item.error as NSError?
         if nsError?.code == -12881 {
             viewModel.markFailed("分片拉取失败（分片可能需要请求头，拦截器覆盖不了）", stage: .segmentFetch)
             return
         }
-        let detail = item?.error?.localizedDescription ?? "未知错误"
-        viewModel.markFailed("这条线路播放失败（\(detail)）")
+        // HTTP 状态码从 errorLog 取（404 这类 HTTP 失败 errorStatusCode 就是状态码，
+        // 非 HTTP 错误时为 0）；拿不到就退回拦截器记的最近一次失败状态码。
+        // 传给 markFailed 做 404 判定：404 不走同线引擎升级，直接切备用线。
+        let httpStatusCode = (errorEvent?.errorStatusCode).flatMap { $0 > 0 ? $0 : nil }
+            ?? viewModel.resourceLoader?.lastFailureStatusCode
+        let detail = item.error?.localizedDescription ?? "未知错误"
+        viewModel.markFailed("这条线路播放失败（\(detail)）", httpStatusCode: httpStatusCode, failedURL: url)
     }
 
     /// 播到片尾：停在 0:00（不循环、不续播），控制条常显，等用户再点播放。
@@ -649,28 +689,45 @@ final class CustomPlayerController: ObservableObject {
 
     /// 用户点暂停：只改意图并 pause，不取消在途 seek——seek 完成后
     /// completeSeek 按 live shouldPlay 决定不续播，seek 本身仍会落点。
+    /// 例外：seek 已落点、仅在等起播/踢活时，用户主动暂停直接收尾，
+    /// 不让看门狗在暂停态触发重建。
     func pauseByUser() {
         shouldPlay = false
         player.pause()
+        if let phase = seekPhase {
+            switch phase {
+            case .waitingForPlayback, .kickingPlayback:
+                invalidateSeekOperation()
+            case .initialSeek, .retrySeek, .waitingForReplacement, .rebuiltSeek:
+                break
+            }
+        }
         isLoading = false
         controlsVisible = true
     }
 
     /// 用户点播放：只改意图；seek 在途时不直接 play()，等 seek 完成时
     /// completeSeek 按 live shouldPlay 续播，避免 play 与 seek 抢跑。
+    /// 若此前因 failSeek 导致当前 item 处于 .failed，点播放时重建 item 恢复，避免永久死播。
     func playByUser() {
         shouldPlay = true
-        if !isSeekingInFlight && !isScrubbing {
+        if currentItem?.status == .failed, let url = lastURL {
+            let target = currentTime > 1 ? CMTime(seconds: currentTime, preferredTimescale: 600) : nil
+            let loader = (lastEngine == .nativeIntercepted) ? (activeResourceLoader ?? viewModel.resourceLoader) : nil
+            replaceItem(url, headers: lastHeaders, resumeAt: target, resourceLoader: loader)
+        } else if !isSeekingInFlight && !isScrubbing {
             player.play()
         }
         showControlsTemporarily()
     }
 
-    /// 1. 开始拖进度条：记录意图、作废旧 seek 操作、暂停播放器，但绝不发 seek。
+    /// 1. 开始拖进度条：记录意图、作废旧 seek 操作（含待恢复的重建定位）、暂停播放器，但绝不发 seek。
     func beginScrub() {
         isScrubbing = true
         wasPlayingBeforeScrub = shouldPlay
         invalidateSeekOperation()
+        pendingResumeAt = nil
+        pendingSeekRecoveryAttempt = nil
         stallKickTask?.cancel()
         hideTask?.cancel()
         controlsVisible = true
@@ -686,31 +743,44 @@ final class CustomPlayerController: ObservableObject {
 
     /// 3. 松手：发出唯一一次精确（±1s）seek，仅在 seek 完成且用户仍想播时 play()，
     /// 并挂前台 10 秒看门狗（Stage 1 取消并重 seek；Stage 2 重建 AVPlayerItem 刷新 CoreMedia/mediaserverd 状态）。
+    /// 若 item 仍在重建（.unknown）则更新 pendingResumeAt，等就绪后跳到最新目标，不丢用户操作；
+    /// item 已 .failed 则重建 item 到目标时间。
     func endScrub(to seconds: Double) {
         isScrubbing = false
         let resume = wasPlayingBeforeScrub
-        guard let item = currentItem, item.status == .readyToPlay, duration > 0 else {
-            if resume {
-                shouldPlay = true
-                player.play()
-            }
+        shouldPlay = resume
+        let clamped = duration > 0 ? min(max(seconds, 0), duration) : max(seconds, 0)
+        if duration > 0 {
+            currentTime = clamped
+        }
+        guard let item = currentItem, duration > 0 else {
+            if resume { player.play() }
             return
         }
-        let clamped = min(max(seconds, 0), duration)
-        currentTime = clamped
-        shouldPlay = resume
-        seekGeneration &+= 1
-        performExactSeek(
-            to: CMTime(seconds: clamped, preferredTimescale: 600),
-            shouldResume: resume,
-            attempt: 1,
-            phase: .initialSeek
-        )
+        let target = CMTime(seconds: clamped, preferredTimescale: 600)
+        switch item.status {
+        case .readyToPlay:
+            seekGeneration &+= 1
+            performExactSeek(to: target, shouldResume: resume, phase: .initialSeek)
+        case .unknown:
+            pendingResumeAt = target
+            pendingSeekRecoveryAttempt = nil
+            isLoading = true
+        case .failed:
+            if let url = lastURL {
+                let loader = (lastEngine == .nativeIntercepted) ? (activeResourceLoader ?? viewModel.resourceLoader) : nil
+                replaceItem(url, headers: lastHeaders, resumeAt: target, resourceLoader: loader)
+            }
+        @unknown default:
+            break
+        }
     }
 
     /// 执行单次串行精确 seek（±1s 容差 + 代际号/阶段令牌防旧回调 + 前台 10 秒两阶段看门狗）。
     /// 单一 seek 入口：除片尾复位外，所有 AVPlayer.seek 都走这里。
-    private func performExactSeek(to targetTime: CMTime, shouldResume: Bool, attempt: Int, phase: SeekPhase) {
+    /// 另起一个 5 秒兜底 Task：seek 回调 5 秒不回（CoreMedia 卡住）就强制 completeSeek，
+    /// 由 waitingForPlayback 的 10 秒看门狗继续接管恢复链；completeSeek 里取消它。
+    private func performExactSeek(to targetTime: CMTime, shouldResume: Bool, phase: SeekPhase) {
         let operation = seekGeneration
         seekPhaseToken &+= 1
         let token = seekPhaseToken
@@ -722,7 +792,19 @@ final class CustomPlayerController: ObservableObject {
 
         player.currentItem?.cancelPendingSeeks()
 
-        startSeekWatchdog(operation: operation, token: token)
+        startSeekWatchdog(operation: operation, token: token, timeout: Self.seekTimeoutSeconds)
+
+        seekCompleteFallbackTask?.cancel()
+        seekCompleteFallbackTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            guard self.seekGeneration == operation,
+                  self.seekPhaseToken == token,
+                  self.isSeekingInFlight,
+                  self.seekPhase == phase,
+                  !self.isScrubbing else { return }
+            self.completeSeek(operation: operation, fromPhase: phase)
+        }
 
         let tolerance = CMTime(seconds: Self.seekToleranceSeconds, preferredTimescale: 600)
         player.seek(to: targetTime, toleranceBefore: tolerance, toleranceAfter: tolerance) { [weak self] finished in
@@ -734,7 +816,7 @@ final class CustomPlayerController: ObservableObject {
                       self.seekPhase == phase,
                       !self.isScrubbing else { return }
                 if finished {
-                    self.completeSeek()
+                    self.completeSeek(operation: operation, fromPhase: phase)
                 } else {
                     self.advanceSeekRecovery(operation: operation, phase: phase, reason: "Seek completion returned false")
                 }
@@ -743,10 +825,12 @@ final class CustomPlayerController: ObservableObject {
     }
 
     /// 一次精确 seek 成功落点：上报实际落点时间；播不播以 live shouldPlay 为准
-    /// （用户在 seek 中途点暂停/播放都以最新意图为准）。
-    /// 播的话继续挂着看门狗，直到 timeControlStatus 真正进入 .playing 才由
-    /// playbackDidBecomeActive() 解除——play() 后若卡在 waiting，看门狗 10 秒后兜底。
-    private func completeSeek() {
+    ///（用户在 seek 中途点暂停/播放都以最新意图为准）。
+    /// 若用户仍想播，切到 .waitingForPlayback 并保持看门狗运行直到 timeControlStatus
+    /// 真正进入 .playing（play() 后若卡在 waiting，看门狗 10 秒后按阶段升级兜底）。
+    private func completeSeek(operation: UInt64, fromPhase: SeekPhase) {
+        seekCompleteFallbackTask?.cancel()
+        seekCompleteFallbackTask = nil
         let actual = player.currentTime()
         if actual.isNumeric {
             currentTime = actual.seconds
@@ -754,8 +838,23 @@ final class CustomPlayerController: ObservableObject {
             currentTime = seekTarget.seconds
         }
         if shouldPlay && !isScrubbing {
+            let attempt: Int
+            switch fromPhase {
+            case .rebuiltSeek: attempt = 3
+            case .retrySeek: attempt = 2
+            default: attempt = 1
+            }
+            seekPhaseToken &+= 1
+            let token = seekPhaseToken
+            seekPhase = .waitingForPlayback(attempt: attempt)
+            isSeekingInFlight = true
+            isLoading = true
             player.play()
-            // 不在此处取消看门狗：继续等到 timeControlStatus 真正进入 .playing。
+            if player.timeControlStatus == .playing {
+                playbackDidBecomeActive()
+            } else {
+                startSeekWatchdog(operation: operation, token: token, timeout: Self.seekTimeoutSeconds)
+            }
         } else {
             isSeekingInFlight = false
             seekPhase = nil
@@ -768,6 +867,7 @@ final class CustomPlayerController: ObservableObject {
     private func playbackDidBecomeActive() {
         isSeekingInFlight = false
         seekPhase = nil
+        isLoading = false
         stopSeekWatchdog()
     }
 
@@ -776,6 +876,8 @@ final class CustomPlayerController: ObservableObject {
     private func invalidateSeekOperation() {
         seekGeneration &+= 1
         seekPhaseToken &+= 1
+        seekCompleteFallbackTask?.cancel()
+        seekCompleteFallbackTask = nil
         stopSeekWatchdog()
         player.currentItem?.cancelPendingSeeks()
         isSeekingInFlight = false
@@ -783,7 +885,8 @@ final class CustomPlayerController: ObservableObject {
     }
 
     /// 两阶段 seek 卡死恢复（每阶段限一次）：
-    /// Stage 1（初次 10s 超时）：目标时间已在缓冲内先 playImmediately 踢活，再重发一次精确 seek；
+    /// Stage 1（初次 10s 超时）：目标时间已在缓冲内先 playImmediately 踢活，
+    /// 给 2.5 秒异步观察窗（绝不紧接着同步重 seek 把踢活打断），再重发一次精确 seek；
     /// Stage 2（重试 10s 超时）：重建 AVPlayerItem（等价于切后台再回前台，清空卡死的 CoreMedia 队列与 mediaserverd 连接），就绪后定位到目标时间；
     /// 终端（重建后 seek 仍失败，或重建 item 未就绪）：停播并报 DEBUG，不再无限循环。
     private func advanceSeekRecovery(operation: UInt64, phase: SeekPhase, reason: String) {
@@ -792,16 +895,25 @@ final class CustomPlayerController: ObservableObject {
               seekPhase == phase else { return }
         stopSeekWatchdog()
         switch phase {
-        case .initialSeek:
+        case .initialSeek, .waitingForPlayback(attempt: 1):
+            // 若目标已在缓冲内，先 playImmediately 踢活并给 2.5s 异步观察窗，
+            // 绝不紧接着同步重 seek 把踢活打断。
             if seekShouldResume && shouldPlay && isTimeBuffered(seekTarget) {
+                seekPhaseToken &+= 1
+                let token = seekPhaseToken
+                seekPhase = .kickingPlayback
                 player.playImmediately(atRate: 1.0)
                 if player.timeControlStatus == .playing {
                     playbackDidBecomeActive()
-                    return
+                } else {
+                    startSeekWatchdog(operation: operation, token: token, timeout: Self.seekKickGraceSeconds)
                 }
+                return
             }
-            performExactSeek(to: seekTarget, shouldResume: seekShouldResume, attempt: 2, phase: .retrySeek)
-        case .retrySeek:
+            performExactSeek(to: seekTarget, shouldResume: shouldPlay, phase: .retrySeek)
+        case .kickingPlayback:
+            performExactSeek(to: seekTarget, shouldResume: shouldPlay, phase: .retrySeek)
+        case .retrySeek, .waitingForPlayback(attempt: 2):
             guard let url = lastURL else {
                 failSeek("Seek stalled and no URL to rebuild: \(reason)")
                 return
@@ -819,10 +931,10 @@ final class CustomPlayerController: ObservableObject {
                 preserveSeekRecovery: true
             )
             // 重建 item 的就绪窗口也用前台 10 秒看门狗兜底。
-            startSeekWatchdog(operation: operation, token: token)
+            startSeekWatchdog(operation: operation, token: token, timeout: Self.seekTimeoutSeconds)
         case .waitingForReplacement:
             failSeek("Replacement item did not become ready: \(reason)")
-        case .rebuiltSeek:
+        case .rebuiltSeek, .waitingForPlayback(attempt: 3):
             failSeek("Seek failed after item rebuild: \(reason)")
         }
     }
@@ -830,6 +942,8 @@ final class CustomPlayerController: ObservableObject {
     /// Seek 终端失败：停看门狗、取消待处理 seek、停播、清意图，不再重试。
     /// 原因只打 DEBUG 日志（不弹用户可见报错，用户点播放可重试）。
     private func failSeek(_ reason: String) {
+        seekCompleteFallbackTask?.cancel()
+        seekCompleteFallbackTask = nil
         stopSeekWatchdog()
         player.currentItem?.cancelPendingSeeks()
         player.pause()
@@ -837,6 +951,8 @@ final class CustomPlayerController: ObservableObject {
         isScrubbing = false
         shouldPlay = false
         seekPhase = nil
+        pendingResumeAt = nil
+        pendingSeekRecoveryAttempt = nil
         seekGeneration &+= 1
         seekPhaseToken &+= 1
         isLoading = false
@@ -852,9 +968,9 @@ final class CustomPlayerController: ObservableObject {
 
     // MARK: - Seek 看门狗（只在前台计时）
 
-    private func startSeekWatchdog(operation: UInt64, token: UInt64) {
+    private func startSeekWatchdog(operation: UInt64, token: UInt64, timeout: TimeInterval) {
         stopSeekWatchdog()
-        seekWatchdogRemaining = Self.seekTimeoutSeconds
+        seekWatchdogRemaining = timeout
         scheduleSeekWatchdog(operation: operation, token: token)
     }
 
@@ -923,9 +1039,11 @@ final class CustomPlayerController: ObservableObject {
     }
 
     /// 回前台：seek 还在途就按剩余秒数续计看门狗。
+    /// 给回前台后的网络/解码器至少 3 秒苏醒宽限，避免 0.1 秒剩余时间立刻误触发重建。
     private func seekApplicationDidBecomeActive() {
         seekAppIsActive = true
         guard isSeekingInFlight, seekPhase != nil else { return }
+        seekWatchdogRemaining = max(seekWatchdogRemaining, Self.foregroundResumeMinGraceSeconds)
         scheduleSeekWatchdog(operation: seekGeneration, token: seekPhaseToken)
     }
 
@@ -1167,8 +1285,12 @@ final class FullscreenPlayerViewController: UIViewController {
 enum FullscreenPlayerPresenter {
     @MainActor
     static func present(player: AVPlayer, controller: CustomPlayerController, viewModel: PlayerViewModel, onExit: @escaping () -> Void) {
-        guard let top = topViewController() else { return }
-        if top is FullscreenPlayerViewController { return }
+        guard let top = topViewController(), !(top is FullscreenPlayerViewController) else {
+            // 拿不到顶层控制器、或已经在全屏里：直接调 onExit，
+            // 不然 controller.isFullscreen 一直 true、再也退不出来。
+            onExit()
+            return
+        }
         let vc = FullscreenPlayerViewController(player: player, controller: controller, viewModel: viewModel, onExit: onExit)
         top.present(vc, animated: true, completion: nil)
     }

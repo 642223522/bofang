@@ -10,7 +10,7 @@ import WebKit
 /// 不强制 IPv4（NAT64 安全），不改 UA、不注脚本、不碰挑战流程，只观测。
 /// 每个子探针都有超时；整轮跑在后台 Task 里，取消即停、结果分段回填 UI。
 /// 调用方在 DiagnosticsView（检测 Tab）里起 Task 跑它，onLine 每出一行就刷新列表。
-final class StagedNetworkProbe: NSObject, URLSessionDataDelegate {
+final class StagedNetworkProbe: NSObject {
 
     /// 一行探针结果（UI 直接展示）。
     struct ProbeLine: Identifiable {
@@ -49,11 +49,6 @@ final class StagedNetworkProbe: NSObject, URLSessionDataDelegate {
     /// 探针只在后台 Task 里跑，onLine 在各子探针的回调线程上触发。
     var onLine: ((ProbeLine) -> Void)?
 
-    /// 当前 URLSession 探针的 label（didFinishCollecting 收到 metrics 时
-    /// 归属到这一行；探针是串行跑的，一个时刻只有一个在途）。
-    private let metricsLock = NSLock()
-    private var currentMetricsLabel = ""
-
     private func emit(_ line: ProbeLine) {
         onLine?(line)
     }
@@ -69,8 +64,8 @@ final class StagedNetworkProbe: NSObject, URLSessionDataDelegate {
             if Task.isCancelled { return }
             emit(ProbeLine(stage: .info, label: "HOST", detail: host, ok: nil))
 
-            // 1. 系统 DNS（阻塞式 getaddrinfo；调用方已把它放在后台 Task 里）。
-            let sys = resolveSystemDNS(host: host)
+            // 1. 系统 DNS（异步 getaddrinfo，可取消、5 秒超时，不卡死 Swift 并发池）。
+            let sys = await resolveSystemDNS(host: host)
             emit(ProbeLine(
                 stage: .dns,
                 label: "DNS[System]",
@@ -126,40 +121,77 @@ final class StagedNetworkProbe: NSObject, URLSessionDataDelegate {
     }
 
     // MARK: - 1. System DNS with timing
-    private func resolveSystemDNS(host: String) -> (latencyMs: Int, v4: [String], v6: [String]) {
+    /// 可取消、带 5s 超时的系统 DNS 解析（不卡死 Swift 并发池）：
+    /// getaddrinfo 是同步阻塞调用，放后台全局队列跑；5 秒没回就按空结果收尾，
+    /// 取消时也一样收尾（不留挂起的 continuation）。
+    private func resolveSystemDNS(host: String) async -> (latencyMs: Int, v4: [String], v6: [String]) {
         let start = CFAbsoluteTimeGetCurrent()
-        var hints = addrinfo(
-            ai_flags: 0, ai_family: AF_UNSPEC, ai_socktype: SOCK_STREAM,
-            ai_protocol: 0, ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil
-        )
-        var res: UnsafeMutablePointer<addrinfo>?
-        guard getaddrinfo(host, nil, &hints, &res) == 0, let first = res else {
-            return (Int((CFAbsoluteTimeGetCurrent() - start) * 1000), [], [])
+        final class DNSBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var cont: CheckedContinuation<(Int, [String], [String]), Never>?
+            private var done = false
+            func set(_ c: CheckedContinuation<(Int, [String], [String]), Never>) {
+                lock.lock(); defer { lock.unlock() }
+                if done { c.resume(returning: (0, [], [])) } else { cont = c }
+            }
+            func finish(_ val: (Int, [String], [String])) {
+                lock.lock()
+                guard !done else { lock.unlock(); return }
+                done = true
+                let c = cont; cont = nil
+                lock.unlock()
+                c?.resume(returning: val)
+            }
         }
-        defer { freeaddrinfo(res) }
-
-        var v4: [String] = []
-        var v6: [String] = []
-        var ptr: UnsafeMutablePointer<addrinfo>? = first
-        while let cur = ptr {
-            if cur.pointee.ai_family == AF_INET, let addr = cur.pointee.ai_addr {
-                var s = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
-                var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-                if inet_ntop(AF_INET, &s, &buf, socklen_t(INET_ADDRSTRLEN)) != nil {
-                    let ip = String(cString: buf)
-                    if !v4.contains(ip) { v4.append(ip) }
+        let box = DNSBox()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { cont in
+                box.set(cont)
+                if Task.isCancelled {
+                    box.finish((Int((CFAbsoluteTimeGetCurrent() - start) * 1000), [], []))
+                    return
                 }
-            } else if cur.pointee.ai_family == AF_INET6, let addr = cur.pointee.ai_addr {
-                var s6 = addr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee.sin6_addr }
-                var buf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
-                if inet_ntop(AF_INET6, &s6, &buf, socklen_t(INET6_ADDRSTRLEN)) != nil {
-                    let ip = String(cString: buf)
-                    if !v6.contains(ip) { v6.append(ip) }
+                DispatchQueue.global(qos: .utility).async {
+                    var hints = addrinfo(
+                        ai_flags: 0, ai_family: AF_UNSPEC, ai_socktype: SOCK_STREAM,
+                        ai_protocol: 0, ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil
+                    )
+                    var res: UnsafeMutablePointer<addrinfo>?
+                    guard getaddrinfo(host, nil, &hints, &res) == 0, let first = res else {
+                        box.finish((Int((CFAbsoluteTimeGetCurrent() - start) * 1000), [], []))
+                        return
+                    }
+                    defer { freeaddrinfo(res) }
+                    var v4: [String] = []
+                    var v6: [String] = []
+                    var ptr: UnsafeMutablePointer<addrinfo>? = first
+                    while let cur = ptr {
+                        if cur.pointee.ai_family == AF_INET, let addr = cur.pointee.ai_addr {
+                            var s = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+                            var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                            if inet_ntop(AF_INET, &s, &buf, socklen_t(INET_ADDRSTRLEN)) != nil {
+                                let ip = String(cString: buf)
+                                if !v4.contains(ip) { v4.append(ip) }
+                            }
+                        } else if cur.pointee.ai_family == AF_INET6, let addr = cur.pointee.ai_addr {
+                            var s6 = addr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee.sin6_addr }
+                            var buf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+                            if inet_ntop(AF_INET6, &s6, &buf, socklen_t(INET6_ADDRSTRLEN)) != nil {
+                                let ip = String(cString: buf)
+                                if !v6.contains(ip) { v6.append(ip) }
+                            }
+                        }
+                        ptr = cur.pointee.ai_next
+                    }
+                    box.finish((Int((CFAbsoluteTimeGetCurrent() - start) * 1000), v4, v6))
+                }
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) {
+                    box.finish((Int((CFAbsoluteTimeGetCurrent() - start) * 1000), [], []))
                 }
             }
-            ptr = cur.pointee.ai_next
+        } onCancel: {
+            box.finish((Int((CFAbsoluteTimeGetCurrent() - start) * 1000), [], []))
         }
-        return (Int((CFAbsoluteTimeGetCurrent() - start) * 1000), v4, v6)
     }
 
     // MARK: - 1b. IP-Literal DoH Query (A / AAAA / HTTPS=65)
@@ -264,7 +296,12 @@ final class StagedNetworkProbe: NSObject, URLSessionDataDelegate {
                         }
                     case .failed(let err):
                         stageHistory.append("failed(\(err))@\(ms)ms")
-                        finish("FAILED(\(err))")
+                        // TLS 失败单独打标记：最终按 .tls 归类，不再跟 TCP 失败混在一起。
+                        if case .tls = err {
+                            finish("FAILED_TLS(\(err))")
+                        } else {
+                            finish("FAILED(\(err))")
+                        }
                     default:
                         break
                     }
@@ -284,29 +321,49 @@ final class StagedNetworkProbe: NSObject, URLSessionDataDelegate {
         if summary.contains("CANCELLED") {
             return ProbeLine(stage: .info, label: "NW[\(label)]", detail: summary, ok: false)
         }
+        if summary.contains("FAILED_TLS") {
+            return ProbeLine(stage: .tls, label: "NW[\(label)]", detail: summary, ok: false)
+        }
         return ProbeLine(stage: .tcp, label: "NW[\(label)]", detail: summary, ok: false)
     }
 
     // MARK: - 3. Staged URLSession Probe (Default vs H3 Disabled)
+    /// 每请求一个 metrics delegate：label 跟着这次请求走，不再用共享
+    /// currentMetricsLabel（串行探针也可能被取消/重入，共享 label 会张冠李戴）。
+    private final class ProbeMetricsDelegate: NSObject, URLSessionDataDelegate {
+        let label: String
+        weak var probe: StagedNetworkProbe?
+
+        init(label: String, probe: StagedNetworkProbe) {
+            self.label = label
+            self.probe = probe
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+            guard let probe else { return }
+            for m in metrics.transactionMetrics {
+                let d = { (a: Date?, b: Date?) -> String in
+                    guard let a, let b else { return "nil" }
+                    return "\(Int(b.timeIntervalSince(a) * 1000))ms"
+                }
+                let detail = "proto=\(m.networkProtocolName ?? "nil") remote=\(m.remoteAddress ?? "nil"):\(m.remotePort ?? 0) DNS=\(d(m.domainLookupStartDate, m.domainLookupEndDate)) TCP=\(d(m.connectStartDate, m.connectEndDate)) TLS=\(d(m.secureConnectionStartDate, m.secureConnectionEndDate)) TTFB=\(d(m.requestStartDate, m.responseStartDate))"
+                probe.emit(ProbeLine(stage: .tcp, label: "[Metrics \(label)]", detail: detail, ok: nil))
+            }
+        }
+    }
+
     private func probeURLSession(url: URL, ua: String?, referer: String?, allowH3: Bool, label: String) async -> ProbeLine {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 12
         cfg.timeoutIntervalForResource = 12
-        let session = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
+        let metricsDelegate = ProbeMetricsDelegate(label: label, probe: self)
+        let session = URLSession(configuration: cfg, delegate: metricsDelegate, delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
 
         var req = URLRequest(url: url)
         req.assumesHTTP3Capable = allowH3
-        if !allowH3 {
-            // Prevents optimistic H3 upgrade; note cached Alt-Svc is empty on ephemeral config.
-            req.setValue("close", forHTTPHeaderField: "Connection")
-        }
         if let ua { req.setValue(ua, forHTTPHeaderField: "User-Agent") }
         if let referer { req.setValue(referer, forHTTPHeaderField: "Referer") }
-
-        metricsLock.lock()
-        currentMetricsLabel = label
-        metricsLock.unlock()
 
         let start = CFAbsoluteTimeGetCurrent()
         do {
@@ -333,27 +390,13 @@ final class StagedNetworkProbe: NSObject, URLSessionDataDelegate {
         }
     }
 
-    /// URLSession metrics 明细（DNS/TCP/TLS/TTFB 分段耗时）：探针的 delegate 回调，
-    /// 每条请求收完就以单独一行发出（归属到当前 probeURLSession 的 label）。
-    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
-        metricsLock.lock()
-        let label = currentMetricsLabel
-        metricsLock.unlock()
-        for m in metrics.transactionMetrics {
-            let d = { (a: Date?, b: Date?) -> String in
-                guard let a, let b else { return "nil" }
-                return "\(Int(b.timeIntervalSince(a) * 1000))ms"
-            }
-            let detail = "proto=\(m.networkProtocolName ?? "nil") remote=\(m.remoteAddress ?? "nil"):\(m.remotePort ?? 0) DNS=\(d(m.domainLookupStartDate, m.domainLookupEndDate)) TCP=\(d(m.connectStartDate, m.connectEndDate)) TLS=\(d(m.secureConnectionStartDate, m.secureConnectionEndDate)) TTFB=\(d(m.requestStartDate, m.responseStartDate))"
-            emit(ProbeLine(stage: .tcp, label: "[Metrics \(label)]", detail: detail, ok: nil))
-        }
-    }
-
     // MARK: - 4. Clean WKWebView Probe (Zero UA spoofing, zero script injection)
     @MainActor
     private func probeCleanWKWebView(url: URL) async -> ProbeLine {
         let cfg = WKWebViewConfiguration()
-        cfg.websiteDataStore = .default()
+        // 不用 .default() 持久 store：探针的 cookie/缓存不污染正常浏览，
+        // 也不让上次探针的 CF 状态影响这次结果。
+        cfg.websiteDataStore = .nonPersistent()
         let wv = WKWebView(frame: .zero, configuration: cfg)
         wv.customUserAgent = nil
 
@@ -394,7 +437,12 @@ final class StagedNetworkProbe: NSObject, URLSessionDataDelegate {
                 }
             }
         } onCancel: {
-            Task { @MainActor in loader.finish("CANCELLED") }
+            // 取消即停加载，不只 finish：不调 stopLoading 的话 WebView 还在后台
+            // 跑，下一轮探针的结果会跟这轮的串在一起。
+            Task { @MainActor in
+                wv.stopLoading()
+                loader.finish("CANCELLED")
+            }
         }
         let ok = result.hasPrefix("LOADED")
         return ProbeLine(stage: .webview, label: "WKWebView[Clean]", detail: result, ok: ok)

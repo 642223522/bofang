@@ -48,13 +48,15 @@ enum AdBlockRules {
 
     /// 生成 WKContentRuleList 的 JSON。url-filter 是正则，匹配完整 URL；
     /// 只拦 third-party + 脚本/图片/样式/字体/子文档这几类资源。
+    /// 正则同时匹配 apex 域（如 https://popads.net/...）与子域
+    ///（旧版 ".*\\." + escaped 要求前面必须有个点，apex 域漏拦）。
     static func rulesJSON(forSiteHost host: String) -> String {
         let domains = baseAdDomains + extraDomains(forSiteHost: host)
         let rules: [[String: Any]] = domains.map { domain in
             let escaped = domain.replacingOccurrences(of: ".", with: "\\.")
             return [
                 "trigger": [
-                    "url-filter": ".*\\." + escaped + ".*",
+                    "url-filter": "^https?://([^/]+\\.)?" + escaped + "([:/]|$)",
                     "load-type": ["third-party"],
                     "resource-type": ["script", "image", "style-sheet", "font", "subdocument"]
                 ],
@@ -82,6 +84,8 @@ enum AdBlockRuleStore {
     /// 堵 reloadWithoutRules 与异步编译的竞态；不传则默认装）。
     static func install(into controller: WKUserContentController, siteHost: String, shouldInstall: (() -> Bool)? = nil) {
         if let list = cached {
+            // 缓存命中也要尊重 shouldInstall：CF 兜底关规则后才编完的规则不能再装回去。
+            if let shouldInstall, !shouldInstall() { return }
             controller.add(list)
             return
         }
@@ -113,9 +117,11 @@ enum AdBlockRuleStore {
 
 /// 广告 DOM 清理脚本（document-start 注入，主框架 + 子框架都跑）。
 /// 两阶段：每轮先查有没有 Cloudflare 验证在跑（标题 "Just a moment"、
-/// 挑战 iframe、cf- 标记），有就跳过这轮、什么都不碰；验证过了才删广告。
-/// 删什么：① 文本命中的广告卡片（录屏里那种 "Your Next Adventure Starts Here!"
-/// 旅行卡）；② 类名/id 带广告标记的元素；③ src 落在广告域的 iframe
+/// 挑战 iframe、cf- 标记，含中文标题“请稍候/正在验证/您是真人吗”），有就跳过这轮、什么都不碰；验证过了才删广告。
+/// 删什么：① 假 Download 按钮/弹窗（playmogo 常见悬浮下载框）；
+/// ② 覆盖在 <video> 上方的高 z-index 透明点击劫持层（绝不碰 <video> 及其祖先容器与播放器控制条）；
+/// ③ 文本命中的广告卡片（录屏里那种 "Your Next Adventure Starts Here!" 旅行卡）；
+/// ④ 类名/id 带广告标记的元素；⑤ src 落在广告域的 iframe
 /// （视频播放器本身在 iframe 里，只按域名删，不碰别的 iframe）。
 /// 另：所有 video 元素都打上 playsinline，让嵌页视频在页内播、
 /// 走我们的外层控制条，而不是一播就跳系统全屏播放器。
@@ -127,15 +133,24 @@ enum AdStripScript {
         'popads.net','popcash.net','adcash.com','propellerads.com','adsterra.com',
         'hilltopads.com','clickadu.com','amazon-adsystem.com','moatads.com'];
       var AD_TEXTS = ['Your Next Adventure', 'Starts Here!', 'Discover amazing attractions'];
+      var FAKE_DL_RE = /^(fast\\s*)?(free\\s*)?download(\\s*(now|hd|video|app|file|here|free))*\\s*$/i;
+      var FAKE_DL_TEXTS = ['高速下载', '立即下载', '免费下载', '下载视频', '极速下载'];
       function cfRunning(){
         try {
           var t = (document.title || '').toLowerCase();
           if (t.indexOf('just a moment') >= 0) return true;
           if (t.indexOf('checking your browser') >= 0) return true;
+          if (t.indexOf('请稍候') >= 0) return true;
+          if (t.indexOf('正在验证') >= 0) return true;
+          if (t.indexOf('您是真人吗') >= 0) return true;
           if (document.querySelector('iframe[src*="challenges.cloudflare.com"]')) return true;
+          if (document.querySelector('iframe[src*="turnstile"]')) return true;
           if (document.querySelector('[id*="cf-"], [class*="cf-challenge"], [class*="challenge-running"], [class*="turnstile"]')) return true;
         } catch(e){}
         return false;
+      }
+      function hasVideoInside(el){
+        return el && (el.tagName === 'VIDEO' || (el.querySelector && el.querySelector('video')));
       }
       function isAdSrc(u){
         if (!u) return false;
@@ -145,32 +160,87 @@ enum AdStripScript {
         }
         return false;
       }
+      function isFakeDownloadLabel(label){
+        var s = (label || '').trim();
+        if (s.length === 0 || s.length > 28) return false;
+        if (FAKE_DL_RE.test(s)) return true;
+        for (var i = 0; i < FAKE_DL_TEXTS.length; i++) {
+          if (s === FAKE_DL_TEXTS[i]) return true;
+        }
+        return false;
+      }
       function hideEl(el){
-        try { el.style.setProperty('display', 'none', 'important'); } catch(e){}
+        try {
+          el.style.setProperty('display', 'none', 'important');
+          el.style.setProperty('pointer-events', 'none', 'important');
+        } catch(e){}
       }
       function stripOnce(){
         if (cfRunning()) return;
         try {
-          // 文本命中的广告卡片：往上找带关闭按钮/卡片样的容器一起藏（最多 4 层）。
+          // 1. 假 Download 按钮/弹窗（playmogo 常见悬浮下载框）：往上找
+          // fixed/absolute 定位的弹窗容器一起藏（最多 3 层），绝不碰含 video 的祖先。
+          var clickables = document.querySelectorAll('a, button, div[role="button"]');
+          for (var d = 0; d < clickables.length; d++) {
+            var c = clickables[d];
+            if (hasVideoInside(c)) continue;
+            var label = (c.innerText || c.textContent || '').trim();
+            if (isFakeDownloadLabel(label)) {
+              var box = c;
+              for (var up = 0; up < 3 && box.parentElement; up++) {
+                var p = box.parentElement;
+                if (hasVideoInside(p)) break;
+                var ps = getComputedStyle(p);
+                if (ps.position === 'fixed' || ps.position === 'absolute') { box = p; }
+              }
+              hideEl(box);
+            }
+          }
+          // 2. 覆盖在视频上的透明点击劫持层（不碰 video 及常见播放器控制条）。
+          var vw = window.innerWidth || 0, vh = window.innerHeight || 0;
+          if (vw > 0 && vh > 0 && document.querySelector('video')) {
+            var overlays = document.querySelectorAll('div, a');
+            for (var o = 0; o < overlays.length; o++) {
+              var ov = overlays[o];
+              if (hasVideoInside(ov)) continue;
+              var cls = String(ov.className || '').toLowerCase();
+              if (cls.indexOf('plyr') >= 0 || cls.indexOf('vjs') >= 0 || cls.indexOf('player') >= 0 || cls.indexOf('control') >= 0) continue;
+              var st = getComputedStyle(ov);
+              if (st.position !== 'fixed' && st.position !== 'absolute') continue;
+              var z = parseInt(st.zIndex, 10);
+              if (!isFinite(z) || z < 100) continue;
+              var rect = ov.getBoundingClientRect();
+              if (rect.width >= vw * 0.5 && rect.height >= vh * 0.5) {
+                var txtLen = (ov.innerText || '').trim().length;
+                if (ov.tagName === 'A' || txtLen === 0 || isFakeDownloadLabel(ov.innerText || '')) {
+                  hideEl(ov);
+                }
+              }
+            }
+          }
+          // 3. 文本命中的广告卡片：往上找带关闭按钮/卡片样的容器一起藏（最多 4 层）。
           var all = document.querySelectorAll('div, section, aside, article');
           for (var i = 0; i < all.length; i++) {
             var el = all[i];
+            if (hasVideoInside(el)) continue;
             var txt = el.textContent || '';
             for (var k = 0; k < AD_TEXTS.length; k++) {
               if (txt.indexOf(AD_TEXTS[k]) >= 0 && txt.length < 500) {
                 var node = el;
-                for (var up = 0; up < 4 && node; up++) {
+                for (var up2 = 0; up2 < 4 && node; up2++) {
+                  if (hasVideoInside(node)) break;
                   if (node.querySelector && node.querySelector('[aria-label*="lose" i], [class*="close" i], [id*="close" i]')) { hideEl(node); break; }
                   node = node.parentElement;
                 }
-                if (up >= 4) hideEl(el);
+                if (up2 >= 4) hideEl(el);
                 break;
               }
             }
           }
-          // 类名/id 带广告标记的元素（不碰 video、播放器、CF）。
+          // 4. 类名/id 带广告标记的元素（不碰 video、播放器、CF）。
           var ads = document.querySelectorAll('[id*="ad-"], [id*="-ad-"], [class*="ad-banner"], [class*="ad-popup"], [class*="advertisement"], [class*="ads-container"], [class*="popunder"], [class*="overlay-ad"]');
           for (var j = 0; j < ads.length; j++) {
+            if (hasVideoInside(ads[j])) continue;
             var a = ads[j];
             if (a.tagName === 'VIDEO' || a.querySelector('video')) continue;
             hideEl(a);
@@ -205,9 +275,9 @@ enum AdStripScript {
 /// 探不到 video（跨域 iframe、还没加载出 video）时 hasVideo=false，外层只显示状态文案。
 /// 嵌页自己的播放控制不动（页内播放器照常用）；外层底条只是多一套统一外观的操作入口。
 /// 底条显隐也放这里管（@MainActor 类，Task 写起来安全；View struct 里写 Task 容易踩并发坑）。
-/// 另管 CF 卡死兜底：标题已明确是质询页（"Just a moment" / "Checking your browser"）
-/// 就立即关掉内容规则、重载一次，不等 25 秒探针超时；标题之外的质询信号
-/// （挑战 iframe / cf- 标记）仍走 25 秒兜底。只重载一次。
+/// 另管 CF 卡死兜底：所有质询信号（标题 "Just a moment"、挑战 iframe、
+/// cf- 标记、turnstile）统一等 12 秒，让挑战 JS 自己完成；12 秒还没出
+/// video 才关规则重载一次。只重载一次。
 /// challengeRunning：质询在跑且还没出 video 时为 true，WebViewPlayerView 用它
 /// 盖一层原生 Loading 遮罩（WebView 本身保持全尺寸在屏，只盖住不隐藏，
 /// 否则质询会判 headless 无限刷新）。
@@ -238,6 +308,12 @@ final class EmbedProbeState: ObservableObject {
     private var hideTask: Task<Void, Never>?
     private var wasPaused = true
     private var isScrubbing = false
+    /// 拖进度条松手后 1.2 秒内探针不回写 currentTime（页内 video 还没 seek 完，
+    /// 回写会把用户刚拖到的时间又 snap 回旧时间）。
+    private var scrubLockUntil = Date.distantPast
+    /// video 卡在 0:00 且暂停的首见时间；2 秒后只踢一次 play()。
+    private var zeroVideoSeenAt: Date?
+    private var didNudgeZeroPlay = false
     /// CF 挑战第一次被看到的时间；challengeReloaded=true 表示兜底已用过一次。
     private var challengeSince: Date?
     private var challengeReloaded = false
@@ -259,6 +335,9 @@ final class EmbedProbeState: ObservableObject {
         hideTask?.cancel()
         hideTask = nil
         isScrubbing = false
+        scrubLockUntil = .distantPast
+        didNudgeZeroPlay = false
+        zeroVideoSeenAt = nil
         challengeRunning = false
         challengeReloaded = false
         challengeSince = nil
@@ -281,9 +360,11 @@ final class EmbedProbeState: ObservableObject {
               var cfTitle = false;
               try {
                 var t = (document.title || '').toLowerCase();
-                if (t.indexOf('just a moment') >= 0 || t.indexOf('checking your browser') >= 0) { cf = true; cfTitle = true; }
+                if (t.indexOf('just a moment') >= 0 || t.indexOf('checking your browser') >= 0
+                    || t.indexOf('请稍候') >= 0 || t.indexOf('正在验证') >= 0 || t.indexOf('您是真人吗') >= 0) { cf = true; cfTitle = true; }
                 if (document.querySelector('iframe[src*="challenges.cloudflare.com"]')) cf = true;
-                if (document.querySelector('[id*="cf-"], [class*="cf-challenge"], [class*="challenge-running"]')) cf = true;
+                if (document.querySelector('iframe[src*="turnstile"]')) cf = true;
+                if (document.querySelector('[id*="cf-"], [class*="cf-challenge"], [class*="challenge-running"], [class*="turnstile"]')) cf = true;
               } catch(e){}
               if (!v) return JSON.stringify({cf: cf, cfTitle: cfTitle});
               return JSON.stringify({t: v.currentTime, d: v.duration, p: v.paused, cf: cf, cfTitle: cfTitle});
@@ -297,22 +378,17 @@ final class EmbedProbeState: ObservableObject {
                 self.hasVideo = false
                 return
             }
-            // CF 质询处理：标题已明确是质询页就立即关规则重载一次，不等 25 秒；
-            // 标题之外的质询信号（挑战 iframe / cf- 标记）仍走 25 秒兜底。只重载一次。
+            // CF 质询处理：所有质询信号统一等 12 秒，让挑战 JS 自己完成
+            //（iframe 里的勾选框我们点不到，立即 reload 会破坏挑战会话）；
+            // 12 秒还没出 video 才关规则重载一次。只重载一次。
             let cfRunning = (json["cf"] as? Bool) ?? false
-            let cfTitle = (json["cfTitle"] as? Bool) ?? false
             if cfRunning && !self.hasVideo {
-                if cfTitle && !self.challengeReloaded {
+                if self.challengeSince == nil { self.challengeSince = Date() }
+                if let since = self.challengeSince,
+                   !self.challengeReloaded,
+                   Date().timeIntervalSince(since) >= 12 {
                     self.challengeReloaded = true
-                    self.challengeSince = nil
                     self.reloadWithoutRules()
-                } else if !self.challengeReloaded {
-                    if self.challengeSince == nil { self.challengeSince = Date() }
-                    if let since = self.challengeSince,
-                       Date().timeIntervalSince(since) > 25 {
-                        self.challengeReloaded = true
-                        self.reloadWithoutRules()
-                    }
                 }
             } else {
                 self.challengeSince = nil
@@ -324,7 +400,9 @@ final class EmbedProbeState: ObservableObject {
             }
             self.hasVideo = true
             self.challengeRunning = false
-            if !self.isScrubbing {
+            // 拖进度条锁：松手后 1.2 秒内不回写，避免探针把用户刚拖到的时间
+            // 又 snap 回页内 video 还没 seek 完的旧时间。
+            if !self.isScrubbing && Date() > self.scrubLockUntil {
                 self.currentTime = (json["t"] as? Double) ?? 0
             }
             let d = (json["d"] as? Double) ?? 0
@@ -339,6 +417,22 @@ final class EmbedProbeState: ObservableObject {
             }
             self.paused = nowPaused
             self.wasPaused = nowPaused
+            // video 一直在 0:00 且已暂停：2 秒后只踢一次 play()。
+            // 嵌页播放器常有"点了播放却停在 0:00"的假死，踢一次即可。
+            let t = (json["t"] as? Double) ?? 0
+            if t < 0.5 && nowPaused {
+                if self.zeroVideoSeenAt == nil { self.zeroVideoSeenAt = Date() }
+                let seenFor = Date().timeIntervalSince(self.zeroVideoSeenAt ?? Date())
+                if !self.didNudgeZeroPlay && seenFor >= 2 {
+                    self.didNudgeZeroPlay = true
+                    webView.evaluateJavaScript(
+                        "var v=document.querySelector('video'); if(v){ var p=v.play(); if(p && p.catch) p.catch(function(){}); }",
+                        completionHandler: nil
+                    )
+                }
+            } else {
+                self.zeroVideoSeenAt = nil
+            }
             // 页内 video 真在播（有 video、没暂停、时间在往前走）：报一次 onPlaying，
             // 外层调 markPlaying()，账本终局为“播放中”。只报一次（同一 URL）；
             // 挑战页/停着的 video 不报；拖动时 currentTime 冻结，不会误报。
@@ -410,9 +504,11 @@ final class EmbedProbeState: ObservableObject {
         currentTime = min(max(seconds, 0), duration)
     }
 
-    /// 松手：只发一次 JS seek。
+    /// 松手：只发一次 JS seek；松手后 1.2 秒内探针不回写 currentTime
+    ///（页内 video 还没 seek 完，回写会把刚拖到的时间 snap 回旧时间）。
     func endScrub(to seconds: Double) {
         isScrubbing = false
+        scrubLockUntil = Date().addingTimeInterval(1.2)
         guard seconds.isFinite else { return }
         let clamped = duration > 0 ? min(max(seconds, 0), duration) : max(seconds, 0)
         currentTime = clamped
@@ -482,7 +578,7 @@ final class EmbedProbeState: ObservableObject {
 
 /// 嵌入页播放器的 UIViewController：WKWebView 全铺，不带任何按钮。
 /// 按钮/底条都在外层 SwiftUI（和直链自定义播放器同一套 PlayerControlBar）。
-final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
+final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UIGestureRecognizerDelegate {
     private let url: URL
     private let probe: EmbedProbeState
     private let adStrip: Bool
@@ -551,32 +647,67 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
             self?.adRulesDisabled = true
         }
 
+        // 原生点按手势（系统级，穿透覆盖层）：点画面切换底条显隐。
+        // 绝不用 SwiftUI .onTapGesture——WKWebView 的内层手势会把它整个吃掉。
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleWebViewTap))
+        tap.cancelsTouchesInView = false
+        tap.delegate = self
+        webView.addGestureRecognizer(tap)
+
         loadIfNeeded(url: url)
     }
 
+    @objc private func handleWebViewTap() {
+        probe.toggleControls()
+    }
+
+    // 绝不抢 WKWebView 内层手势（播放器按钮/进度条照常用）：两个手势同时识别。
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        true
+    }
+
     /// URL 不变不重载，避免 SwiftUI 刷新时打断正在播的嵌入页。
+    /// 只做 URL 加载：探针 reset 不在这里做（SwiftUI 更新期调它会改
+    /// @Published，撞上视图更新）；切 URL 时 WebViewPlayerView 的
+    /// .onChange(of: url) 会调 probe.stop()/start()。
     func loadIfNeeded(url: URL) {
         guard loadedURL != url else { return }
         loadedURL = url
         navigationStartAt = Date()
-        // 切 URL = 新的一页：探针整套状态清掉重开（challengeReloaded、hasVideo、
-        // playingReported 都归零），不然 Line B 沿用 Line A 的状态，CF 兜底
-        // 跳过、markPlaying 也不再报。
-        probe.stop()
-        probe.start()
+        // 上一页关掉广告规则后换了新 URL：规则重新开，新的一页重新评估。
+        adRulesDisabled = false
+        // onlybokep 系嵌页常被 Cloudflare 拦：先看播放 WebView 的 cookie
+        // 里有没有有效的 cf_clearance；有就直接加载，没有就先预热
+        //（干净 WebView 打开目标域，让 CF 发 clearance，再同步进来），
+        // 暖完（或暖失败 3 次）都照常加载，兜底是用户手动过验证。
+        // 预热是异步的：加载发生在回调里；用户切走后 loadedURL 已变，
+        // 回调里不再加载旧 URL。
+        guard let host = url.host, CloudflareWarmup.needsWarmup(host: host) else {
+            load(request: url)
+            return
+        }
+        CloudflareWarmup.shared.ensureClearance(for: host, webView: webView, container: view) { [weak self] in
+            guard let self, self.loadedURL == url else { return }
+            self.load(request: url)
+        }
+    }
+
+    private func load(request url: URL) {
         var request = URLRequest(url: url, timeoutInterval: 20)
         request.assumesHTTP3Capable = false
         webView?.load(request)
     }
 
-    /// 停掉 WebView、释放资源（关闭 / 离开详情页时调）：停加载、清页面、摘代理、移出视图。
+    /// 停掉 WebView、释放资源（关闭 / 离开详情页时调）：先摘代理，再停加载、清页面、移出视图。
     func teardown() {
+        // 先摘代理（再有回调也不进来），再停加载、清页面、移出视图。
+        // 顺序反了会崩：stopLoading 期间的回调走到已释放的 delegate。
+        webView?.navigationDelegate = nil
+        webView?.uiDelegate = nil
         probe.webView = nil
         probe.onDisableAdRules = nil
         webView?.stopLoading()
         webView?.loadHTMLString("", baseURL: nil)
-        webView?.navigationDelegate = nil
-        webView?.uiDelegate = nil
         webView?.removeFromSuperview()
         webView = nil
         loadedURL = nil
@@ -629,9 +760,25 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
 
     /// 主框架导航：只放行嵌页自己（当前播的嵌页 host 及其子域）或 dood 家各门面；
     /// 广告点一下想把主框架跳去别的站时拦住。子框架导航一律放行（播放器 iframe 要加载）。
+    /// window.open / target=_blank 的新窗口（targetFrame == nil）一律拦；
+    /// 非 http(s)（tel:、mailto:、intent: …）一律拦，about:/blob:/data: 放行
+    ///（播放器内部偶尔用它们，拦了会断播）。
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        guard let targetFrame = navigationAction.targetFrame, targetFrame.isMainFrame,
-              let host = navigationAction.request.url?.host?.lowercased() else {
+        guard let requestURL = navigationAction.request.url,
+              let scheme = requestURL.scheme?.lowercased() else {
+            decisionHandler(.cancel)
+            return
+        }
+        guard scheme == "http" || scheme == "https" || scheme == "about" || scheme == "blob" || scheme == "data" else {
+            decisionHandler(.cancel)
+            return
+        }
+        guard let targetFrame = navigationAction.targetFrame else {
+            // targetFrame == nil：window.open / target=_blank 弹窗，一律拦。
+            decisionHandler(.cancel)
+            return
+        }
+        guard targetFrame.isMainFrame, let host = requestURL.host?.lowercased() else {
             decisionHandler(.allow)
             return
         }
@@ -680,9 +827,9 @@ struct EmbedWebView: UIViewControllerRepresentable {
 /// 深色半透明底条（播放/暂停、进度条、当前时间/总时间、全屏、关闭），点画面显示/隐藏。
 /// 探不到页内 video 时只显示“嵌入播放中”状态文案 + 全屏/关闭。
 /// 只在混合解流抽不出直链时用（解出直链优先走 AVPlayer）。
-/// 广告剥离三层全开（规则 + 代理拦弹窗 + CF 通过后删 DOM）；标题一读到是 CF 质询页
-/// 就立即关规则重载一次（25 秒兜底仍在），质询进行中盖一层原生 Loading 遮罩
-/// （WebView 本身保持全尺寸在屏、不隐藏）。关闭/离开时停掉 WebView、释放资源。
+/// 广告剥离三层全开（规则 + 代理拦弹窗 + CF 通过后删 DOM）；质询信号出现后统一等
+/// 12 秒才关规则重载（只一次），质询进行中顶部只飘一枚小胶囊提示
+/// （WebView 本身保持全尺寸在屏、不隐藏、不拦手势）。关闭/离开时停掉 WebView、释放资源。
 struct WebViewPlayerView: View {
     let url: URL
     let onClose: () -> Void
@@ -697,23 +844,26 @@ struct WebViewPlayerView: View {
     var body: some View {
         ZStack {
             EmbedWebView(url: url, probe: probe, adStrip: adStrip)
-                .onTapGesture { probe.toggleControls() }
-            // 质询进行中：原生 Loading 遮罩盖住 WebView（只盖住、不隐藏它——
-            // WebView 保持全尺寸在屏，质询才能正常跑完；出 video 后自动撤掉）。
-            // 遮罩在控制条之下，关闭/全屏按钮始终可点。
+            // 质询进行中：顶部小胶囊提示，不盖全屏、不拦手势
+            //（Cloudflare 复选框在下面，用户要能点到“我是人类”；
+            // 点画面切底条显隐走 WKWebView 上的原生手势，不走 SwiftUI
+            // .onTapGesture——内层手势会把它整个吃掉）。
             if probe.challengeRunning {
-                ZStack {
-                    Color.black.opacity(0.85)
-                    VStack(spacing: 12) {
+                VStack {
+                    HStack(spacing: 8) {
                         ProgressView()
                             .tint(.white)
-                        Text("正在验证，请稍候…")
+                        Text("正在验证，如出现勾选框请点击完成")
                             .font(.subheadline)
                             .foregroundColor(.white)
                     }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(Color.black.opacity(0.7))
+                    .clipShape(Capsule())
+                    .padding(.top, 12)
+                    Spacer()
                 }
-                // 遮罩只作提示，不拦截手势：Cloudflare 复选框在它下面，
-                // 遮罩吃掉点击的话用户永远点不到“我是人类”，挑战就永远过不去。
                 .allowsHitTesting(false)
             }
             VStack {
@@ -745,6 +895,14 @@ struct WebViewPlayerView: View {
             probe.onPlaying = onPlaying
             probe.start()
             probe.showControlsTemporarily()
+        }
+        .onChange(of: url) { _, _ in
+            // 切 URL = 新的一页：探针整套状态清掉重开（challengeReloaded、
+            // hasVideo、playingReported 都归零），不然 Line B 沿用 Line A
+            // 的状态，CF 兜底跳过、markPlaying 也不再报。
+            // 放这里不放 loadIfNeeded：SwiftUI 更新期改 @Published 会撞上视图更新。
+            probe.stop()
+            probe.start()
         }
         .onDisappear {
             probe.stop()

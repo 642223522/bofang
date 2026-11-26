@@ -57,9 +57,12 @@ struct LedgerHomeView: View {
     @State private var isUploading = false
     @State private var uploadStatus: String?
     @State private var uploadFailed = false
+    /// 是否存过 Gitee Token：@State 缓存，onAppear 读一次、上传开始时再读一次，
+    /// 不再每次 body 求值时同步调 SecItemCopyMatching（主线程 Keychain IPC）。
+    @State private var hasSavedToken = false
 
-    private var hasSavedToken: Bool {
-        !(store.loadSavedGiteeToken()?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+    private func refreshTokenState() {
+        hasSavedToken = !(store.loadSavedGiteeToken()?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
 
     var body: some View {
@@ -135,10 +138,14 @@ struct LedgerHomeView: View {
         }
         .navigationTitle("播放账本")
         .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            refreshTokenState()
+        }
     }
 
     private func uploadLedger() {
         guard !isUploading else { return }
+        refreshTokenState()
         isUploading = true
         uploadStatus = nil
         uploadFailed = false

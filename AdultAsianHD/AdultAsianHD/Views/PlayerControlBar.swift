@@ -51,6 +51,9 @@ struct PlayerProgressSlider: View {
 
     @State private var dragTime: Double? = nil
     @State private var isDragging = false
+    /// 手势是否正在进行（SwiftUI 保证：手势被系统打断/取消时自动归 false，
+    /// .onEnded 不触发也能兜底收尾，不再卡住 isDragging）。
+    @GestureState private var gestureActive = false
 
     private var displayedTime: Double { dragTime ?? currentTime }
     private var progress: Double {
@@ -84,6 +87,9 @@ struct PlayerProgressSlider: View {
             .contentShape(Rectangle())
             .highPriorityGesture(
                 DragGesture(minimumDistance: 0)
+                    .updating($gestureActive) { _, state, _ in
+                        state = true
+                    }
                     .onChanged { value in
                         guard duration > 0, geo.size.width > 0 else { return }
                         if !isDragging {
@@ -110,6 +116,24 @@ struct PlayerProgressSlider: View {
                         onScrubEnd(t)
                     }
             )
+            // 系统打断拖动（来电/控制中心/旋转/视图消失）时 .onEnded 不触发，
+            // @GestureState 会自动归 false，在此兜底收尾，防止播放器卡死在拖动态。
+            .onChange(of: gestureActive) { _, active in
+                if !active && isDragging {
+                    let t = dragTime ?? currentTime
+                    dragTime = nil
+                    isDragging = false
+                    onScrubEnd(t)
+                }
+            }
+            .onDisappear {
+                if isDragging {
+                    let t = dragTime ?? currentTime
+                    dragTime = nil
+                    isDragging = false
+                    onScrubEnd(t)
+                }
+            }
         }
         .frame(height: 28)
     }

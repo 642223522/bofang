@@ -17,15 +17,14 @@ struct DiagnosticsView: View {
     @State private var isCheckingAll = false
     @State private var resultMessage = ""
     @State private var showResultAlert = false
+    /// 当前网络摘要（direct/proxy + 触发原因）：进页时现测一次缓存起来，
+    /// 不在 body 里每次都调 inspect()（getifaddrs + 代理字典每帧都跑没必要）。
+    @State private var networkSummary = ""
 
     var body: some View {
         WideContent {
-            Group {
-                if store.sources.isEmpty {
-                    EmptyState(title: "还没有源", message: "先到「源」Tab 导入一个 JS 源，自检与竞速结果会出现在这里。")
-                } else {
-                    List {
-                        Section("自检") {
+            List {
+                Section("自检") {
                             Button {
                                 checkAll()
                             } label: {
@@ -39,6 +38,11 @@ struct DiagnosticsView: View {
                                 } label: {
                                     checkRow(for: source)
                                 }
+                            }
+                            if store.sources.isEmpty {
+                                Text("还没有源：先到「源」Tab 导入一个 JS 源，自检与竞速结果会出现在这里。")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
                             }
                         }
 
@@ -61,7 +65,7 @@ struct DiagnosticsView: View {
                         }
 
                         Section("网络诊断（DNS/TCP/TLS/HTTP/WAF）") {
-                            infoRow("当前网络", PlaybackLedger.networkClass == "proxy" ? "proxy（代理/VPN）" : "direct（直连无节点）")
+                            infoRow("当前网络", networkSummary.isEmpty ? NetworkState.diagnosticSummary() : networkSummary)
                             if netDiag.events.isEmpty {
                                 Text("暂无请求记录：浏览列表或播放后，这里会显示每条请求死在哪一层（DNS/TCP/TLS/HTTP/WAF）与各阶段耗时。")
                                     .font(.caption)
@@ -118,17 +122,18 @@ struct DiagnosticsView: View {
                             }
                         }
 
-                    }
-                    .listStyle(.plain)
-                    .scrollContentBackground(.hidden)
-                    .refreshable {
-                        _ = await store.runCheckAll()
-                    }
-                }
+            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            .refreshable {
+                _ = await store.runCheckAll()
             }
         }
         .navigationTitle("检测")
         .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            networkSummary = NetworkState.diagnosticSummary()
+        }
         .alert("提示", isPresented: $showResultAlert) {
             Button("好", role: .cancel) {}
         } message: {
@@ -314,7 +319,7 @@ struct DiagnosticsView: View {
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }
-            Text("\(event.source) · \(event.statusCode.map { "HTTP \($0)" } ?? (event.errorSummary ?? "无响应")) · \(event.timingSummary)")
+            Text("\(event.source) · \(event.errorSummary ?? event.statusCode.map { "HTTP \($0)" } ?? "无响应") · \(event.timingSummary)")
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .lineLimit(2)
@@ -467,8 +472,8 @@ private struct RaceDetailView: View {
 private func netDiagPhaseColor(_ phase: NetworkDiagPhase) -> Color {
     switch phase {
     case .ok: return .green
-    case .dns, .tcp, .tls, .waf: return .red
-    case .http: return .orange
+    case .dns, .tcp, .tls, .waf, .transport: return .red
+    case .http, .timeout: return .orange
     case .cancelled, .unknown: return .secondary
     }
 }
@@ -584,7 +589,7 @@ private final class NetworkProbeViewModel: ObservableObject {
             guard let self else { return }
             let probe = StagedNetworkProbe()
             probe.onLine = { [weak self] line in
-                Task { @MainActor [weak self] in self?.lines.append(line) }
+                DispatchQueue.main.async { [weak self] in self?.lines.append(line) }
             }
             for target in StagedNetworkProbe.defaultTargets {
                 if Task.isCancelled { break }

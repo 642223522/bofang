@@ -16,6 +16,8 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     @Published private(set) var sources: [SourceRecord] = []
     /// 上次码云同步成功的时间（存 UserDefaults，源页显示用）
     @Published private(set) var lastSyncAt: Date?
+    /// 最近一次同步里被跳过的第一个错误（部分成功时也照实留着，源页在成功提示里一并报出来；无错时为 nil）。
+    @Published private(set) var lastSyncError: String?
     /// 自检结果：[源 id: 结果]，持久化在 Documents/check-results.json
     /// （与 sources.json 分开，不动 SourceRecord）。
     @Published private(set) var checkResults: [String: SourceCheckResult] = [:]
@@ -42,6 +44,9 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     /// 正在跑的后台自动自检 Task（轻检或深探针）。用户一点屏幕/切页/开始播放，
     /// 或 App 进后台，立刻 cancel；下次从断点接着跑（增量逻辑跳过已测过的）。
     private var autoCheckTask: Task<Void, Never>?
+    /// runCheckAll 共享并发守卫（防 .refreshable、手动“自检全部”与后台自动自检并发重入）
+    private let checkAllLock = NSLock()
+    private var isCheckAllRunning = false
     /// 后台自动自检的轮次间隔：轻检 12 小时一轮；深探针 7 天一轮（分开轮次）。
     private let autoCheckInterval: TimeInterval = 12 * 3600
     private let deepProbeInterval: TimeInterval = 7 * 24 * 3600
@@ -139,6 +144,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         config.timeoutIntervalForRequest = 15
         config.timeoutIntervalForResource = 30
         let session = URLSession(configuration: config)
+        defer { session.finishTasksAndInvalidate() }
         let data: Data
         do {
             let (fetched, response) = try await session.data(from: url)
@@ -334,25 +340,14 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             rawComponents?.queryItems = rawQueryItems
             guard let rawURL = rawComponents?.url else { continue }
 
-            let existing = await MainActor.run { self.sources.first(where: { $0.fileName == name }) }
-            if let existing {
-                try? fileManager.removeItem(at: sourcesDirectory.appendingPathComponent(existing.fileName))
-                await MainActor.run {
-                    self.sources.removeAll { $0.fileName == existing.fileName }
-                    self.saveManifest()
-                }
-            }
-
             do {
-                // 优先走 contents API 单文件接口（带 Token 的 JSON 接口，不经过 raw 链接
-                // 重定向，鉴权不会丢）；#43 的 raw 下载带了 Authorization 头 +
-                // access_token 参数仍失败，可能是重定向后鉴权丢了或 access_token 对
-                // raw 端点无效。contents API 拿不到再 fallback 到 raw 下载。
+                // 1. 先下载到内存，绝不提前删本地旧源
                 let data: Data
                 if let contentsData = await fetchGiteeContentsFile(name: name, token: effectiveToken) {
                     data = contentsData
                 } else {
                     var downloadRequest = URLRequest(url: rawURL)
+                    downloadRequest.cachePolicy = .reloadIgnoringLocalCacheData
                     downloadRequest.setValue("token \(effectiveToken)", forHTTPHeaderField: "Authorization")
                     downloadRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
                     downloadRequest.timeoutInterval = 30
@@ -363,17 +358,54 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
                     }
                     data = rawData
                 }
-                switch await importData(data, fileName: name, origin: "gitee") {
-                case .success:
-                    imported += 1
-                case .failure(let error):
-                    // 已存在相同源：跳过，不算失败（同步不重复加）
-                    if case .duplicate = error {
-                        // 什么都不做，继续下一个文件
-                    } else if firstError == nil {
-                        firstError = error.localizedDescription
-                    }
+
+                // 2. 先校验新文件合法性，校验不通过保留旧源不动
+                guard let text = String(data: data, encoding: .utf8),
+                      !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    if firstError == nil { firstError = "\(name) 不是有效文本文件" }
+                    continue
                 }
+                let validation = WidgetHost.validate(jsSource: text, fallbackTitle: name)
+                guard validation.ok, let meta = validation.meta else {
+                    if firstError == nil { firstError = validation.error ?? "\(name) 不是有效模块" }
+                    continue
+                }
+
+                // 3. 确认下载+校验全部通过，再原子替换同名/同 id 旧源
+                let sanitized = sanitizedFileName(name, fallback: meta.id)
+                let existing = await MainActor.run {
+                    self.sources.first(where: { $0.fileName == sanitized || $0.id == meta.id })
+                }
+                if existing == nil, let dup = await existingDuplicate(for: meta, jsSource: text) {
+                    _ = dup // 已存在同域名其他源：跳过不重复加
+                    continue
+                }
+                let finalName = existing?.fileName ?? uniqueFileName(sanitized)
+                let targetURL = sourcesDirectory.appendingPathComponent(finalName)
+                do {
+                    try data.write(to: targetURL, options: .atomic)
+                } catch {
+                    if firstError == nil { firstError = "写入 \(finalName) 失败" }
+                    continue
+                }
+                let record = SourceRecord(
+                    id: meta.id,
+                    title: meta.title,
+                    fileName: finalName,
+                    origin: "gitee",
+                    country: existing?.country ?? countryGuess(for: meta),
+                    version: meta.version,
+                    importedAt: Date()
+                )
+                await MainActor.run {
+                    if let idx = self.sources.firstIndex(where: { $0.fileName == finalName }) {
+                        self.sources[idx] = record
+                    } else {
+                        self.sources.append(record)
+                    }
+                    self.saveManifest()
+                }
+                imported += 1
             } catch {
                 if firstError == nil { firstError = friendlyNetworkError(error) }
                 continue
@@ -381,11 +413,13 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         }
 
         if imported == 0 {
+            await MainActor.run { self.lastSyncError = firstError }
             return .failure(.network(firstError ?? "同步到的源都下载失败"))
         }
         await MainActor.run {
             let now = Date()
             self.lastSyncAt = now
+            self.lastSyncError = firstError
             UserDefaults.standard.set(now.timeIntervalSince1970, forKey: self.lastSyncDefaultsKey)
         }
         return .success(imported)
@@ -911,6 +945,24 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     ///   下次从断点接着跑（已测过且指纹没变的源跳过，不重跑）。
     /// 返回（正常数，失败数，跳过数）。取消时返回已统计到的数（未测的源下次接着跑）。
     func runCheckAll() async -> (ok: Int, failed: Int, skipped: Int) {
+        checkAllLock.lock()
+        if isCheckAllRunning {
+            checkAllLock.unlock()
+            // 已在跑：不重入，直接返回当前已统计数（上次结果里的计数）。
+            return await MainActor.run {
+                let ok = self.checkResults.values.filter { $0.status == .ok }.count
+                let failed = self.checkResults.values.filter { $0.status == .failed }.count
+                let skipped = self.checkResults.values.filter { $0.status == .skipped }.count
+                return (ok, failed, skipped)
+            }
+        }
+        isCheckAllRunning = true
+        checkAllLock.unlock()
+        defer {
+            checkAllLock.lock()
+            isCheckAllRunning = false
+            checkAllLock.unlock()
+        }
         var ok = 0
         var failed = 0
         var skipped = 0
@@ -980,8 +1032,8 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
                light?.sourceFingerprint == fingerprint(for: source) {
                 continue
             }
-            guard let playableLine = await firstPlayableLine(for: source) else { continue }
-            let probe = await Self.deepProbe(line: playableLine)
+            guard let candidate = await firstPlayableLine(for: source) else { continue }
+            let probe = await Self.deepProbe(line: candidate.line, fallbackReferer: candidate.pageLink)
             // 探针中途被取消：结果不写（取消不算失败，下次断点续跑重测这个源）。
             if Task.isCancelled { completed = false; break }
             await MainActor.run {
@@ -1001,18 +1053,21 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     /// 解析失败返回 nil（该源跳过深探针）。
     /// 返回整条 PlayLine，不只 URL：深探针要用线路的真实请求身份
     /// （模块头/Referer/Cookie），裸 URL 播会把好的源判成坏的。
-    private func firstPlayableLine(for source: SourceRecord) async -> PlayLine? {
+    private func firstPlayableLine(for source: SourceRecord) async -> (line: PlayLine, pageLink: String)? {
         guard let host = try? loadHost(for: source),
               let probe = host.fixedProbeModule(),
               let samples = try? await host.loadList(moduleId: probe.id, page: 1),
               let first = samples.first,
-              let lines = try? await host.loadResource(link: first.link, title: first.title) else {
+              let lines = try? await host.loadResource(link: first.link, title: first.title),
+              let playable = lines.first(where: {
+                  let lower = $0.url.lowercased()
+                  return lower.contains(".m3u8") || lower.contains(".mp4")
+              }) else {
             return nil
         }
-        return lines.first { line in
-            let lower = line.url.lowercased()
-            return lower.contains(".m3u8") || lower.contains(".mp4")
-        }
+        // pageLink（帖子链接）一起带回去：深探针用它当 Referer 兜底
+        //（nmcorp 这类防盗链的线，line.referer 是 nil，没它就 403 误判坏源）。
+        return (playable, first.link)
     }
 
     /// 深探针：静音真播到出画（真的起 AVPlayer、静音、确认出首帧画面）。
@@ -1025,18 +1080,25 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     /// Task.isCancelled）。CancelBox 建在 continuation 外面：onCancel 可能在
     /// 主队列 setup 块跑之前就触发，那时 player/timer 还没建——盒子先记下
     /// “已取消”，setup 块一进来就直接收尾，不建播放器。
-    static func deepProbe(line: PlayLine) async -> DeepProbeResult {
+    static func deepProbe(line: PlayLine, fallbackReferer: String? = nil) async -> DeepProbeResult {
         guard let url = URL(string: line.url) else {
             return DeepProbeResult(passed: false, failedStep: "解析", reason: "URL 非法", checkedAt: Date())
         }
-        var headers = NetConstants.mergeHeaders(base: NetConstants.defaultBrowserHeaders, overrides: line.headers ?? [:])
+        // 头按大小写不敏感合并（mergeHeaders 已做这件事）：模块头里小写的
+        // user-agent/referer/cookie 不会再和大写键并存、把自定义 UA 顶掉。
+        // 不再混入 defaultBrowserHeaders 的 Accept: application/json——那是给
+        // 列表 API 的头，不该进视频请求。
+        var base: [String: String] = ["User-Agent": NetConstants.iPhoneUserAgent]
         if let referer = line.referer, !referer.isEmpty {
-            headers["Referer"] = referer
+            base["Referer"] = referer
+        } else if let fallbackReferer, !fallbackReferer.isEmpty {
+            base["Referer"] = fallbackReferer
         }
+        var headers = NetConstants.mergeHeaders(base: base, overrides: line.headers ?? [:])
         if let cookie = line.cookie, !cookie.isEmpty {
-            headers["Cookie"] = cookie
+            headers = NetConstants.mergeHeaders(base: headers, overrides: ["Cookie": cookie])
         }
-        let userAgent = headers["User-Agent"] ?? NetConstants.iPhoneUserAgent
+        let userAgent = headers.first(where: { $0.key.lowercased() == "user-agent" })?.value ?? NetConstants.iPhoneUserAgent
 
         final class CancelBox: @unchecked Sendable {
             var cancelled = false
@@ -1060,6 +1122,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
                         box.timer?.cancel()
                         box.timer = nil
                         box.player?.pause()
+                        box.player?.replaceCurrentItem(with: nil)
                         box.player = nil
                         continuation.resume(returning: DeepProbeResult(passed: passed, failedStep: step, reason: reason, checkedAt: Date()))
                     }

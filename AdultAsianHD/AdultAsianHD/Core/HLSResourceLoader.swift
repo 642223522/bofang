@@ -21,8 +21,8 @@ import Foundation
 /// 把要播的 m3u8 URL 的 scheme 换成 hlsloader://（http 则换成 hlsloader-http://）
 /// 建 AVURLAsset，delegate 里换回 https/http，用 URLSession 代发播单/密钥，
 /// 带 iPhone UA + Referer + Cookie + 模块自定义头。
-/// - 302 跨域重定向：URLSession 默认会丢自定义头，这里经 RedirectHandler 在重定向
-///   请求上把头补回去。
+/// - 302 跨域重定向：代发请求走 DiagnosticHTTPClient，它的 PerRequestDelegate
+///   在重定向请求上把自定义头补回去（同源才保留凭据头）。
 /// - 相对路径 key URI：按播单所在 URL 解析成绝对路径并改 scheme；相对路径分片 URI：
 ///   同样解析成绝对路径，但保持 https（见上）。
 /// - 密钥 403/401：先重拉一次播单（签名可能已刷新），用刷新后播单里的新 key URI
@@ -71,8 +71,6 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     let delegateQueue = DispatchQueue(label: "com.liudehen.xiaoshipin.hlsloader", qos: .userInitiated)
 
     private let allHeaders: [String: String]
-    private let session: URLSession
-    private let redirectHandler: RedirectHandler
 
     private let stateLock = NSLock()
     private var keyCache: [String: Data] = [:]
@@ -135,20 +133,16 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
             overrides: overrides
         )
         self.allHeaders = merged
-        let handler = RedirectHandler()
-        handler.headers = merged
-        self.redirectHandler = handler
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 12
-        config.timeoutIntervalForResource = 25
-        config.httpMaximumConnectionsPerHost = 8
-        config.waitsForConnectivity = false
-        self.session = URLSession(configuration: config, delegate: handler, delegateQueue: nil)
         super.init()
     }
 
     deinit {
-        session.invalidateAndCancel()
+        // 代发请求走 DiagnosticHTTPClient（自带会话），本类不再持有 URLSession；
+        // 释放时只取消还在途的 loadingRequest 任务。
+        stateLock.lock()
+        let pending = Array(tasks.values)
+        stateLock.unlock()
+        for task in pending { task.cancel() }
     }
 
     // MARK: - AVAssetResourceLoaderDelegate
@@ -264,7 +258,7 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
         }
     }
 
-    // MARK: - 代发请求（带头；重定向由 RedirectHandler 补头）
+    // MARK: - 代发请求（带头；走 DiagnosticHTTPClient，重定向由它补头）
 
     private struct RequestedRange {
         let offset: Int
@@ -310,13 +304,16 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     }
 
     /// 密钥 403/401 后的挽救：重拉一次播单，用刷新后播单里的新 key URI 再拉一次密钥。
+    /// 注意基址：播单那次 fetch 可能经过重定向，相对 key URI 必须按重定向后的
+    /// 最终 URL（http.url）解析，按旧基址解析会指向错误 host/路径、100% 404。
     private func retryKeyAfterPlaylistRefresh(failedKeyURL: URL) async -> Data? {
         guard let playlist = currentPlaylistURL() else { return nil }
         guard let (data, response) = try? await fetch(url: playlist, range: nil),
               let http = response as? HTTPURLResponse,
               (200...299).contains(http.statusCode) else { return nil }
+        let finalPlaylistURL = http.url ?? playlist
         let text = String(decoding: data, as: UTF8.self)
-        let keyURI = extractKeyURI(from: text, baseURL: playlist) ?? failedKeyURL.absoluteString
+        let keyURI = extractKeyURI(from: text, baseURL: finalPlaylistURL) ?? failedKeyURL.absoluteString
         guard let keyURL = URL(string: keyURI) else { return nil }
         guard let (keyData, keyResponse) = try? await fetch(url: keyURL, range: nil),
               let keyHTTP = keyResponse as? HTTPURLResponse,
@@ -327,10 +324,16 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
 
     // MARK: - 播单改写
 
+    /// 播单判定（后缀 + 正文双重判定）：后缀 .m3u8 或 MIME 含 mpegurl 只是候选，
+    /// 正文首行必须是 #EXTM3U（去 UTF-8 BOM 与前导空白）才算播单——
+    /// CF 挑战页挂在 .m3u8 地址上时，按旧逻辑会被当成播单喂给 AVPlayer。
     private func isPlaylist(data: Data, url: URL, response: HTTPURLResponse) -> Bool {
-        if url.pathExtension.lowercased() == "m3u8" { return true }
-        if let mime = response.mimeType?.lowercased(), mime.contains("mpegurl") { return true }
-        return data.starts(with: Data("#EXTM3U".utf8))
+        let hasPlaylistMarker = url.pathExtension.lowercased() == "m3u8"
+            || (response.mimeType?.lowercased().contains("mpegurl") ?? false)
+        guard hasPlaylistMarker else { return false }
+        var text = String(decoding: data.prefix(64), as: UTF8.self)
+        if text.hasPrefix("\u{FEFF}") { text.removeFirst() }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("#EXTM3U")
     }
 
     /// 播单逐行改写：key URI 解析成绝对路径并改 scheme（走拦截器）；
@@ -574,39 +577,5 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
 
     private static func fairPlayError() -> NSError {
         NSError(domain: "HLSResourceLoader", code: -1, userInfo: [NSLocalizedDescriptionKey: "这条线路用了 FairPlay 加密（skd://），当前播放器不支持"])
-    }
-}
-
-/// 重定向补头：URLSession 跟随 302 跨域重定向时会丢自定义头，
-/// 这里在重定向请求上把拦截器的头原样补回去。
-/// 只弱持有头字典（值类型拷贝），不持有 loader，避免 session↔loader 循环引用。
-private final class RedirectHandler: NSObject, URLSessionTaskDelegate {
-    var headers: [String: String] = [:]
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
-        var redirected = request
-        redirected.assumesHTTP3Capable = false
-        // 凭据头（Authorization / Cookie / API key）只在同源（scheme+host+端口）
-        // 时保留；跨域或 HTTPS→HTTP 降级一律不带。
-        let sameOrigin = NetConstants.isSameOrigin(response.url ?? task.currentRequest?.url, request.url)
-        for (key, value) in headers {
-            if !sameOrigin && NetConstants.isSensitiveHeader(key) { continue }
-            redirected.setValue(value, forHTTPHeaderField: key)
-        }
-        completionHandler(redirected)
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
-        guard let request = task.originalRequest else { return }
-        let event = NetworkDiagnostics.makeEvent(
-            source: "hlsloader",
-            request: request,
-            response: task.response,
-            bodyData: nil,
-            error: task.error,
-            metrics: metrics,
-            fallbackDurationMs: 0
-        )
-        NetworkDiagnostics.record(event)
     }
 }

@@ -192,64 +192,127 @@ struct RouteMemoryEntry {
 /// 节点状态检测（只做标签，不影响播放与路由）：
 /// Shadowrocket 开节点有两种形态——代理模式改系统 HTTP 代理，VPN 模式建 utun 虚拟网卡；
 /// 两个都查，任一命中即判为代理。查不到/出错时按直连记（宁可漏标，不可误标）。
+/// 隧道判定以 __SCOPED__ 为准：真正接管系统路由的 VPN（Shadowrocket/Clash/WireGuard/IKEv2）
+/// 会登记在代理字典的 __SCOPED__ 里；仅系统内建/VoWiFi 占位接口不在里面，
+/// 不会误杀 ChinaNet 家庭 Wi-Fi（旧版只看 utun + 地址可路由，把系统 utun 的
+/// fc00::/7 ULA 当成可路由，plain Wi-Fi 也报 proxy）。
+/// inspect() 同时返回触发原因，供检测页与账本核验是哪条规则命中的。
+
 enum NetworkState {
+    struct Inspection: Sendable {
+        let networkClass: String // "direct" / "proxy"
+        let reason: String       // 具体触发原因（供检测页与账本核验）
+    }
+
     static func currentNetworkClass() -> String {
-        if hasSystemProxy() || hasTunnelInterface() { return "proxy" }
-        return "direct"
+        inspect().networkClass
     }
 
-    static func hasSystemProxy() -> Bool {
-        // CFNetworkCopySystemProxySettings 是 Copy 系函数，返回 Unmanaged<CFDictionary>?，
-        // 必须 takeRetainedValue() 拿到字典再桥接——直接 as? [String: Any] 永远失败（编译警告已点明）。
-        guard let raw = CFNetworkCopySystemProxySettings() else { return false }
-        let proxies = raw.takeRetainedValue() as NSDictionary
-        // kCFNetworkProxiesHTTPEnable 在 iOS 上可用；kCFNetworkProxiesHTTPSEnable 是 macOS 专属（NA），
-        // iOS 上不能引用这个常量——HTTPS 那项改用字符串键查（iOS 的代理字典里同样有这个键）。
-        let httpOn = (proxies[kCFNetworkProxiesHTTPEnable as String] as? NSNumber)?.intValue == 1
-        let httpsOn = (proxies["HTTPSEnable"] as? NSNumber)?.intValue == 1
-        return httpOn || httpsOn
+    static func diagnosticSummary() -> String {
+        let info = inspect()
+        return "\(info.networkClass)（\(info.reason)）"
     }
 
-    static func hasTunnelInterface() -> Bool {
+    static func inspect() -> Inspection {
+        let settings = copyProxySettings()
+        if let proxyReason = activeSystemProxyReason(from: settings) {
+            return Inspection(networkClass: "proxy", reason: proxyReason)
+        }
+        let scopedKeys = scopedInterfaceNames(from: settings)
+        if let tunnelReason = activeTunnelReason(scopedInterfaces: scopedKeys) {
+            return Inspection(networkClass: "proxy", reason: tunnelReason)
+        }
+        return Inspection(networkClass: "direct", reason: "无系统代理，无生效 VPN 隧道")
+    }
+
+    private static func copyProxySettings() -> NSDictionary? {
+        guard let raw = CFNetworkCopySystemProxySettings() else { return nil }
+        return raw.takeRetainedValue() as NSDictionary
+    }
+
+    private static func scopedInterfaceNames(from proxies: NSDictionary?) -> Set<String> {
+        guard let scoped = proxies?["__SCOPED__"] as? [String: Any] else { return [] }
+        return Set(scoped.keys)
+    }
+
+    private static func activeSystemProxyReason(from proxies: NSDictionary?) -> String? {
+        guard let proxies else { return nil }
+        if (proxies[kCFNetworkProxiesHTTPEnable as String] as? NSNumber)?.intValue == 1,
+           let host = proxies[kCFNetworkProxiesHTTPProxy as String] as? String, !host.isEmpty {
+            let port = (proxies[kCFNetworkProxiesHTTPPort as String] as? NSNumber)?.intValue ?? 0
+            return "系统 HTTP 代理 \(host):\(port)"
+        }
+        if (proxies["HTTPSEnable"] as? NSNumber)?.intValue == 1,
+           let host = proxies["HTTPSProxy"] as? String, !host.isEmpty {
+            let port = (proxies["HTTPSPort"] as? NSNumber)?.intValue ?? 0
+            return "系统 HTTPS 代理 \(host):\(port)"
+        }
+        if (proxies["SOCKSEnable"] as? NSNumber)?.intValue == 1,
+           let host = proxies["SOCKSProxy"] as? String, !host.isEmpty {
+            let port = (proxies["SOCKSPort"] as? NSNumber)?.intValue ?? 0
+            return "系统 SOCKS 代理 \(host):\(port)"
+        }
+        if (proxies[kCFNetworkProxiesProxyAutoConfigEnable as String] as? NSNumber)?.intValue == 1,
+           let pac = proxies[kCFNetworkProxiesProxyAutoConfigURLString as String] as? String, !pac.isEmpty {
+            return "系统 PAC 自动代理"
+        }
+        return nil
+    }
+
+    private static func activeTunnelReason(scopedInterfaces: Set<String>) -> String? {
         var head: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&head) == 0, let first = head else { return false }
+        guard getifaddrs(&head) == 0, let first = head else { return nil }
         defer { freeifaddrs(first) }
         var cursor: UnsafeMutablePointer<ifaddrs>? = first
         while let node = cursor {
+            defer { cursor = node.pointee.ifa_next }
             let name = String(cString: node.pointee.ifa_name)
-            if name.hasPrefix("utun") || name.hasPrefix("ppp") || name.hasPrefix("ipsec") {
-                // 只看名不行：每台真机自带 utun0/1/2（系统内部用），没开 VPN 也在。
-                // 必须同时满足：接口 UP+RUNNING，且配了真实地址（非链路本地 IPv4 /
-                // 非 fe80:: 链路本地 IPv6）——光有 fe80:: 的 utun 只是系统占位，不算节点。
-                let flags = node.pointee.ifa_flags
-                let up = (flags & UInt32(IFF_UP)) != 0 && (flags & UInt32(IFF_RUNNING)) != 0
-                if up, let addr = node.pointee.ifa_addr, hasRoutableAddress(addr) {
-                    return true
-                }
+            guard name.hasPrefix("utun") || name.hasPrefix("ppp") || name.hasPrefix("ipsec") || name.hasPrefix("wg") else { continue }
+            let flags = node.pointee.ifa_flags
+            let active = (flags & UInt32(IFF_UP)) != 0
+                && (flags & UInt32(IFF_RUNNING)) != 0
+                && (flags & UInt32(IFF_POINTOPOINT)) != 0
+            guard active, let addr = node.pointee.ifa_addr else { continue }
+            guard let ipString = routableAddressString(addr) else { continue }
+            // 真正接管系统路由的 VPN（Shadowrocket/Clash/WireGuard/IKEv2）会登记在 __SCOPED__ 中；
+            // 仅系统内建/VoWiFi 占位接口不在 __SCOPED__ 里，不会误杀 ChinaNet 家庭 Wi-Fi。
+            if scopedInterfaces.contains(name) {
+                return "活动隧道 \(name) (\(ipString), __SCOPED__)"
             }
-            cursor = node.pointee.ifa_next
         }
-        return false
+        return nil
     }
 
-    /// 该地址是不是可路由地址：IPv4 排除 169.254/16（链路本地）；
-    /// IPv6 排除 fe80::/10（链路本地），其余（全局单播/ULA）都算。
-    private static func hasRoutableAddress(_ addr: UnsafeMutablePointer<sockaddr>) -> Bool {
+    /// 严格可路由地址校验：
+    /// - IPv4 排除 0.0.0.0、127/8、169.254/16、224/4（组播及保留段）
+    /// - IPv6 排除 ::、::1、fe80::/10（链路本地）、fc00::/7（ULA，iOS 系统 utun 常用）、ff00::/8，只认 2000::/3 全球单播
+    private static func routableAddressString(_ addr: UnsafeMutablePointer<sockaddr>) -> String? {
         switch Int32(addr.pointee.sa_family) {
         case AF_INET:
-            let sin = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr.s_addr }
-            let hostOrder = UInt32(bigEndian: sin)
-            // 169.254.0.0/16 链路本地
-            return (hostOrder & 0xFFFF0000) != 0xA9FE0000
+            var sin = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+            let hostOrder = UInt32(bigEndian: sin.s_addr)
+            if hostOrder == 0 { return nil }                               // 0.0.0.0
+            if (hostOrder & 0xFF000000) == 0x7F000000 { return nil }       // 127.0.0.0/8
+            if (hostOrder & 0xFFFF0000) == 0xA9FE0000 { return nil }       // 169.254.0.0/16
+            if hostOrder >= 0xE0000000 { return nil }                      // 224.0.0.0/4+
+            var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            guard inet_ntop(AF_INET, &sin, &buf, socklen_t(INET_ADDRSTRLEN)) != nil else { return nil }
+            return String(cString: buf)
         case AF_INET6:
-            let sin6 = addr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee.sin6_addr }
-            var bytes = [UInt8](repeating: 0, count: 16)
-            withUnsafeBytes(of: sin6) { bytes = Array($0.prefix(16)) }
-            // fe80::/10 链路本地（前 10 位 1111111010）
-            if bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80 { return false }
-            return true
+            var sin6 = addr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee.sin6_addr }
+            let bytes = withUnsafeBytes(of: sin6) { Array($0.prefix(16)) }
+            guard bytes.count == 16 else { return nil }
+            let allZeroPrefix = bytes[0..<15].allSatisfy { $0 == 0 }
+            if allZeroPrefix && (bytes[15] == 0 || bytes[15] == 1) { return nil } // :: / ::1
+            if bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80 { return nil }       // fe80::/10
+            if (bytes[0] & 0xFE) == 0xFC { return nil }                           // fc00::/7 ULA
+            if bytes[0] == 0xFF { return nil }                                    // ff00::/8 multicast
+            guard (bytes[0] & 0xE0) == 0x20 else { return nil }                   // 仅 2000::/3 全球单播
+            var buf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+            guard inet_ntop(AF_INET6, &sin6, &buf, socklen_t(INET6_ADDRSTRLEN)) != nil else { return nil }
+            return String(cString: buf)
         default:
-            return false
+            return nil
         }
     }
 }
@@ -567,6 +630,7 @@ final class PlaybackLedger: ObservableObject {
         }
         let root: [String: Any] = [
             "exportedAt": iso.string(from: Date()),
+            "networkSummary": NetworkState.diagnosticSummary(),
             "attempts": attemptsJSON,
             "mismatches": mismatchesJSON,
             "routeMemory": routesJSON,

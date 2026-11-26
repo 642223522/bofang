@@ -18,6 +18,9 @@ final class WidgetHost: @unchecked Sendable {
     private let exceptionBox: ExceptionBox
     /// 分类请求拦截器（一个 host 一个，跟着它自己的 JSContext 走）。
     private let requestInterceptor: CategoryRequestInterceptor
+    /// 在途 Widget.http 请求登记表（见 HTTPRequestRegistry）：executor Task
+    /// 是 detached 的，host 释放/一次模块调用失败时没人取消，记在这里统一取消。
+    private let httpRegistry = HTTPRequestRegistry()
     /// 线路竞速（进模块时跑一次）：本次该模块的首选线。
     /// 本会话（开软件到关软件）每个模块只自动竞速一次：首选线记在 SourceStore
     /// 的会话缓存里，新 host 不重竞时 preferredLine 兜底读它（见下面 getter）。
@@ -67,6 +70,13 @@ final class WidgetHost: @unchecked Sendable {
         self.modules = built.modules
         self.exceptionBox = built.exceptionBox
         self.requestInterceptor = built.requestInterceptor
+        self.httpRegistry = built.httpRegistry
+    }
+
+    deinit {
+        // host 释放：在途的 Widget.http 请求全部取消，不让 detached 的
+        // executor Task 继续跑、继续 resolve 已释放的 JSContext。
+        httpRegistry.cancelAll()
     }
 
     private struct BuiltHost {
@@ -75,6 +85,7 @@ final class WidgetHost: @unchecked Sendable {
         let modules: [ModuleDescriptor]
         let exceptionBox: ExceptionBox
         let requestInterceptor: CategoryRequestInterceptor
+        let httpRegistry: HTTPRequestRegistry
     }
 
     private static func buildOnMainThread(jsSource: String, fallbackTitle: String? = nil) throws -> BuiltHost {
@@ -100,7 +111,8 @@ final class WidgetHost: @unchecked Sendable {
         }
 
         let interceptor = CategoryRequestInterceptor()
-        installWidgetBridge(in: context, interceptor: interceptor)
+        let httpRegistry = HTTPRequestRegistry()
+        installWidgetBridge(in: context, interceptor: interceptor, httpRegistry: httpRegistry)
 
         context.evaluateScript(jsSource)
         if let message = box.message, !message.isEmpty {
@@ -162,7 +174,7 @@ final class WidgetHost: @unchecked Sendable {
             throw WidgetHostError.invalidFormat("这个脚本的模块清单是空的，没有可用的功能")
         }
 
-        return BuiltHost(context: context, meta: meta, modules: modules, exceptionBox: box, requestInterceptor: interceptor)
+        return BuiltHost(context: context, meta: meta, modules: modules, exceptionBox: box, requestInterceptor: interceptor, httpRegistry: httpRegistry)
     }
 
     /// 站点字段有多个叫法（site / siteUrl / homepage），哪个有取哪个；都没有或为空就 nil。
@@ -218,7 +230,7 @@ final class WidgetHost: @unchecked Sendable {
     /// 前缀 fw.localstorage.）、全局 fetch（GET/POST 最小实现）、setTimeout / clearTimeout、
     /// setInterval / clearInterval、console.log / info / debug / warn / error（多参数拼接）。
     /// 模块发现三路超集、loadDetail/childItems/relatedItems 解析、分类拦截器都不在这里动。
-    private static func installWidgetBridge(in context: JSContext, interceptor: CategoryRequestInterceptor) {
+    private static func installWidgetBridge(in context: JSContext, interceptor: CategoryRequestInterceptor, httpRegistry: HTTPRequestRegistry) {
         let widget = JSValue(newObjectIn: context)!
         let http = JSValue(newObjectIn: context)!
         let storage = JSValue(newObjectIn: context)!
@@ -235,7 +247,7 @@ final class WidgetHost: @unchecked Sendable {
                 // JS 正在执行时 context 不可能已释放；这行理论上走不到。
                 fatalError("WidgetHost: JSContext 已释放，无法发起请求")
             }
-            return makeHttpGetPromise(in: context, urlString: urlString, options: options, interceptor: interceptor)
+            return makeHttpGetPromise(in: context, urlString: urlString, options: options, interceptor: interceptor, httpRegistry: httpRegistry)
         }
         http.setValue(httpGet, forProperty: "get")
 
@@ -246,7 +258,7 @@ final class WidgetHost: @unchecked Sendable {
             guard let context else {
                 fatalError("WidgetHost: JSContext 已释放，无法发起请求")
             }
-            return makeHttpPostPromise(in: context, urlString: urlString, body: body, options: options)
+            return makeHttpPostPromise(in: context, urlString: urlString, body: body, options: options, httpRegistry: httpRegistry)
         }
         http.setValue(httpPost, forProperty: "post")
         widget.setValue(http, forProperty: "http")
@@ -510,7 +522,7 @@ final class WidgetHost: @unchecked Sendable {
     /// 从 context 取 Promise 构造器，用 executor block 造一个 JS Promise。
     /// executor 被 Promise 构造器同步调用，交出 resolve/reject；
     /// Swift 拿着它们去后台发请求，完事回主线程结算。
-    private static func makeHttpGetPromise(in context: JSContext, urlString: String, options: JSValue?, interceptor: CategoryRequestInterceptor) -> JSValue {
+    private static func makeHttpGetPromise(in context: JSContext, urlString: String, options: JSValue?, interceptor: CategoryRequestInterceptor, httpRegistry: HTTPRequestRegistry) -> JSValue {
         guard let promiseConstructor = context.objectForKeyedSubscript("Promise"),
               !promiseConstructor.isUndefined else {
             fatalError("WidgetHost: JS 环境里没有 Promise")
@@ -520,7 +532,15 @@ final class WidgetHost: @unchecked Sendable {
         let effectiveURL = interceptor.rewrittenURL(for: urlString) ?? urlString
         let executor: @convention(block) (JSValue, JSValue) -> Void = { resolve, reject in
             let box = JSCallbackBox(resolve: resolve, reject: reject)
-            Task {
+            // executor Task 是 detached 的：记进登记表，完事自己注销；
+            // host 释放/模块调用失败时由 cancelAll 统一取消。
+            // 注意：Task 体内第一个 await（fetchHTTP）才会挂起，register
+            // 一定在 Task 跑完之前执行到，defer 里的 unregister 不会漏。
+            var taskID: UUID?
+            let task = Task {
+                defer {
+                    if let taskID { httpRegistry.unregister(taskID) }
+                }
                 do {
                     let (status, data, responseHeaders, rawData) = try await Self.fetchHTTP(
                         urlString: effectiveURL,
@@ -550,6 +570,7 @@ final class WidgetHost: @unchecked Sendable {
                     }
                 }
             }
+            taskID = httpRegistry.register(task)
         }
         guard let promise = promiseConstructor.construct(withArguments: [executor]) else {
             fatalError("WidgetHost: 构造 Promise 失败")
@@ -557,7 +578,7 @@ final class WidgetHost: @unchecked Sendable {
         return promise
     }
 
-    private static func makeHttpPostPromise(in context: JSContext, urlString: String, body: JSValue?, options: JSValue?) -> JSValue {
+    private static func makeHttpPostPromise(in context: JSContext, urlString: String, body: JSValue?, options: JSValue?, httpRegistry: HTTPRequestRegistry) -> JSValue {
         guard let promiseConstructor = context.objectForKeyedSubscript("Promise"),
               !promiseConstructor.isUndefined else {
             fatalError("WidgetHost: JS 环境里没有 Promise")
@@ -567,7 +588,13 @@ final class WidgetHost: @unchecked Sendable {
         let bodyData = httpBodyData(from: body)
         let executor: @convention(block) (JSValue, JSValue) -> Void = { resolve, reject in
             let box = JSCallbackBox(resolve: resolve, reject: reject)
-            Task {
+            // executor Task 是 detached 的：记进登记表，完事自己注销；
+            // host 释放/模块调用失败时由 cancelAll 统一取消（与 GET 同理）。
+            var taskID: UUID?
+            let task = Task {
+                defer {
+                    if let taskID { httpRegistry.unregister(taskID) }
+                }
                 do {
                     let (status, data, responseHeaders, rawData) = try await Self.fetchHTTP(
                         urlString: urlString,
@@ -599,6 +626,7 @@ final class WidgetHost: @unchecked Sendable {
                     }
                 }
             }
+            taskID = httpRegistry.register(task)
         }
         guard let promise = promiseConstructor.construct(withArguments: [executor]) else {
             fatalError("WidgetHost: 构造 Promise 失败")
@@ -1232,7 +1260,8 @@ final class WidgetHost: @unchecked Sendable {
         }
         let once = OnceBox()
         let contBox = ContinuationBox()
-        return try await withTaskCancellationHandler {
+        do {
+            return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<JSValue, Error>) in
                 contBox.set(continuation)
                 if Task.isCancelled {
@@ -1266,12 +1295,11 @@ final class WidgetHost: @unchecked Sendable {
                     }
                 )
                 DispatchQueue.main.async {
-                    if Task.isCancelled {
-                        if once.tryTake() {
-                            contBox.take()?.resume(throwing: CancellationError())
-                        }
-                        return
-                    }
+                    // 旧检查是死的：这个闭包跑在主队列上时 Task.isCancelled
+                    // 读的是当前任务（主队列任务）的取消状态，永远 false。
+                    // 用 once.isDone 判：onCancel 已抢占时直接返回，不再调 then
+                    //（调了也没用——回调会被 once 拦住，continuation 永远等不到）。
+                    guard !once.isDone else { return }
                     _ = box.value.invokeMethod("then", withArguments: [callbacks.fulfilled, callbacks.rejected])
                 }
             }
@@ -1279,6 +1307,12 @@ final class WidgetHost: @unchecked Sendable {
             if once.tryTake() {
                 contBox.take()?.resume(throwing: CancellationError())
             }
+        }
+        } catch {
+            // 本次模块调用失败/超时（reject 或取消）：在途的 Widget.http
+            // 请求全部取消，不让它们继续跑、继续 resolve 这个 host 的 JS。
+            httpRegistry.cancelAll()
+            throw error
         }
     }
 
@@ -1431,11 +1465,48 @@ private final class ExceptionBox {
     var message: String?
 }
 
+/// 在途 Widget.http 请求登记表：executor Task 是 detached 的（无父子关系，
+/// host 释放时没人取消），记在这里；host deinit 或一次模块调用失败/超时
+/// 时统一取消，不让已死的 host 的请求继续跑、继续 resolve 已释放的 JSContext。
+private final class HTTPRequestRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var tasks: [UUID: Task<Void, Never>] = [:]
+
+    func register(_ task: Task<Void, Never>) -> UUID {
+        let id = UUID()
+        lock.lock()
+        tasks[id] = task
+        lock.unlock()
+        return id
+    }
+
+    func unregister(_ id: UUID) {
+        lock.lock()
+        tasks.removeValue(forKey: id)
+        lock.unlock()
+    }
+
+    func cancelAll() {
+        lock.lock()
+        let current = tasks
+        tasks.removeAll()
+        lock.unlock()
+        for task in current.values { task.cancel() }
+    }
+}
+
 /// 防 continuation 被两个回调各 resume 一次（Promise 正常只调一个，但防一手，
 /// 重复 resume 会直接 crash）。
 private final class OnceBox {
     private let lock = NSLock()
     private var done = false
+
+    /// 是否已被占过（任一回调/onCancel 抢到了唯一一次 resume 权）。
+    var isDone: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return done
+    }
 
     func tryTake() -> Bool {
         lock.lock()

@@ -15,7 +15,8 @@ import Network
 //
 // 关键点（Claude Q5 定稿，逐项兑现）：
 // - 重定向：代理自己跟随上游 3xx，绝不把 Location 交给 AVPlayer；
-//   跨域 302 会丢自定义头，重定向请求上把身份头补回去（同拦截器的 RedirectHandler）。
+//   跨域 302 会丢自定义头，重定向请求上把身份头补回去（同 DiagnosticHTTPClient
+//   的 PerRequestDelegate 的做法）。
 // - 流式转发：分片边收边发，不先下完再回（AVPlayer 首字节预算约 3.5 秒，二手说法，
 //   宁可信其有）；播单/密钥小响应先收齐（要改写/要原样服务），再一次发出。
 // - 一次性 token：首次真实请求即嗅探，不另做预检 GET；小响应（≤8MB）
@@ -139,9 +140,12 @@ final class LoopbackProxyServer: NSObject {
     private var cacheBytes: Int = 0
     /// taskIdentifier → 拉取上下文。
     private var activeTasks: [Int: ProxyFetchContext] = [:]
-    /// token → 在途拉取上下文（从登记占位到拉取收尾；didCompleteWithError 结束才撤，
-    /// 不然撤掉到进缓存的窗口里后到的请求会再发一次上游、烧掉一次性 token）。
-    private var inFlightByToken: [String: ProxyFetchContext] = [:]
+    /// cacheKey(token:range:) → 在途拉取上下文（从登记占位到拉取收尾；
+    /// didCompleteWithError 结束才撤，不然撤掉到进缓存的窗口里后到的请求会再发
+    /// 一次上游、烧掉一次性 token）。键必须含 Range：同一 token 的全量与
+    /// Range 请求是两次不同的上游拉取，共用一个占位会把 Range 请求错当成
+    /// “已在途”挂等候、最后拿到错误长度的响应。
+    private var inFlightByKey: [String: ProxyFetchContext] = [:]
     /// 正在服务的连接（stop 时一并断掉）。数组 + 身份比对：
     /// NWConnection 不是 Hashable，不能放 Set；去重与删除都按对象身份（===）。
     private var connections: [NWConnection] = []
@@ -261,8 +265,15 @@ final class LoopbackProxyServer: NSObject {
     }
 
     private func onListenerReady(listener: NWListener) {
-        stateLock.lock()
         let port = Int(listener.port?.rawValue ?? 0)
+        // port == 0 必须在改状态之前就拦住：旧代码先把 startCompleted 置 true
+        // 再调 completeStart(success: false)，后者被 startCompleted 守卫直接
+        // 拦回，start 的 completion 永远不回调、调用方永久挂起。
+        guard port > 0 else {
+            completeStart(success: false)
+            return
+        }
+        stateLock.lock()
         let wasBound = boundPort != 0
         boundPort = port
         let handler = restartHandler
@@ -274,16 +285,12 @@ final class LoopbackProxyServer: NSObject {
         }
         restartAttempts = 0
         stateLock.unlock()
-        if port > 0 {
-            // 第一次就绪是“能力已证实”；之后是监听重启换端口。
-            PlaybackCapabilities.hasLoopbackProxy = true
-            if !completed {
-                completion?(true)
-            } else if wasBound {
-                handler?()
-            }
-        } else {
-            completeStart(success: false)
+        // 第一次就绪是“能力已证实”；之后是监听重启换端口。
+        PlaybackCapabilities.hasLoopbackProxy = true
+        if !completed {
+            completion?(true)
+        } else if wasBound {
+            handler?()
         }
     }
 
@@ -542,8 +549,8 @@ final class LoopbackProxyServer: NSObject {
             stateLock.unlock()
             return .serveCached(cached)
         }
-        // 2. 同一 token 正在取。
-        if let context = inFlightByToken[mapping.token] {
+        // 2. 同一 token + 同 Range 正在取。
+        if let context = inFlightByKey[key] {
             if !context.headersSent {
                 context.waiters.append((connection: connection, queue: queue, range: range))
                 stateLock.unlock()
@@ -559,7 +566,7 @@ final class LoopbackProxyServer: NSObject {
         }
         // 3. 没人取：登记占位（建 task 前就占住，别的连接再来只能挂等候）。
         let context = ProxyFetchContext(connection: connection, queue: queue, mapping: mapping, requestRange: range)
-        inFlightByToken[mapping.token] = context
+        inFlightByKey[key] = context
         stateLock.unlock()
         return .startFetch(context)
     }
@@ -571,7 +578,7 @@ final class LoopbackProxyServer: NSObject {
         guard let session else {
             // 会话没了（已 stop）：撤掉占位，主连接和已挂上的等候者都给 502。
             stateLock.lock()
-            inFlightByToken.removeValue(forKey: context.mapping.token)
+            inFlightByKey.removeValue(forKey: cacheKey(token: context.mapping.token, range: context.requestRange))
             let waiters = context.waiters
             stateLock.unlock()
             sendSimpleResponse(connection: context.connection, queue: context.queue, status: 502, body: "Bad Gateway")
@@ -611,7 +618,7 @@ final class LoopbackProxyServer: NSObject {
         stateLock.lock()
         defer { stateLock.unlock() }
         if let context = activeTasks.removeValue(forKey: task.taskIdentifier) {
-            inFlightByToken.removeValue(forKey: context.mapping.token)
+            inFlightByKey.removeValue(forKey: cacheKey(token: context.mapping.token, range: context.requestRange))
         }
     }
 

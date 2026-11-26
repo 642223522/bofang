@@ -1130,13 +1130,26 @@ final class PlayerViewModel: ObservableObject {
     /// - 非原生容器且没集成软解：报明确错误（需要软解播放器），不无意义重试。
     /// 先试下一条没失败过的线，都失败才报 failed。
     /// 终局（切线/报 failed）时账本定 stage 与三路判定；分层明确的失败才写路线记忆。
-    func markFailed(_ reason: String, stage: PlaybackFailureStage? = nil) {
+    func markFailed(
+        _ reason: String,
+        stage: PlaybackFailureStage? = nil,
+        httpStatusCode: Int? = nil,
+        failedURL: URL? = nil
+    ) {
+        // 所有调用方都在主线程（PlayerViewModel 是 @MainActor）：不断言就
+        // 悄悄把锁省了，万一哪天有后台调用方，assert 会在 DEBUG 抓住它。
+        assert(Thread.isMainThread)
+        // 拦截旧 item 迟到的失败回调，防误杀刚切好的新线。
+        if let failedURL, failedURL != currentURL && failedURL != proxyURL { return }
         // 同一条 URL 只认一次失败：KVO .failed 和失败通知可能先后都到，
         // 不拦的话第二次会把刚切上的下一条线也误标失败。
         guard let current = currentURL?.absoluteString, !failedURLs.contains(current) else { return }
         // 分层：调用方传来的 stage 优先，否则用拦截器记的分层。
         let failureStage = stage ?? resourceLoader?.lastFailureStage
-        let failureStatusCode = resourceLoader?.lastFailureStatusCode
+        // 状态码：调用方（播放器视图的 errorLog）优先，否则用拦截器记的。
+        let failureStatusCode = httpStatusCode ?? resourceLoader?.lastFailureStatusCode
+        // 404/410 说明服务端根本没有该片源（如 memojav 缺号），跳过同线引擎升级，直接切备用线。
+        let isNotFound = (failureStatusCode == 404 || failureStatusCode == 410)
         // FairPlay：拦截器或代理已在播单里见到 skd://，直接明确报错。
         if resourceLoader?.encounteredFairPlay == true || proxyServer?.hasEncounteredFairPlay() == true {
             failedURLs.insert(current)
@@ -1147,93 +1160,98 @@ final class PlayerViewModel: ObservableObject {
         }
         let currentLine = lines.first(where: { $0.url == current })
         let hintIsHLSJS = (currentLine?.playerHint ?? "").lowercased().contains("hlsjs")
-        // 过期/一次性 URL 不再自动重试：签名线在 key 层失败（403/401，重拉+重铸已尽），
-        // 同一条旧 URL 再换引擎试也没有意义——直接记过期、切下一条线。
-        if hintIsHLSJS || PlaybackEngine.isSignedURL(current),
-           failureStage == .keyFetch {
-            expiredTokenURLs.insert(current)
-            failedURLs.insert(current)
-            if let next = lines.first(where: { !failedURLs.contains($0.url) }) {
+        // 404/410：服务端根本没有该片源，同线换引擎没有意义
+        //（memojav 缺号时 native→拦截器→hls.js→代理全试一遍也是 404），
+        // 直接跳过下面五段引擎升级，切备用线。
+        if !isNotFound {
+            // 过期/一次性 URL 不再自动重试：签名线在 key 层失败（403/401，重拉+重铸已尽），
+            // 同一条旧 URL 再换引擎试也没有意义——直接记过期、切下一条线。
+            if hintIsHLSJS || PlaybackEngine.isSignedURL(current),
+               failureStage == .keyFetch {
+                expiredTokenURLs.insert(current)
+                failedURLs.insert(current)
+                if let next = lines.first(where: { !failedURLs.contains($0.url) }) {
+                    finalizeLedgerAttempt(outcome: "密钥过期/一次性 token 失效", playedOK: false)
+                    routeLine(next)
+                    return
+                }
+                failureReason = layeredReason(stage: .keyFetch, statusCode: failureStatusCode, fallback: reason)
+                status = .failed(failureReason!)
                 finalizeLedgerAttempt(outcome: "密钥过期/一次性 token 失效", playedOK: false)
-                routeLine(next)
                 return
             }
-            failureReason = layeredReason(stage: .keyFetch, statusCode: failureStatusCode, fallback: reason)
-            status = .failed(failureReason!)
-            finalizeLedgerAttempt(outcome: "密钥过期/一次性 token 失效", playedOK: false)
-            return
-        }
-        if hintIsHLSJS {
-            // hls.js 失败 → Native HLS 兼容实现（拦截器），只试一次。
-            if currentEngine == .hlsjs, !hasTriedFallback(url: current, engine: .nativeIntercepted) {
-                markFallbackTried(url: current, engine: .nativeIntercepted)
-                engineOverrides[current] = .nativeIntercepted
-                if let line = currentLine {
-                    routeLine(line)
+            if hintIsHLSJS {
+                // hls.js 失败 → Native HLS 兼容实现（拦截器），只试一次。
+                if currentEngine == .hlsjs, !hasTriedFallback(url: current, engine: .nativeIntercepted) {
+                    markFallbackTried(url: current, engine: .nativeIntercepted)
+                    engineOverrides[current] = .nativeIntercepted
+                    if let line = currentLine {
+                        routeLine(line)
+                        return
+                    }
+                }
+                // 拦截器失败 → hls.js 重试同一条线一次（分片需头 -12881 也走这条：
+                // 拦截器覆盖不了分片，hls.js 经 XHR 能给分片带头）。
+                if currentEngine == .nativeIntercepted,
+                   PlaybackCapabilities.hasHLSJS,
+                   !hasTriedFallback(url: current, engine: .hlsjs) {
+                    markFallbackTried(url: current, engine: .hlsjs)
+                    engineOverrides[current] = .hlsjs
+                    resourceLoader = nil
+                    noteLedgerEngine(.hlsjs)
+                    currentEngine = .hlsjs
+                    status = .loading
+                    failureReason = nil
                     return
                 }
             }
-            // 拦截器失败 → hls.js 重试同一条线一次（分片需头 -12881 也走这条：
-            // 拦截器覆盖不了分片，hls.js 经 XHR 能给分片带头）。
-            if currentEngine == .nativeIntercepted,
+            // P 失败 → J：代理也失败了，hlsjs 线、hls.js 可用、还没试过 hls.js 时，
+            // 切 hls.js 再试一次（一步）；不是 hlsjs 线或 hls.js 已试过，直接走下面切线。
+            if currentEngine == .proxy,
+               hintIsHLSJS,
                PlaybackCapabilities.hasHLSJS,
                !hasTriedFallback(url: current, engine: .hlsjs) {
                 markFallbackTried(url: current, engine: .hlsjs)
                 engineOverrides[current] = .hlsjs
                 resourceLoader = nil
+                releaseProxy()
                 noteLedgerEngine(.hlsjs)
                 currentEngine = .hlsjs
                 status = .loading
                 failureReason = nil
                 return
             }
-        }
-        // P 失败 → J：代理也失败了，hlsjs 线、hls.js 可用、还没试过 hls.js 时，
-        // 切 hls.js 再试一次（一步）；不是 hlsjs 线或 hls.js 已试过，直接走下面切线。
-        if currentEngine == .proxy,
-           hintIsHLSJS,
-           PlaybackCapabilities.hasHLSJS,
-           !hasTriedFallback(url: current, engine: .hlsjs) {
-            markFallbackTried(url: current, engine: .hlsjs)
-            engineOverrides[current] = .hlsjs
-            resourceLoader = nil
-            releaseProxy()
-            noteLedgerEngine(.hlsjs)
-            currentEngine = .hlsjs
-            status = .loading
-            failureReason = nil
-            return
-        }
-        // D 失败 → P：回环代理升级（梯子 D → P → J 里的一级）。
-        // 只在代理能帮上忙的信号下升级：分片需头（.segmentFetch / -12881，
-        // 拦截器覆盖不了分片）或拦截被绕过（errorLog 指向原始 https 地址）；
-        // 其他失败直接切线，不白跑代理。代理起监听失败过（sticky）也不再试。
-        // 升级后由 routeLine 走 setCurrent(.proxy) 起监听；监听就绪才交回环地址给播放器。
-        if (currentEngine == .nativeIntercepted || currentEngine == .hlsjs),
-           !PlaybackCapabilities.loopbackProxyBindFailed,
-           !hasTriedFallback(url: current, engine: .proxy),
-           (failureStage == .segmentFetch || lastBypassSignal) {
-            markFallbackTried(url: current, engine: .proxy)
-            engineOverrides[current] = .proxy
-            if let line = currentLine {
+            // D 失败 → P：回环代理升级（梯子 D → P → J 里的一级）。
+            // 只在代理能帮上忙的信号下升级：分片需头（.segmentFetch / -12881，
+            // 拦截器覆盖不了分片）或拦截被绕过（errorLog 指向原始 https 地址）；
+            // 其他失败直接切线，不白跑代理。代理起监听失败过（sticky）也不再试。
+            // 升级后由 routeLine 走 setCurrent(.proxy) 起监听；监听就绪才交回环地址给播放器。
+            if (currentEngine == .nativeIntercepted || currentEngine == .hlsjs),
+               !PlaybackCapabilities.loopbackProxyBindFailed,
+               !hasTriedFallback(url: current, engine: .proxy),
+               (failureStage == .segmentFetch || lastBypassSignal) {
+                markFallbackTried(url: current, engine: .proxy)
+                engineOverrides[current] = .proxy
+                if let line = currentLine {
+                    routeLine(line)
+                    return
+                }
+            }
+            // 裸连失败升级拦截器：只对明文静态线（无签名、无自定义头、无 Cookie），
+            // 同一条线只升级一次；带 token 的线不重试同一条（不消费一次性 token）。
+            if currentEngine == .native,
+               let line = currentLine,
+               PlaybackEngine.isPlainStaticLine(line),
+               !hasTriedFallback(url: current, engine: .nativeIntercepted) {
+                markFallbackTried(url: current, engine: .nativeIntercepted)
+                engineOverrides[current] = .nativeIntercepted
                 routeLine(line)
                 return
             }
         }
-        // 裸连失败升级拦截器：只对明文静态线（无签名、无自定义头、无 Cookie），
-        // 同一条线只升级一次；带 token 的线不重试同一条（不消费一次性 token）。
-        if currentEngine == .native,
-           let line = currentLine,
-           PlaybackEngine.isPlainStaticLine(line),
-           !hasTriedFallback(url: current, engine: .nativeIntercepted) {
-            markFallbackTried(url: current, engine: .nativeIntercepted)
-            engineOverrides[current] = .nativeIntercepted
-            routeLine(line)
-            return
-        }
         failedURLs.insert(current)
         if let next = lines.first(where: { !failedURLs.contains($0.url) }) {
-            finalizeLedgerAttempt(outcome: "失败，切下一条线", playedOK: false)
+            finalizeLedgerAttempt(outcome: isNotFound ? "主线 404，自动切备用线" : "失败，切下一条线", playedOK: false)
             if let line = currentLine {
                 // 分层明确的失败才写路线记忆（分层不明不写，避免把偶然失败记成路线）。
                 PlaybackLedger.shared.recordRouteFailure(key: routeMemoryKey(for: line), clearClass: failureStage != nil)

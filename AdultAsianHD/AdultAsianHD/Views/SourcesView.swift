@@ -565,7 +565,11 @@ struct SourcesView: View {
                 if let first = store.sources.first {
                     currentSourceId = first.id
                 }
-                showResultAlert("同步完成，共 \(count) 个源")
+                if let warning = store.lastSyncError {
+                    showResultAlert("同步完成，共 \(count) 个源；有个文件没同步上：\(warning)")
+                } else {
+                    showResultAlert("同步完成，共 \(count) 个源")
+                }
             case .failure(let error):
                 showResultAlert(error.localizedDescription)
             }

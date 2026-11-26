@@ -115,6 +115,7 @@ final class CoverImageCache: @unchecked Sendable {
 
     /// 先查 L1 内存，未命中再异步读 L2 磁盘并回填 L1；均未命中返回 nil（调用方才发网络请求）。
     func cachedImage(for key: String) async -> UIImage? {
+        if Task.isCancelled { return nil }
         if let mem = memoryCache.object(forKey: key as NSString) {
             return mem
         }
@@ -126,9 +127,13 @@ final class CoverImageCache: @unchecked Sendable {
                     return
                 }
                 guard let data = try? Data(contentsOf: fileURL),
-                      let uiImage = UIImage(data: data) else {
+                      var uiImage = UIImage(data: data) else {
                     continuation.resume(returning: nil)
                     return
+                }
+                // 磁盘解出的图预渲染一次再回填 L1/上屏，避免主线程首次绘制卡顿。
+                if let prepared = uiImage.preparingForDisplay() {
+                    uiImage = prepared
                 }
                 // 更新修改时间用于 LRU 淘汰
                 var mutableURL = fileURL
@@ -273,12 +278,21 @@ struct CoverImage: View {
             image = nil
             return
         }
-        // 1. 先查 L1 内存 → L2 磁盘，命中直接显示，绝不发网络请求
+        // 1. 同步查 L1 内存：命中立即显示；未命中先把旧图清掉（cell 复用时
+        // 不闪上一张图的旧封面），再走异步 L2/网络路径。
+        if let mem = CoverImageCache.shared.image(for: urlString) {
+            image = mem
+            return
+        }
+        image = nil
+        // 2. L2 磁盘，命中直接显示，绝不发网络请求
         if let cached = await CoverImageCache.shared.cachedImage(for: urlString) {
             if !Task.isCancelled { image = cached }
             return
         }
-        // 2. 缓存均未命中：带 UA + Referer 拉图，禁用 HTTP/3 规避无节点 UDP 443 卡顿
+        // 3. 缓存均未命中：带 UA + Referer 拉图，禁用 HTTP/3 规避无节点 UDP 443 卡顿。
+        // 4xx（图不存在/没权限）直接放弃不重试；5xx/网络错 500ms 后重试一次。
+        // 解码放 Task.detached（不占主线程），解完 preparingForDisplay 预渲染。
         for attempt in 0..<2 {
             if Task.isCancelled { return }
             do {
@@ -288,9 +302,15 @@ struct CoverImage: View {
                 request.setValue(Self.referer(for: url), forHTTPHeaderField: "Referer")
                 let (data, response) = try await Self.imageSession.data(for: request)
                 if Task.isCancelled { return }
-                guard (response as? HTTPURLResponse)?.statusCode == 200 else { continue }
-                guard let decoded = CryptoImage.decodeCover(data),
-                      let uiImage = UIImage(data: decoded) else { continue }
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                if (400..<500).contains(status) { return }
+                guard status == 200 else { continue }
+                guard let decoded = CryptoImage.decodeCover(data) else { continue }
+                let uiImage = await Task.detached(priority: .userInitiated) { () -> UIImage? in
+                    guard let img = UIImage(data: decoded) else { return nil }
+                    return img.preparingForDisplay() ?? img
+                }.value
+                guard let uiImage else { continue }
                 CoverImageCache.shared.store(uiImage, rawDecodedData: decoded, for: urlString)
                 if !Task.isCancelled { image = uiImage }
                 return

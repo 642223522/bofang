@@ -2,12 +2,16 @@ import Foundation
 import Network
 
 /// 单次网络请求的死因/结果分层：区分 DNS / TCP / TLS / HTTP / WAF，定位真机无节点失败点。
+/// 404 归 .http（"HTTP 响应异常"），超时归 .timeout，连接中途丢归 .transport——
+/// 404 再也不会被写成“超时”，账本/检测页的死因才对得上。
 enum NetworkDiagPhase: String, Codable, Sendable {
     case ok
     case dns
     case tcp
     case tls
     case http
+    case timeout
+    case transport
     case waf
     case cancelled
     case unknown
@@ -18,7 +22,9 @@ enum NetworkDiagPhase: String, Codable, Sendable {
         case .dns: return "DNS 失败"
         case .tcp: return "TCP 连接失败"
         case .tls: return "TLS/SNI 握手失败"
-        case .http: return "HTTP 响应异常/超时"
+        case .http: return "HTTP 响应异常"
+        case .timeout: return "请求超时"
+        case .transport: return "传输层失败"
         case .waf: return "WAF/CF 挑战拦截"
         case .cancelled: return "已取消"
         case .unknown: return "未知网络错误"
@@ -297,6 +303,14 @@ final class NetworkDiagnostics: ObservableObject {
         description: String
     ) -> (NetworkDiagPhase, String) {
         guard let tx else {
+            // 连 metrics 都没有：按错误码分——超时就是超时，连接丢失就是传输层失败，
+            // 不再一律判未知/HTTP。
+            if code == URLError.timedOut.rawValue {
+                return (.timeout, "请求超时 [\(code)] \(description)")
+            }
+            if code == URLError.networkConnectionLost.rawValue {
+                return (.transport, "连接丢失 [\(code)] \(description)")
+            }
             return (.unknown, "[\(code)] \(description)")
         }
         // DNS 开始了但没结束
@@ -326,13 +340,16 @@ final class NetworkDiagnostics: ObservableObject {
         }
         // TLS 完成了、请求已发，但未收到响应头（服务端丢包/慢响应/WAF 静默丢弃）
         if tx.requestStartDate != nil && tx.responseStartDate == nil {
-            return (.http, "等待首字节超时/连接重置 [\(code)]")
+            if code == URLError.timedOut.rawValue {
+                return (.timeout, "等待首字节超时 [\(code)]")
+            }
+            return (.transport, "等待首字节时连接重置 [\(code)]")
         }
         // 什么都没启动就失败（如离线/代理不可达）：不判 DNS，判未知。
         if tx.domainLookupStartDate == nil && tx.connectStartDate == nil {
             return (.unknown, "未启动解析/建连，可能离线或代理不可达 [\(code)]")
         }
-        return (.http, "传输中断 [\(code)] \(description)")
+        return (.transport, "传输中断 [\(code)] \(description)")
     }
 
     private nonisolated static func isWAFResponse(http: HTTPURLResponse, bodyData: Data?) -> Bool {
@@ -412,6 +429,9 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
             if signature != self.lastPathSignature {
                 self.lastPathSignature = signature
                 self.resetCookies()
+                // 切网：DoH 解析出的 IP 与偏好表一起清空（新网络下
+                // 旧 IP 可能不可达，下一请求重新解析）。
+                DoHFallbackClient.shared.resetForNetworkChange()
             }
         }
         pathMonitor.start(queue: pathMonitorQueue)
@@ -442,6 +462,13 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
             request.timeoutInterval = 12
         }
         let totalDeadline = timeout ?? 12
+
+        // DoH 偏好 host（之前走 DoH 成功过）：直接走 DoH，不再先浪费一次
+        // 系统 DNS（系统 DNS 给的是被污染的 Facebook IP，TCP 黑洞 12 秒）。
+        if DoHFallbackClient.shared.isDoHPreferred(for: request.url?.host),
+           let url = request.url, url.scheme?.lowercased() == "https" {
+            return try await performViaDoH(request: request, source: source, preservedHeaders: preservedHeaders, timeout: totalDeadline)
+        }
 
         let delegate = PerRequestDelegate(
             originURL: request.url,
@@ -483,6 +510,74 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                 bodyData: nil,
                 error: error,
                 metrics: await delegate.takeMetricsSoon(),
+                fallbackDurationMs: elapsedMs,
+                networkClass: networkClassAtStart
+            )
+            NetworkDiagnostics.record(event)
+            // 系统 DNS/TCP/TLS/超时失败：DoH 兜底（只对 https + 有 host 的请求；
+            // HTTP 4xx/5xx 是服务端正常响应，不进 catch；离线/证书信任失败/
+            // 取消不走兜底，DoH 也救不了）。
+            if let url = request.url,
+               url.scheme?.lowercased() == "https",
+               let host = url.host, !host.isEmpty,
+               isDoHFallbackWorthy(error) {
+                return try await performViaDoH(request: request, source: source, preservedHeaders: preservedHeaders, timeout: totalDeadline)
+            }
+            throw error
+        }
+    }
+
+    /// 哪些失败值得走 DoH 兜底：DNS 查不到/污染、TCP 连不上/黑洞、
+    /// TLS 握手失败、超时。
+    private func isDoHFallbackWorthy(_ error: Error) -> Bool {
+        guard let urlErr = error as? URLError else { return false }
+        switch urlErr.code {
+        case .timedOut, .cannotFindHost, .cannotConnectToHost,
+             .networkConnectionLost, .dnsLookupFailed, .secureConnectionFailed:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// 经 DoH 客户端发请求（直连 DoH 解析出的 IP）：成功记偏好，
+    /// 失败记一条诊断事件后把错抛回调用方。
+    private func performViaDoH(
+        request: URLRequest,
+        source: String,
+        preservedHeaders: [String: String],
+        timeout: TimeInterval
+    ) async throws -> (Data, URLResponse) {
+        let started = Date()
+        let networkClassAtStart = PlaybackLedger.networkClass
+        do {
+            let (data, http, _) = try await DoHFallbackClient.shared.perform(
+                request: request,
+                preservedHeaders: preservedHeaders,
+                timeout: timeout
+            )
+            let elapsedMs = Int(Date().timeIntervalSince(started) * 1000)
+            let event = NetworkDiagnostics.makeEvent(
+                source: source,
+                request: request,
+                response: http,
+                bodyData: data,
+                error: nil,
+                metrics: nil,
+                fallbackDurationMs: elapsedMs,
+                networkClass: networkClassAtStart
+            )
+            NetworkDiagnostics.record(event)
+            return (data, http)
+        } catch {
+            let elapsedMs = Int(Date().timeIntervalSince(started) * 1000)
+            let event = NetworkDiagnostics.makeEvent(
+                source: source,
+                request: request,
+                response: nil,
+                bodyData: nil,
+                error: error,
+                metrics: nil,
                 fallbackDurationMs: elapsedMs,
                 networkClass: networkClassAtStart
             )
