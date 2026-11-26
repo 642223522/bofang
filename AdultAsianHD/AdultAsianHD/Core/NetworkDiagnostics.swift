@@ -36,7 +36,9 @@ struct NetworkDiagEvent: Identifiable, Codable, Sendable {
     let host: String
     /// 重定向前的原始 host（与 host 不同时才有值；同 host 时为 nil）。
     /// host/path 一律按最终重定向落点记，原始 host 只留作对照。
-    let originalHost: String? = nil
+    /// 注意：声明上不带 = nil——let 在声明里给了初值就不能在 init 里再赋值
+    ///（run #15 教训）；默认值放在下面显式 init 的参数上。
+    let originalHost: String?
     let sanitizedPath: String
     /// direct / proxy（发起时的网络类）
     let networkClass: String
