@@ -51,6 +51,14 @@ targets:
         - UIInterfaceOrientationPortrait
         - UIInterfaceOrientationLandscapeLeft
         - UIInterfaceOrientationLandscapeRight
+      # iPad 方向（Duo 内屏按 iPad 形态走，缺它时回退读通用键；四个方向全给，
+      # 2026-11-26 Gemini+ChatGPT 共识的加固项。工作流 Fix 步骤里也会在已编好的
+      # .app 上再补一次，和 iPhone 方向键一样，防管线弄丢）。
+      "INFOPLIST_KEY_UISupportedInterfaceOrientations~ipad":
+        - UIInterfaceOrientationPortrait
+        - UIInterfaceOrientationLandscapeLeft
+        - UIInterfaceOrientationLandscapeRight
+        - UIInterfaceOrientationPortraitUpsideDown
       SWIFT_VERSION: "5.0"
       TARGETED_DEVICE_FAMILY: "1,2"
       CODE_SIGN_STYLE: Automatic
