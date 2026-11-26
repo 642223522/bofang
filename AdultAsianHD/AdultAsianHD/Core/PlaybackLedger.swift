@@ -199,9 +199,14 @@ enum NetworkState {
     }
 
     static func hasSystemProxy() -> Bool {
-        guard let proxies = CFNetworkCopySystemProxySettings() as? [String: Any] else { return false }
-        let httpOn = proxies[kCFNetworkProxiesHTTPEnable as String] as? Int == 1
-        let httpsOn = proxies[kCFNetworkProxiesHTTPSEnable as String] as? Int == 1
+        // CFNetworkCopySystemProxySettings 是 Copy 系函数，返回 Unmanaged<CFDictionary>?，
+        // 必须 takeRetainedValue() 拿到字典再桥接——直接 as? [String: Any] 永远失败（编译警告已点明）。
+        guard let raw = CFNetworkCopySystemProxySettings() else { return false }
+        let proxies = raw.takeRetainedValue() as NSDictionary
+        // kCFNetworkProxiesHTTPEnable 在 iOS 上可用；kCFNetworkProxiesHTTPSEnable 是 macOS 专属（NA），
+        // iOS 上不能引用这个常量——HTTPS 那项改用字符串键查（iOS 的代理字典里同样有这个键）。
+        let httpOn = (proxies[kCFNetworkProxiesHTTPEnable as String] as? NSNumber)?.intValue == 1
+        let httpsOn = (proxies["HTTPSEnable"] as? NSNumber)?.intValue == 1
         return httpOn || httpsOn
     }
 
