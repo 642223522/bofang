@@ -20,7 +20,10 @@ final class WidgetHost: @unchecked Sendable {
     private let requestInterceptor: CategoryRequestInterceptor
     /// 在途 Widget.http 请求登记表（见 HTTPRequestRegistry）：executor Task
     /// 是 detached 的，host 释放/一次模块调用失败时没人取消，记在这里统一取消。
-    private let httpRegistry = HTTPRequestRegistry()
+    /// 注意：声明上不带初值（初值在 init 里从 built.httpRegistry 拿）——
+    /// let 带了初值又在 init 里再赋一次会编译失败（run #15 的 originalHost
+    /// 同款坑，run #17 第二轮又栽了一次）。
+    private let httpRegistry: HTTPRequestRegistry
     /// 线路竞速（进模块时跑一次）：本次该模块的首选线。
     /// 本会话（开软件到关软件）每个模块只自动竞速一次：首选线记在 SourceStore
     /// 的会话缓存里，新 host 不重竞时 preferredLine 兜底读它（见下面 getter）。
