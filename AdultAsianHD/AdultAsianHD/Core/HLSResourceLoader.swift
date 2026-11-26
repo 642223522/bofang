@@ -220,10 +220,13 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
             }
             // 播单：改写 key URI（改 scheme，走拦截器）与分片 URI（改绝对 https，
             // AVPlayer 直接拉），交给 AVPlayer。
+            // 相对 URI 按最终重定向落点解析（http.url），不是原始 originalURL——
+            // 重定向后的播单若按旧基址解析，相对 URI 会指向错误的 host/路径，100% 404。
             if isPlaylist(data: data, url: originalURL, response: http) {
                 let text = String(decoding: data, as: UTF8.self)
-                setPlaylistURL(originalURL)
-                let rewritten = rewritePlaylist(text, baseURL: originalURL)
+                let finalURL = http.url ?? originalURL
+                setPlaylistURL(finalURL)
+                let rewritten = rewritePlaylist(text, baseURL: finalURL)
                 let out = Data(rewritten.utf8)
                 finish(loadingRequest, data: out, contentType: nil, byteRangeAccessSupported: false, totalLength: out.count)
                 return
@@ -583,7 +586,11 @@ private final class RedirectHandler: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         var redirected = request
         redirected.assumesHTTP3Capable = false
+        // 凭据头（Authorization / Cookie / API key）只在同源（scheme+host+端口）
+        // 时保留；跨域或 HTTPS→HTTP 降级一律不带。
+        let sameOrigin = NetConstants.isSameOrigin(response.url ?? task.currentRequest?.url, request.url)
         for (key, value) in headers {
+            if !sameOrigin && NetConstants.isSensitiveHeader(key) { continue }
             redirected.setValue(value, forHTTPHeaderField: key)
         }
         completionHandler(redirected)

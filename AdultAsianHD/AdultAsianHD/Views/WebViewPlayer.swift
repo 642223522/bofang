@@ -226,6 +226,14 @@ final class EmbedProbeState: ObservableObject {
     weak var webView: WKWebView?
     /// 回调通知容器禁用广告规则（防止异步编译完成后把刚移除的规则又装回去）。
     var onDisableAdRules: (() -> Void)?
+    /// 页内 video 真在播时调一次（有 video、没暂停、时间在走）：外层据此调
+    /// ViewModel.markPlaying()，账本才有“播放中”的终局。注意：只报“真在播”，
+    /// 不报“WebView 接手了”——接手不等于播出（挑战页也会接手）。
+    var onPlaying: (() -> Void)?
+    /// 本 URL 是否已报过一次 onPlaying（切 URL 时 stop() 清掉，下个 URL 重新报）。
+    private var playingReported = false
+    /// 上次探到的 currentTime：时间往前走了才算“在播”。
+    private var lastPlayingTime: Double = 0
     private var timer: Timer?
     private var hideTask: Task<Void, Never>?
     private var wasPaused = true
@@ -241,6 +249,10 @@ final class EmbedProbeState: ObservableObject {
         }
     }
 
+    /// 停探针：切线路/切视频时必须把整套状态清干净再重新开始，
+    /// 不然 Line B 会沿用 Line A 的 challengeReloaded/challengeSince/hasVideo，
+    /// CF 兜底逻辑直接跳过（Line B 的挑战永远不触发）。
+    /// start() 开头会调 stop()，所以每次开始都是干净状态。
     func stop() {
         timer?.invalidate()
         timer = nil
@@ -248,6 +260,15 @@ final class EmbedProbeState: ObservableObject {
         hideTask = nil
         isScrubbing = false
         challengeRunning = false
+        challengeReloaded = false
+        challengeSince = nil
+        hasVideo = false
+        currentTime = 0
+        duration = 0
+        wasPaused = true
+        paused = true
+        playingReported = false
+        lastPlayingTime = 0
     }
 
     private func probe() {
@@ -318,6 +339,17 @@ final class EmbedProbeState: ObservableObject {
             }
             self.paused = nowPaused
             self.wasPaused = nowPaused
+            // 页内 video 真在播（有 video、没暂停、时间在往前走）：报一次 onPlaying，
+            // 外层调 markPlaying()，账本终局为“播放中”。只报一次（同一 URL）；
+            // 挑战页/停着的 video 不报；拖动时 currentTime 冻结，不会误报。
+            if !nowPaused, !self.playingReported {
+                let t = self.currentTime
+                if t > self.lastPlayingTime {
+                    self.playingReported = true
+                    self.onPlaying?()
+                }
+                self.lastPlayingTime = t
+            }
         }
     }
 
@@ -527,6 +559,11 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
         guard loadedURL != url else { return }
         loadedURL = url
         navigationStartAt = Date()
+        // 切 URL = 新的一页：探针整套状态清掉重开（challengeReloaded、hasVideo、
+        // playingReported 都归零），不然 Line B 沿用 Line A 的状态，CF 兜底
+        // 跳过、markPlaying 也不再报。
+        probe.stop()
+        probe.start()
         var request = URLRequest(url: url, timeoutInterval: 20)
         request.assumesHTTP3Capable = false
         webView?.load(request)
@@ -651,6 +688,9 @@ struct WebViewPlayerView: View {
     let onClose: () -> Void
     /// 是否开广告剥离（默认 true；DetailView 可把当前线路的 adStrip 传进来）。
     var adStrip: Bool = true
+    /// 页内 video 真在播时调一次（有 video、没暂停、时间在走）：外层据此
+    /// 调 ViewModel.markPlaying()。只报真在播，不报“WebView 接手了”。
+    var onPlaying: (() -> Void)? = nil
 
     @StateObject private var probe = EmbedProbeState()
 
@@ -672,6 +712,9 @@ struct WebViewPlayerView: View {
                             .foregroundColor(.white)
                     }
                 }
+                // 遮罩只作提示，不拦截手势：Cloudflare 复选框在它下面，
+                // 遮罩吃掉点击的话用户永远点不到“我是人类”，挑战就永远过不去。
+                .allowsHitTesting(false)
             }
             VStack {
                 Spacer()
@@ -699,6 +742,7 @@ struct WebViewPlayerView: View {
         }
         .background(Color.black)
         .onAppear {
+            probe.onPlaying = onPlaying
             probe.start()
             probe.showControlsTemporarily()
         }

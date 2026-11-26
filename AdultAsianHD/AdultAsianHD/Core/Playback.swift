@@ -1029,8 +1029,13 @@ final class PlayerViewModel: ObservableObject {
                     if let first = merged.first {
                         self.routeLine(first)
                     }
-                    // 嵌入线已接手（正在解流，isResolvingEmbed=true）：别报失败，等解流结果
-                    if self.currentURL == nil && !self.isResolvingEmbed {
+                    // 嵌入线已接手（正在解流，isResolvingEmbed=true，或墙后分支已把 URL
+                    // 交给 WebView、webViewURL != nil）：别报失败，等解流/嵌页结果。
+                    // 旧逻辑只查 isResolvingEmbed：墙后分支同步把 isResolvingEmbed=false、
+                    // webViewURL=embedURL、status=.playing 写好了，走到这里 currentURL
+                    // 仍是 nil、isResolvingEmbed 是 false，status 会被这句盖成 .failed，
+                    // 用户看到“没有可用的播放线路”，而 WebView 里其实已经在播了。
+                    if self.currentURL == nil && !self.isResolvingEmbed && self.webViewURL == nil {
                         self.status = .failed("没有可用的播放线路")
                         self.failureReason = "这个视频没有可用的播放线路"
                     }

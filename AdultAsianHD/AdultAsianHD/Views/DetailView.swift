@@ -80,7 +80,7 @@ struct DetailView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                 case .webView:
                     if let webViewURL = playerVM.webViewURL {
-                        WebViewPlayerView(url: webViewURL, onClose: { playerVM.closeWebView() })
+                        WebViewPlayerView(url: webViewURL, onClose: { playerVM.closeWebView() }, onPlaying: { playerVM.markPlaying() })
                             .aspectRatio(16.0 / 9.0, contentMode: .fit)
                             .background(Color.black)
                             .clipShape(RoundedRectangle(cornerRadius: 8))

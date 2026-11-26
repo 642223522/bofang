@@ -218,11 +218,39 @@ enum NetworkState {
         while let node = cursor {
             let name = String(cString: node.pointee.ifa_name)
             if name.hasPrefix("utun") || name.hasPrefix("ppp") || name.hasPrefix("ipsec") {
-                return true
+                // 只看名不行：每台真机自带 utun0/1/2（系统内部用），没开 VPN 也在。
+                // 必须同时满足：接口 UP+RUNNING，且配了真实地址（非链路本地 IPv4 /
+                // 非 fe80:: 链路本地 IPv6）——光有 fe80:: 的 utun 只是系统占位，不算节点。
+                let flags = node.pointee.ifa_flags
+                let up = (flags & UInt32(IFF_UP)) != 0 && (flags & UInt32(IFF_RUNNING)) != 0
+                if up, let addr = node.pointee.ifa_addr, hasRoutableAddress(addr) {
+                    return true
+                }
             }
             cursor = node.pointee.ifa_next
         }
         return false
+    }
+
+    /// 该地址是不是可路由地址：IPv4 排除 169.254/16（链路本地）；
+    /// IPv6 排除 fe80::/10（链路本地），其余（全局单播/ULA）都算。
+    private static func hasRoutableAddress(_ addr: UnsafeMutablePointer<sockaddr>) -> Bool {
+        switch Int32(addr.pointee.sa_family) {
+        case AF_INET:
+            let sin = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr.s_addr }
+            let hostOrder = UInt32(bigEndian: sin)
+            // 169.254.0.0/16 链路本地
+            return (hostOrder & 0xFFFF0000) != 0xA9FE0000
+        case AF_INET6:
+            let sin6 = addr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee.sin6_addr }
+            var bytes = [UInt8](repeating: 0, count: 16)
+            withUnsafeBytes(of: sin6) { bytes = Array($0.prefix(16)) }
+            // fe80::/10 链路本地（前 10 位 1111111010）
+            if bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80 { return false }
+            return true
+        default:
+            return false
+        }
     }
 }
 
@@ -296,15 +324,16 @@ final class PlaybackLedger: ObservableObject {
         }
     }
 
-    /// 合并期望/实际账本（按 token 去重；终局时由 ViewModel 从拦截器/代理取快照后调）。
+    /// 合并期望/实际账本（终局时由 ViewModel 从拦截器/代理取快照后调）。
+    /// expected 按 token 去重（期望清单本来就是“应该有”的一份）；
+    /// actual 不去重：同一 token+kind 的重复请求本身就是证据（重试/重拉/轮询），
+    /// 去重会把“拉了 3 次才成功”抹成“拉了 1 次”。
     func mergeBooks(expected: [LedgerBookEntry], actual: [LedgerBookEntry], attemptId: UUID) {
         guard let index = attempts.firstIndex(where: { $0.id == attemptId }) else { return }
         for entry in expected where !attempts[index].expected.contains(where: { $0.token == entry.token && $0.kind == entry.kind }) {
             attempts[index].expected.append(entry)
         }
-        for entry in actual where !attempts[index].actual.contains(where: { $0.token == entry.token && $0.kind == entry.kind }) {
-            attempts[index].actual.append(entry)
-        }
+        attempts[index].actual.append(contentsOf: actual)
     }
 
     /// 终局：定 stage、定三路判定、记播放器日志（errorLog URI 只存 host + 模板哈希）。

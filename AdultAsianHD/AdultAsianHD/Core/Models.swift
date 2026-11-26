@@ -303,4 +303,37 @@ enum NetConstants {
         }
         return result
     }
+
+    /// 同源判定（scheme + host + 端口）：重定向时只有同源才保留凭据头。
+    /// 端口：显式端口为准，缺省按 scheme 的默认端口（https 443 / http 80）算。
+    static func isSameOrigin(_ a: URL?, _ b: URL?) -> Bool {
+        guard let a, let b,
+              let aHost = a.host?.lowercased(), let bHost = b.host?.lowercased(),
+              aHost == bHost,
+              (a.scheme?.lowercased() ?? "") == (b.scheme?.lowercased() ?? "") else { return false }
+        return effectivePort(of: a) == effectivePort(of: b)
+    }
+
+    private static func effectivePort(of url: URL) -> Int? {
+        if let port = url.port { return port }
+        switch url.scheme?.lowercased() {
+        case "https": return 443
+        case "http": return 80
+        default: return nil
+        }
+    }
+
+    /// 跨域重定向时必须丢掉的凭据类请求头（大小写不敏感）：
+    /// Authorization / Cookie / API key 之类绝不能跟去别的域名，
+    /// HTTPS→HTTP 降级时同样不能带（明文泄漏）。
+    static func isSensitiveHeader(_ name: String) -> Bool {
+        switch name.lowercased() {
+        case "authorization", "cookie", "proxy-authorization",
+             "x-api-key", "api-key", "apikey", "x-auth-token", "x-access-token",
+             "cf-access-client-id", "cf-access-jwt-assertion":
+            return true
+        default:
+            return false
+        }
+    }
 }

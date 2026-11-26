@@ -1194,6 +1194,9 @@ final class WidgetHost: @unchecked Sendable {
     }
 
     /// 等一个 JS Promise，30 秒超时。超时或 reject 都 throw。
+    /// 超时后任务组 cancel 会一路传进 awaitPromiseRaw 的取消处理，
+    /// JS 侧的等待随即收尾，不再空转占着连接池（旧逻辑：超时只 throw，
+    /// continuation 没人 resume，JS 的 fetch 还在后台跑）。
     private func awaitPromise(_ value: JSValue) async throws -> JSValue {
         let box = JSValueBox(value)
         return try await withThrowingTaskGroup(of: JSValue.self) { group in
@@ -1215,35 +1218,66 @@ final class WidgetHost: @unchecked Sendable {
     /// - 是 Promise 就调它的 then(onFulfilled, onRejected)，用 continuation 转成 Swift async。
     /// 关键点：then 必须用 invokeMethod 调（直接把 then 抠出来 call 会丢 this，
     /// JSC 会报 TypeError）；then 的调用必须在主线程。
+    /// 取消：withTaskCancellationHandler + ContinuationBox。取消与 JS 回调共用一个
+    /// OnceBox，谁先到谁 resume，另一个直接丢弃，绝不重复 resume。
+    /// 两个竞态都处理了：① 任务进函数时已取消——onCancel 可能在 continuation 存进
+    /// 盒子前就跑，所以存进去后要再查一次 Task.isCancelled；② 主队列的 then 调度
+    /// 晚于取消——DispatchQueue.main.async 里先查取消再调 then，不给已取消的
+    /// Promise 再挂回调。
     private func awaitPromiseRaw(_ value: JSValue) async throws -> JSValue {
         let box = JSValueBox(value)
         let thenValue = await MainActor.run { box.value.objectForKeyedSubscript("then") }
         guard let thenValue, !thenValue.isUndefined, !thenValue.isNull else {
             return value
         }
-        return try await withCheckedThrowingContinuation { continuation in
-            let once = OnceBox()
-            // 回调装进 Sendable 盒子再带进 DispatchQueue 的闭包（JSValue 本身不是 Sendable）。
-            let callbacks = PromiseCallbacks(
-                fulfilled: { resolved in
-                    guard once.tryTake() else { return }
-                    continuation.resume(returning: resolved)
-                },
-                rejected: { reason in
-                    guard once.tryTake() else { return }
-                    let messageValue = reason.objectForKeyedSubscript("message")
-                    let message: String
-                    if let messageValue, !messageValue.isUndefined, !messageValue.isNull,
-                       !messageValue.toString().isEmpty {
-                        message = messageValue.toString()
+        let once = OnceBox()
+        let contBox = ContinuationBox()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<JSValue, Error>) in
+                contBox.set(continuation)
+                if Task.isCancelled {
+                    // once 被 onCancel 先占了时（它 take 时盒子还是空的，没 resume 到），
+                    // 这里直接 resume 这次存进去的 continuation：JS 回调也被 once 拦着，
+                    // 不会重复 resume；once 没被占时先占下来再 resume，同样只一次。
+                    if once.tryTake() {
+                        contBox.take()?.resume(throwing: CancellationError())
                     } else {
-                        message = reason.toString()
+                        contBox.take()?.resume(throwing: CancellationError())
                     }
-                    continuation.resume(throwing: WidgetHostError.callFailed(message.isEmpty ? "模块执行失败" : message))
+                    return
                 }
-            )
-            DispatchQueue.main.async {
-                _ = box.value.invokeMethod("then", withArguments: [callbacks.fulfilled, callbacks.rejected])
+                // 回调装进 Sendable 盒子再带进 DispatchQueue 的闭包（JSValue 本身不是 Sendable）。
+                let callbacks = PromiseCallbacks(
+                    fulfilled: { resolved in
+                        guard once.tryTake() else { return }
+                        continuation.resume(returning: resolved)
+                    },
+                    rejected: { reason in
+                        guard once.tryTake() else { return }
+                        let messageValue = reason.objectForKeyedSubscript("message")
+                        let message: String
+                        if let messageValue, !messageValue.isUndefined, !messageValue.isNull,
+                           !messageValue.toString().isEmpty {
+                            message = messageValue.toString()
+                        } else {
+                            message = reason.toString()
+                        }
+                        continuation.resume(throwing: WidgetHostError.callFailed(message.isEmpty ? "模块执行失败" : message))
+                    }
+                )
+                DispatchQueue.main.async {
+                    if Task.isCancelled {
+                        if once.tryTake() {
+                            contBox.take()?.resume(throwing: CancellationError())
+                        }
+                        return
+                    }
+                    _ = box.value.invokeMethod("then", withArguments: [callbacks.fulfilled, callbacks.rejected])
+                }
+            }
+        } onCancel: {
+            if once.tryTake() {
+                contBox.take()?.resume(throwing: CancellationError())
             }
         }
     }
@@ -1409,6 +1443,29 @@ private final class OnceBox {
         guard !done else { return false }
         done = true
         return true
+    }
+}
+
+/// 把 CheckedContinuation 交给 withTaskCancellationHandler 的 onCancel 用：
+/// onCancel 与 continuation 闭包不在同一个作用域，靠这个盒子传。
+/// set/take 都加锁、take 后清掉，保证 continuation 只被 resume 一次
+///（第二次 take 返回 nil；配合 OnceBox 双保险）。
+private final class ContinuationBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<JSValue, Error>?
+
+    func set(_ continuation: CheckedContinuation<JSValue, Error>) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.continuation = continuation
+    }
+
+    func take() -> CheckedContinuation<JSValue, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        let taken = continuation
+        continuation = nil
+        return taken
     }
 }
 

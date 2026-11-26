@@ -61,6 +61,11 @@ private final class ProxyFetchContext {
     let connection: NWConnection
     let queue: DispatchQueue
     let mapping: ProxyMapping
+    /// 发起这次拉取的 AVPlayer 请求带的 Range（缓存键的一部分；206 局部响应
+    /// 绝不能不分 Range 地发给别的请求）。
+    let requestRange: String?
+    /// 拉取开始时的网络类（直连/代理）：完成时再读可能已经换网了，诊断要记开始时的。
+    let networkClassAtStart: String
     var response: HTTPURLResponse?
     var receivedBytes = 0
     /// 小响应才攒 body（播单要改写、密钥要原样服务）；超 8MB 即放弃缓存、只流式转发。
@@ -71,12 +76,22 @@ private final class ProxyFetchContext {
     /// 收齐再改写/再发。
     let streamMode: Bool
     /// 同一 token 已在取、后来又到的连接：取完后从缓存统一服务。
-    var waiters: [(connection: NWConnection, queue: DispatchQueue)] = []
+    /// range 各自记着：等候者只配拿自己 Range 对应的响应。
+    var waiters: [(connection: NWConnection, queue: DispatchQueue, range: String?)] = []
+    /// 流式模式里已经收到响应头的等候者（中途上游断了只能断连，不能再塞 502）。
+    var headSentWaiters: [NWConnection] = []
+    /// didFinishCollecting 暂存的 metrics（最终分类由 didCompleteWithError 结合
+    /// task.error 做，不在收集时就下结论——那时 task.error 常为 nil）。
+    var stashedMetrics: URLSessionTaskMetrics?
+    /// 响应体前 16KB（WAF 嗅探用；流模式下 body 不全也够判挑战页）。
+    var sniffPrefix = Data()
 
-    init(connection: NWConnection, queue: DispatchQueue, mapping: ProxyMapping) {
+    init(connection: NWConnection, queue: DispatchQueue, mapping: ProxyMapping, requestRange: String? = nil) {
         self.connection = connection
         self.queue = queue
         self.mapping = mapping
+        self.requestRange = requestRange
+        self.networkClassAtStart = PlaybackLedger.networkClass
         self.streamMode = (mapping.kind == .segment || mapping.kind == .map)
     }
 }
@@ -124,6 +139,9 @@ final class LoopbackProxyServer: NSObject {
     private var cacheBytes: Int = 0
     /// taskIdentifier → 拉取上下文。
     private var activeTasks: [Int: ProxyFetchContext] = [:]
+    /// token → 在途拉取上下文（从登记占位到拉取收尾；didCompleteWithError 结束才撤，
+    /// 不然撤掉到进缓存的窗口里后到的请求会再发一次上游、烧掉一次性 token）。
+    private var inFlightByToken: [String: ProxyFetchContext] = [:]
     /// 正在服务的连接（stop 时一并断掉）。数组 + 身份比对：
     /// NWConnection 不是 Hashable，不能放 Set；去重与删除都按对象身份（===）。
     private var connections: [NWConnection] = []
@@ -210,10 +228,14 @@ final class LoopbackProxyServer: NSObject {
 
     /// 绑定监听（随机端口）。就绪后记端口、调 start completion；
     /// 失败则按 maxRestartAttempts 重建（新随机端口），耗尽才报失败。
+    /// 只绑回环接口（requiredInterfaceType = .loopback）：不占局域网地址，
+    /// 不触发 iOS 本地网络权限提示；AVPlayer 只连 127.0.0.1，本来就不需要别的接口。
     private func bindListener() {
         let listener: NWListener
         do {
-            listener = try NWListener(using: .tcp, on: NWEndpoint.Port(integerLiteral: 0))
+            let params = NWParameters.tcp
+            params.requiredInterfaceType = .loopback
+            listener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: 0))
         } catch {
             completeStart(success: false)
             return
@@ -484,30 +506,81 @@ final class LoopbackProxyServer: NSObject {
             sendSimpleResponse(connection: connection, queue: queue, status: 404, body: "Not Found")
             return
         }
-        // 缓存命中：原样服务，不再碰上游（一次性 token 就靠这个）。
-        if let cached = cachedResponse(for: urlToken) {
+        // 缓存命中、等候挂靠、还是新起上游拉取：一次锁里定（检查与登记原子化，
+        // 两连接同时到同一 token 时只有一个能发起上游请求，一次性 token 不被重复消费）。
+        switch decideFetch(mapping: mapping, range: headers["range"], connection: connection, queue: queue) {
+        case .serveCached(let cached):
             recordActual(mapping: mapping, status: cached.status, bytes: cached.body.count, servedFromCache: true)
             serveCached(connection: connection, queue: queue, mapping: mapping, cached: cached)
+        case .attached:
             return
+        case .send502:
+            recordActual(mapping: mapping, status: nil, bytes: 0, servedFromCache: false)
+            sendSimpleResponse(connection: connection, queue: queue, status: 502, body: "Bad Gateway")
+        case .startFetch(let context):
+            startUpstreamFetch(context: context)
         }
-        // 同一 token 正在取：挂等候（tee 直播 / 从缓存服务）或直接 502，不再发第二次上游请求。
-        if handleWaiterIfFetching(token: urlToken, connection: connection, queue: queue) {
-            return
-        }
-        startUpstreamFetch(mapping: mapping, range: headers["range"], connection: connection, queue: queue)
+        return
     }
 
     // MARK: - 上游拉取（URLSessionDataDelegate 流式转发）
 
-    private func startUpstreamFetch(mapping: ProxyMapping, range: String?, connection: NWConnection, queue: DispatchQueue) {
+    /// 取数决策（一次锁里完成：查缓存 → 查在途 → 登记占位）。
+    /// 返回后调用方在锁外行动（发包/建 task 都不在锁里做，不持锁发包）。
+    private enum FetchDecision {
+        case serveCached(CachedResponse)
+        case attached
+        case send502
+        case startFetch(ProxyFetchContext)
+    }
+
+    private func decideFetch(mapping: ProxyMapping, range: String?, connection: NWConnection, queue: DispatchQueue) -> FetchDecision {
+        stateLock.lock()
+        // 1. 缓存命中（键 = token + Range：206 局部响应只服务同 Range 的请求）。
+        let key = cacheKey(token: mapping.token, range: range)
+        if let cached = cache[key] {
+            stateLock.unlock()
+            return .serveCached(cached)
+        }
+        // 2. 同一 token 正在取。
+        if let context = inFlightByToken[mapping.token] {
+            if !context.headersSent {
+                context.waiters.append((connection: connection, queue: queue, range: range))
+                stateLock.unlock()
+                return .attached
+            }
+            // 已发过头：缓存有（同 Range）就原样服务，否则 502（重复请求错过了直播流）。
+            if let cached = cache[key] {
+                stateLock.unlock()
+                return .serveCached(cached)
+            }
+            stateLock.unlock()
+            return .send502
+        }
+        // 3. 没人取：登记占位（建 task 前就占住，别的连接再来只能挂等候）。
+        let context = ProxyFetchContext(connection: connection, queue: queue, mapping: mapping, requestRange: range)
+        inFlightByToken[mapping.token] = context
+        stateLock.unlock()
+        return .startFetch(context)
+    }
+
+    private func startUpstreamFetch(context: ProxyFetchContext) {
         stateLock.lock()
         let session = self.session
         stateLock.unlock()
         guard let session else {
-            sendSimpleResponse(connection: connection, queue: queue, status: 502, body: "Bad Gateway")
+            // 会话没了（已 stop）：撤掉占位，主连接和已挂上的等候者都给 502。
+            stateLock.lock()
+            inFlightByToken.removeValue(forKey: context.mapping.token)
+            let waiters = context.waiters
+            stateLock.unlock()
+            sendSimpleResponse(connection: context.connection, queue: context.queue, status: 502, body: "Bad Gateway")
+            for waiter in waiters {
+                sendSimpleResponse(connection: waiter.connection, queue: waiter.queue, status: 502, body: "Bad Gateway")
+            }
             return
         }
-        var request = URLRequest(url: mapping.upstream)
+        var request = URLRequest(url: context.mapping.upstream)
         request.httpMethod = "GET"
         request.assumesHTTP3Capable = false
         request.timeoutInterval = 15
@@ -516,10 +589,9 @@ final class LoopbackProxyServer: NSObject {
         for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
-        if let range {
+        if let range = context.requestRange {
             request.setValue(range, forHTTPHeaderField: "Range")
         }
-        let context = ProxyFetchContext(connection: connection, queue: queue, mapping: mapping)
         let task = session.dataTask(with: request)
         stateLock.lock()
         activeTasks[task.taskIdentifier] = context
@@ -533,39 +605,14 @@ final class LoopbackProxyServer: NSObject {
         return activeTasks[task.taskIdentifier]
     }
 
-    private func takeContext(for task: URLSessionTask) -> ProxyFetchContext? {
+    /// 拉取收尾时才撤（didCompleteWithError 的 defer 里调）：缓存/改写完成前不撤，
+    /// 不然撤掉到进缓存的窗口里后到的请求会再发一次上游、烧掉一次性 token。
+    private func removeContext(for task: URLSessionTask) {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return activeTasks.removeValue(forKey: task.taskIdentifier)
-    }
-
-    /// 同一 token 正在取：还没发过头就挂等候（流式直播 tee、缓冲取完从缓存服务）；
-    /// 已发过头且缓存有就原样服务；否则给 502（重复请求已错过直播流）。
-    /// 返回 true 表示已处理（不再发起第二次上游请求）。
-    private func handleWaiterIfFetching(token: String, connection: NWConnection, queue: DispatchQueue) -> Bool {
-        stateLock.lock()
-        var target: ProxyFetchContext?
-        for context in activeTasks.values where context.mapping.token == token {
-            target = context
-            break
+        if let context = activeTasks.removeValue(forKey: task.taskIdentifier) {
+            inFlightByToken.removeValue(forKey: context.mapping.token)
         }
-        stateLock.unlock()
-        guard let context = target else { return false }
-        let sent = isHeadersSent(context)
-        if !sent {
-            stateLock.lock()
-            context.waiters.append((connection: connection, queue: queue))
-            stateLock.unlock()
-            return true
-        }
-        if let cached = cachedResponse(for: token) {
-            recordActual(mapping: context.mapping, status: cached.status, bytes: cached.body.count, servedFromCache: true)
-            serveCached(connection: connection, queue: queue, mapping: context.mapping, cached: cached)
-            return true
-        }
-        recordActual(mapping: context.mapping, status: nil, bytes: 0, servedFromCache: false)
-        sendSimpleResponse(connection: connection, queue: queue, status: 502, body: "Bad Gateway")
-        return true
     }
 
     /// waiters 与 headersSent 跨队列读写（监听队列挂等候、URLSession 队列发包），
@@ -582,10 +629,31 @@ final class LoopbackProxyServer: NSObject {
         context.headersSent = true
     }
 
-    private func snapshotWaiters(_ context: ProxyFetchContext) -> [(connection: NWConnection, queue: DispatchQueue)] {
+    /// 原子切换：把 headersSent 置 true 并取出当时全部等候者，同时记下
+    /// 哪些等候者收到了响应头（headedWaiters=true 时，流式模式用）。
+    /// 先快照再置旗会让中间到的 waiter 永远收不到头（只收到无头的分块 body），
+    /// 必须一次锁里同时做完。
+    private func markHeadersSent(_ context: ProxyFetchContext, headedWaiters: Bool) -> [(connection: NWConnection, queue: DispatchQueue, range: String?)] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        context.headersSent = true
+        if headedWaiters {
+            context.headSentWaiters.append(contentsOf: context.waiters.map { $0.connection })
+        }
+        return context.waiters
+    }
+
+    private func snapshotWaiters(_ context: ProxyFetchContext) -> [(connection: NWConnection, queue: DispatchQueue, range: String?)] {
         stateLock.lock()
         defer { stateLock.unlock() }
         return context.waiters
+    }
+
+    /// 已收到响应头的等候者（中途上游断了只能断连，不能再塞响应）。
+    private func snapshotHeadSentWaiters(_ context: ProxyFetchContext) -> [NWConnection] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return context.headSentWaiters
     }
 
     // MARK: - 播单改写（通用 URI 属性，不写死名单）
@@ -726,22 +794,30 @@ final class LoopbackProxyServer: NSObject {
 
     // MARK: - 缓存
 
-    private func cachedResponse(for token: String) -> CachedResponse? {
+    /// 缓存键：token + Range。206 局部响应只服务同 Range 的请求——
+    /// 旧逻辑只按 token 查，2 字节探测响应可能被缓存后返回给所有 Range 请求。
+    private func cacheKey(token: String, range: String?) -> String {
+        guard let range, !range.isEmpty else { return token }
+        return "\(token)|\(range)"
+    }
+
+    private func cachedResponse(for token: String, range: String?) -> CachedResponse? {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return cache[token]
+        return cache[cacheKey(token: token, range: range)]
     }
 
     /// 小响应进缓存（FIFO，总量 ≤64MB，超了淘汰最旧的）。
-    private func cacheResponse(token: String, response: CachedResponse) {
+    private func cacheResponse(token: String, range: String?, response: CachedResponse) {
         stateLock.lock()
         defer { stateLock.unlock() }
-        if cache[token] == nil {
-            cacheOrder.append(token)
+        let key = cacheKey(token: token, range: range)
+        if cache[key] == nil {
+            cacheOrder.append(key)
         } else {
-            cacheBytes -= cache[token]?.body.count ?? 0
+            cacheBytes -= cache[key]?.body.count ?? 0
         }
-        cache[token] = response
+        cache[key] = response
         cacheBytes += response.body.count
         while cacheBytes > Self.maxCacheBytes, let oldest = cacheOrder.first {
             cacheOrder.removeFirst()
@@ -753,9 +829,9 @@ final class LoopbackProxyServer: NSObject {
 
     // MARK: - 发包（chunked 流式；各连接在自己的串行队列上发，不持锁）
 
-    private func send(connection: NWConnection, queue: DispatchQueue, data: Data, isComplete: Bool) {
+    private func send(connection: NWConnection, queue: DispatchQueue, data: Data, isComplete: Bool, contentContext: NWConnection.ContentContext = .defaultMessage, onComplete: (() -> Void)? = nil) {
         queue.async {
-            connection.send(content: data, contentContext: .defaultMessage, isComplete: isComplete, completion: .contentProcessed { _ in })
+            connection.send(content: data, contentContext: contentContext, isComplete: isComplete, completion: .contentProcessed { _ in onComplete?() })
         }
     }
 
@@ -800,13 +876,17 @@ final class LoopbackProxyServer: NSObject {
         send(connection: connection, queue: queue, data: packet, isComplete: false)
     }
 
-    /// 终结块：0 长度块，完结本次响应。
+    /// 终结块：0 长度块，完结本次响应。发完后才断连（.finalMessage + 完成回调里
+    /// cancel）：旧逻辑 send 完就地 untrackConnection，末尾分块可能还没发出去
+    /// 连接就从表里掉了，AVPlayer 收不到收尾就报错。
     private func sendTerminalChunk(connection: NWConnection, queue: DispatchQueue) {
-        send(connection: connection, queue: queue, data: Data("0\r\n\r\n".utf8), isComplete: true)
-        untrackConnection(connection)
+        send(connection: connection, queue: queue, data: Data("0\r\n\r\n".utf8), isComplete: true, contentContext: .finalMessage) {
+            self.untrackConnection(connection)
+            connection.cancel()
+        }
     }
 
-    /// 简单错误响应（带 Content-Length、一次发完）。
+    /// 简单错误响应（带 Content-Length、一次发完）。发完才断连，同上。
     private func sendSimpleResponse(connection: NWConnection, queue: DispatchQueue, status: Int, body: String) {
         let bodyData = Data(body.utf8)
         var head = "HTTP/1.1 \(status) \(reasonPhrase(for: status))\r\n"
@@ -815,41 +895,70 @@ final class LoopbackProxyServer: NSObject {
         head += "Connection: close\r\n\r\n"
         var payload = Data(head.utf8)
         payload.append(bodyData)
-        send(connection: connection, queue: queue, data: payload, isComplete: true)
-        untrackConnection(connection)
+        send(connection: connection, queue: queue, data: payload, isComplete: true, contentContext: .finalMessage) {
+            self.untrackConnection(connection)
+            connection.cancel()
+        }
     }
 
-    /// 缓存命中的完整响应：原样服务（chunked 分块发出）。
-    private func serveCached(connection: NWConnection, queue: DispatchQueue, mapping: ProxyMapping, cached: CachedResponse) {
-        var head = "HTTP/1.1 \(cached.status) \(reasonPhrase(for: cached.status))\r\n"
-        head += "Content-Type: \(cached.contentType)\r\n"
-        for (field, value) in cached.headers {
+    /// 已知长度的完整响应（Content-Length，不走 chunked）：缓存响应与缓冲型
+    /// 非 2xx 响应都用它——CoreMedia 对 206 响应要求 Content-Length，
+    /// chunked 会让它在 seek 后卡死。发完断连。
+    private func sendFullResponse(connection: NWConnection, queue: DispatchQueue, status: Int, contentType: String, headers: [String: String], body: Data) {
+        var head = "HTTP/1.1 \(status) \(reasonPhrase(for: status))\r\n"
+        head += "Content-Type: \(contentType)\r\n"
+        for (field, value) in headers {
             head += "\(field): \(value)\r\n"
         }
-        head += "Transfer-Encoding: chunked\r\n"
+        head += "Content-Length: \(body.count)\r\n"
         head += "Connection: close\r\n\r\n"
-        send(connection: connection, queue: queue, data: Data(head.utf8), isComplete: false)
-        // 大 body 分 64KB 一块发，避免单次 send 过大。
-        var offset = 0
-        while offset < cached.body.count {
-            let end = min(offset + 65536, cached.body.count)
-            sendChunk(connection: connection, queue: queue, data: cached.body.subdata(in: offset..<end))
-            offset = end
+        var payload = Data(head.utf8)
+        payload.append(body)
+        send(connection: connection, queue: queue, data: payload, isComplete: true, contentContext: .finalMessage) {
+            self.untrackConnection(connection)
+            connection.cancel()
         }
-        sendTerminalChunk(connection: connection, queue: queue)
     }
 
-    /// 等候者统一服务：取成功了从缓存原样服务，取失败了给 502。
-    private func serveWaiters(context: ProxyFetchContext, error: Error?) {
+    /// 缓存命中的完整响应：原样服务（Content-Length、一次发完，不走 chunked）。
+    private func serveCached(connection: NWConnection, queue: DispatchQueue, mapping: ProxyMapping, cached: CachedResponse) {
+        sendFullResponse(
+            connection: connection, queue: queue,
+            status: cached.status,
+            contentType: cached.contentType,
+            headers: cached.headers,
+            body: cached.body
+        )
+    }
+
+    /// 等候者统一服务。
+    /// - error != nil：还没收到响应头的给 502；已收到头的只能断连（再塞一个响应
+    ///   进已开始的 chunked 流，AVPlayer 会报协议错——旧逻辑全给 502）。
+    /// - response != nil：缓冲型非 2xx 的真实状态/body（等候者不再被 502 冤枉）。
+    /// - 否则从缓存按等候者自己的 Range 取（Range 不同拿到的 206 响应不同）。
+    private func serveWaiters(context: ProxyFetchContext, error: Error?, response: CachedResponse? = nil) {
         let waiters = snapshotWaiters(context)
         guard !waiters.isEmpty else { return }
-        if error == nil, let cached = cachedResponse(for: context.mapping.token) {
-            for waiter in waiters {
+        let headed = Set(snapshotHeadSentWaiters(context).map { ObjectIdentifier($0) })
+        for waiter in waiters {
+            if headed.contains(ObjectIdentifier(waiter.connection)) {
+                closeConnection(waiter.connection)
+                continue
+            }
+            if let error {
+                recordActual(mapping: context.mapping, status: nil, bytes: 0, servedFromCache: false)
+                sendSimpleResponse(connection: waiter.connection, queue: waiter.queue, status: 502, body: "Bad Gateway")
+                continue
+            }
+            if let response {
+                recordActual(mapping: context.mapping, status: response.status, bytes: response.body.count, servedFromCache: false)
+                serveCached(connection: waiter.connection, queue: waiter.queue, mapping: context.mapping, cached: response)
+                continue
+            }
+            if let cached = cachedResponse(for: context.mapping.token, range: waiter.range) {
                 recordActual(mapping: context.mapping, status: cached.status, bytes: cached.body.count, servedFromCache: true)
                 serveCached(connection: waiter.connection, queue: waiter.queue, mapping: context.mapping, cached: cached)
-            }
-        } else {
-            for waiter in waiters {
+            } else {
                 recordActual(mapping: context.mapping, status: nil, bytes: 0, servedFromCache: false)
                 sendSimpleResponse(connection: waiter.connection, queue: waiter.queue, status: 502, body: "Bad Gateway")
             }
@@ -862,28 +971,25 @@ final class LoopbackProxyServer: NSObject {
 extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
 
     /// 重定向：代理自己跟随，绝不把 Location 交给 AVPlayer；
-    /// 跨域 302 会丢自定义头，重定向请求上把身份头补回去。
+    /// 跨域 302 会丢自定义头，重定向请求上把身份头补回去——但凭据头
+    /// （Authorization / Cookie / API key）只在同源（scheme+host+端口）时保留，
+    /// 跨域或 HTTPS→HTTP 降级一律不带。
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         var redirected = request
         redirected.assumesHTTP3Capable = false
+        let sameOrigin = NetConstants.isSameOrigin(response.url ?? task.currentRequest?.url, request.url)
         for (key, value) in headers {
+            if !sameOrigin && NetConstants.isSensitiveHeader(key) { continue }
             redirected.setValue(value, forHTTPHeaderField: key)
         }
         completionHandler(redirected)
     }
 
+    /// 只暂存 metrics：这时 task.error 常为 nil、body 还没拼完，在这里就
+    /// 下结论会把超时判错层；最终分类由 didCompleteWithError 结合 task.error 做。
     func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
-        guard let request = task.originalRequest else { return }
-        let event = NetworkDiagnostics.makeEvent(
-            source: "proxy",
-            request: request,
-            response: task.response,
-            bodyData: nil,
-            error: task.error,
-            metrics: metrics,
-            fallbackDurationMs: 0
-        )
-        NetworkDiagnostics.record(event)
+        guard let context = context(for: task) else { return }
+        context.stashedMetrics = metrics
     }
 
     /// 上游响应头到了：流式模式立刻把头送给 AVPlayer（首字节预算）；
@@ -900,11 +1006,13 @@ extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
         context.response = http
         if context.streamMode {
             let head = responseHead(status: http.statusCode, contentType: contentType(for: context.mapping, response: http), response: http)
+            // 一次锁里同时做：置 headersSent + 取等候者 + 记下哪些等候者收到了头。
+            // 旧逻辑先快照再置旗，中间到的 waiter 永远收不到头（只收到无头的分块 body）。
+            let waiters = markHeadersSent(context, headedWaiters: true)
             send(connection: context.connection, queue: context.queue, data: head, isComplete: false)
-            for waiter in snapshotWaiters(context) {
+            for waiter in waiters {
                 send(connection: waiter.connection, queue: waiter.queue, data: head, isComplete: false)
             }
-            setHeadersSent(context)
         }
         completionHandler(.allow)
     }
@@ -915,6 +1023,10 @@ extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard let context = context(for: dataTask) else { return }
         context.receivedBytes += data.count
+        // 响应体前 16KB 嗅探前缀（WAF 挑战页判定用；流模式 body 不攒全也够判）。
+        if context.sniffPrefix.count < 16384 {
+            context.sniffPrefix.append(data.prefix(16384 - context.sniffPrefix.count))
+        }
         if context.streamMode {
             sendChunk(connection: context.connection, queue: context.queue, data: data)
             for waiter in snapshotWaiters(context) {
@@ -932,8 +1044,27 @@ extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
 
     /// 上游拉取结束：成功则收尾（缓冲模式改写/原样服务 + 进缓存；流式模式发终结块），
     /// 记实际账本，等候者统一服务；失败则记账本、给 502 或断连。
+    /// 上下文只在收尾完成才撤（defer removeContext）：缓存/改写完成前不撤，
+    /// 不然撤掉到进缓存的窗口里后到的请求会再发一次上游、烧掉一次性 token。
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard let context = takeContext(for: task) else { return }
+        guard let context = context(for: task) else { return }
+        defer { removeContext(for: task) }
+
+        // 诊断事件在这里最终记：用暂存的 metrics + 现在的 task.error（这时才准），
+        // body 用 16KB 嗅探前缀判 WAF，host 按最终重定向落点记。
+        let diagRequest = task.currentRequest ?? task.originalRequest ?? URLRequest(url: context.mapping.upstream)
+        let diagEvent = NetworkDiagnostics.makeEvent(
+            source: "proxy",
+            request: diagRequest,
+            response: task.response,
+            bodyData: context.sniffPrefix.isEmpty ? nil : context.sniffPrefix,
+            error: error,
+            metrics: context.stashedMetrics,
+            fallbackDurationMs: 0,
+            networkClass: context.networkClassAtStart
+        )
+        NetworkDiagnostics.record(diagEvent)
+
         if let error {
             recordActual(mapping: context.mapping, status: nil, bytes: context.receivedBytes, servedFromCache: false)
             if !isHeadersSent(context) {
@@ -948,7 +1079,7 @@ extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
         if context.streamMode {
             // 流式：小响应进缓存（供重试原样服务，不再碰上游）；大分片只转发、不缓存。
             if context.cacheable, let http = context.response {
-                cacheResponse(token: context.mapping.token, response: CachedResponse(
+                cacheResponse(token: context.mapping.token, range: context.requestRange, response: CachedResponse(
                     status: http.statusCode,
                     contentType: contentType(for: context.mapping, response: http),
                     headers: forwardedHeaders(from: http),
@@ -971,28 +1102,61 @@ extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
             serveWaiters(context: context, error: NSError(domain: "LoopbackProxy", code: -1, userInfo: nil))
             return
         }
-        // 上游非 2xx：不改写，原样把状态与 body 交给 AVPlayer（账本记 rejectedUpstream）。
+        // 上游非 2xx：不改写，原样把状态与 body 交给 AVPlayer 和等候者
+        //（账本记 rejectedUpstream）。旧逻辑主连接拿真 403、等候者却拿 502。
         guard (200...299).contains(http.statusCode) else {
             recordActual(mapping: context.mapping, status: http.statusCode, bytes: context.body.count, servedFromCache: false)
-            let head = responseHead(status: http.statusCode, contentType: contentType(for: context.mapping, response: http), response: http)
-            send(connection: context.connection, queue: context.queue, data: head, isComplete: false)
+            let non2xx = CachedResponse(
+                status: http.statusCode,
+                contentType: contentType(for: context.mapping, response: http),
+                headers: forwardedHeaders(from: http),
+                body: context.body
+            )
             setHeadersSent(context)
-            sendChunk(connection: context.connection, queue: context.queue, data: context.body)
-            sendTerminalChunk(connection: context.connection, queue: context.queue)
-            serveWaiters(context: context, error: nil)
+            sendFullResponse(
+                connection: context.connection, queue: context.queue,
+                status: non2xx.status,
+                contentType: non2xx.contentType,
+                headers: non2xx.headers,
+                body: non2xx.body
+            )
+            serveWaiters(context: context, error: nil, response: non2xx)
             return
         }
         // 2xx：播单/变体改写后发，密钥原样发；可缓存的进缓存（供重试原样服务）。
         let outBody: Data
         if context.mapping.kind == .playlist || context.mapping.kind == .variant {
             let text = String(decoding: context.body, as: UTF8.self)
-            let rewritten = rewritePlaylist(text, baseURL: context.mapping.upstream)
+            // 只对真播单改写：HTML/WAF 挑战页 / JSON 错误页混进来不能当播单改写、缓存。
+            guard text.contains("#EXTM3U") else {
+                recordActual(mapping: context.mapping, status: http.statusCode, bytes: context.body.count, servedFromCache: false)
+                let passthrough = CachedResponse(
+                    status: http.statusCode,
+                    contentType: contentType(for: context.mapping, response: http),
+                    headers: forwardedHeaders(from: http),
+                    body: context.body
+                )
+                setHeadersSent(context)
+                sendFullResponse(
+                    connection: context.connection, queue: context.queue,
+                    status: passthrough.status,
+                    contentType: passthrough.contentType,
+                    headers: passthrough.headers,
+                    body: passthrough.body
+                )
+                serveWaiters(context: context, error: nil, response: passthrough)
+                return
+            }
+            // 相对 URI 按最终重定向落点解析（task.response.url），不是注册时的
+            // mapping.upstream：重定向后的播单按旧基址解析会 100% 404。
+            let finalBase = task.response?.url ?? task.currentRequest?.url ?? context.mapping.upstream
+            let rewritten = rewritePlaylist(text, baseURL: finalBase)
             outBody = Data(rewritten.utf8)
         } else {
             outBody = context.body
         }
         if context.cacheable {
-            cacheResponse(token: context.mapping.token, response: CachedResponse(
+            cacheResponse(token: context.mapping.token, range: context.requestRange, response: CachedResponse(
                 status: http.statusCode,
                 contentType: contentType(for: context.mapping, response: http),
                 headers: forwardedHeaders(from: http),
@@ -1000,11 +1164,14 @@ extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
             ))
         }
         recordActual(mapping: context.mapping, status: http.statusCode, bytes: outBody.count, servedFromCache: false)
-        let head = responseHead(status: http.statusCode, contentType: contentType(for: context.mapping, response: http), response: http)
-        send(connection: context.connection, queue: context.queue, data: head, isComplete: false)
         setHeadersSent(context)
-        sendChunk(connection: context.connection, queue: context.queue, data: outBody)
-        sendTerminalChunk(connection: context.connection, queue: context.queue)
+        sendFullResponse(
+            connection: context.connection, queue: context.queue,
+            status: http.statusCode,
+            contentType: contentType(for: context.mapping, response: http),
+            headers: forwardedHeaders(from: http),
+            body: outBody
+        )
         serveWaiters(context: context, error: nil)
     }
 

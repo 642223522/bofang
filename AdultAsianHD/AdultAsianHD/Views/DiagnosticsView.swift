@@ -12,6 +12,7 @@ import SwiftUI
 struct DiagnosticsView: View {
     @EnvironmentObject private var store: SourceStore
     @ObservedObject private var netDiag = NetworkDiagnostics.shared
+    @StateObject private var probeVM = NetworkProbeViewModel()
 
     @State private var isCheckingAll = false
     @State private var resultMessage = ""
@@ -87,6 +88,33 @@ struct DiagnosticsView: View {
                                     netDiag.clear()
                                 }
                                 .font(.subheadline)
+                            }
+                        }
+
+                        Section("真机网络探针（无节点为什么进不去）") {
+                            Text("在手机上直接测黄果、onlybokep 的 DNS / 建连 / TLS / HTTP / WAF / WebView，一行一行出结果。跑的时候别切走，约 1–2 分钟；只观测、不改 UA、不注脚本、不碰挑战流程。")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            if probeVM.running {
+                                Button(role: .destructive) {
+                                    probeVM.stop()
+                                } label: {
+                                    Label("停止探针", systemImage: "stop.circle")
+                                }
+                            } else {
+                                Button {
+                                    probeVM.run()
+                                } label: {
+                                    Label("运行真机探针（黄果 + onlybokep）", systemImage: "antenna.radiowaves.left.and.right")
+                                }
+                            }
+                            if !probeVM.summary.isEmpty {
+                                Text(probeVM.summary)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            ForEach(probeVM.lines) { line in
+                                probeRow(for: line)
                             }
                         }
 
@@ -222,6 +250,49 @@ struct DiagnosticsView: View {
             if skipped > 0 { text += "，\(skipped) 个重复跳过" }
             resultMessage = text
             showResultAlert = true
+        }
+    }
+
+    // MARK: - 真机探针行
+
+    /// 一行探针结果：阶段标签 + 名称 + 通/断 + 明细（耗时/IP/状态码/错误）。
+    private func probeRow(for line: StagedNetworkProbe.ProbeLine) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text(line.stage.rawValue)
+                    .font(.caption2)
+                    .fontWeight(.semibold)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(probeStageColor(for: line.stage).opacity(0.15))
+                    .foregroundColor(probeStageColor(for: line.stage))
+                    .cornerRadius(4)
+                Text(line.label)
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                    .lineLimit(1)
+                Spacer()
+                if let ok = line.ok {
+                    Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
+                        .foregroundColor(ok ? .green : .red)
+                }
+            }
+            Text(line.detail)
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func probeStageColor(for stage: StagedNetworkProbe.ProbeStage) -> Color {
+        switch stage {
+        case .dns: return .blue
+        case .tcp: return .teal
+        case .tls: return .purple
+        case .http: return .green
+        case .waf: return .orange
+        case .webview: return .pink
+        case .info: return .secondary
         }
     }
 
@@ -491,5 +562,46 @@ private struct NetworkDiagDetailView: View {
                 .textSelection(.enabled)
         }
         .font(.subheadline)
+    }
+}
+
+/// 真机探针的运行状态（DiagnosticsView 的 @StateObject）：
+/// 探针跑在后台 detached Task 里（阻塞式 DNS 不占主线程），每出一行结果
+/// 就经 onLine 回填 lines；取消即停（各子探针有自己的超时，停下最多等几秒）。
+@MainActor
+private final class NetworkProbeViewModel: ObservableObject {
+    @Published var lines: [StagedNetworkProbe.ProbeLine] = []
+    @Published var running = false
+    @Published var summary = ""
+    private var task: Task<Void, Never>?
+
+    func run() {
+        guard !running else { return }
+        lines.removeAll()
+        summary = ""
+        running = true
+        task = Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            let probe = StagedNetworkProbe()
+            probe.onLine = { [weak self] line in
+                Task { @MainActor [weak self] in self?.lines.append(line) }
+            }
+            for target in StagedNetworkProbe.defaultTargets {
+                if Task.isCancelled { break }
+                await probe.run(target: target)
+            }
+            let cancelled = Task.isCancelled
+            await MainActor.run {
+                self.running = false
+                let failed = self.lines.filter { $0.ok == false }.count
+                self.summary = cancelled
+                    ? "探针已停止（\(self.lines.count) 行，异常 \(failed) 行）"
+                    : "探针完成（\(self.lines.count) 行，异常 \(failed) 行）"
+            }
+        }
+    }
+
+    func stop() {
+        task?.cancel()
     }
 }

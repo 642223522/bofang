@@ -967,8 +967,11 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     /// 让路：每测完一个源检查 Task.isCancelled。
     func runDeepProbeRound() async {
         let all = await MainActor.run { self.sources }
+        // 整轮跑完才写时间戳：中途被取消（用户点屏/切页/进后台）就不写，
+        // 下次还要跑完剩下的源（旧逻辑取消也写时间戳，等于谎报“这轮已检完”）。
+        var completed = true
         for source in all {
-            if Task.isCancelled { break }
+            if Task.isCancelled { completed = false; break }
             let light = await MainActor.run { self.checkResults[source.id] }
             guard light?.status == .ok else { continue }
             // 7 天内做过且模块没变的不重做
@@ -977,8 +980,10 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
                light?.sourceFingerprint == fingerprint(for: source) {
                 continue
             }
-            guard let playableURL = await firstPlayableURL(for: source) else { continue }
-            let probe = await Self.deepProbe(urlString: playableURL)
+            guard let playableLine = await firstPlayableLine(for: source) else { continue }
+            let probe = await Self.deepProbe(line: playableLine)
+            // 探针中途被取消：结果不写（取消不算失败，下次断点续跑重测这个源）。
+            if Task.isCancelled { completed = false; break }
             await MainActor.run {
                 if var current = self.checkResults[source.id] {
                     current.deepProbe = probe
@@ -987,12 +992,16 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
                 }
             }
         }
-        UserDefaults.standard.set(Date(), forKey: lastDeepProbeDefaultsKey)
+        if completed {
+            UserDefaults.standard.set(Date(), forKey: lastDeepProbeDefaultsKey)
+        }
     }
 
-    /// 取一个源第一条可播 URL（固定验线第一个样本的解析结果；深探针用）。
+    /// 取一个源第一条可播线路（固定验线第一个样本的解析结果；深探针用）。
     /// 解析失败返回 nil（该源跳过深探针）。
-    private func firstPlayableURL(for source: SourceRecord) async -> String? {
+    /// 返回整条 PlayLine，不只 URL：深探针要用线路的真实请求身份
+    /// （模块头/Referer/Cookie），裸 URL 播会把好的源判成坏的。
+    private func firstPlayableLine(for source: SourceRecord) async -> PlayLine? {
         guard let host = try? loadHost(for: source),
               let probe = host.fixedProbeModule(),
               let samples = try? await host.loadList(moduleId: probe.id, page: 1),
@@ -1003,65 +1012,106 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         return lines.first { line in
             let lower = line.url.lowercased()
             return lower.contains(".m3u8") || lower.contains(".mp4")
-        }?.url
+        }
     }
 
     /// 深探针：静音真播到出画（真的起 AVPlayer、静音、确认出首帧画面）。
     /// 15 秒不出画即失败。返回 DeepProbeResult。
-    static func deepProbe(urlString: String) async -> DeepProbeResult {
-        guard let url = URL(string: urlString) else {
+    /// 用线路的真实请求身份（模块头/Referer/Cookie + iPhone UA）建 AVURLAsset，
+    /// 不用裸 AVPlayerItem(url:)——有的站没 Referer/没模块头就 403，
+    /// 裸播会把好的源判成坏的（头拼法与 CustomPlayerView 的 headers 分支同款）。
+    /// 取消：withTaskCancellationHandler + CancelBox。取消时停播放器、停 timer、
+    /// 只 resume 一次，绝不写结果（runDeepProbeRound 在探针返回后还会再查一次
+    /// Task.isCancelled）。CancelBox 建在 continuation 外面：onCancel 可能在
+    /// 主队列 setup 块跑之前就触发，那时 player/timer 还没建——盒子先记下
+    /// “已取消”，setup 块一进来就直接收尾，不建播放器。
+    static func deepProbe(line: PlayLine) async -> DeepProbeResult {
+        guard let url = URL(string: line.url) else {
             return DeepProbeResult(passed: false, failedStep: "解析", reason: "URL 非法", checkedAt: Date())
         }
-        return await withCheckedContinuation { continuation in
+        var headers = NetConstants.mergeHeaders(base: NetConstants.defaultBrowserHeaders, overrides: line.headers ?? [:])
+        if let referer = line.referer, !referer.isEmpty {
+            headers["Referer"] = referer
+        }
+        if let cookie = line.cookie, !cookie.isEmpty {
+            headers["Cookie"] = cookie
+        }
+        let userAgent = headers["User-Agent"] ?? NetConstants.iPhoneUserAgent
+
+        final class CancelBox: @unchecked Sendable {
+            var cancelled = false
+            var finish: ((Bool, String?, String?) -> Void)?
+        }
+        let cancelBox = CancelBox()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<DeepProbeResult, Never>) in
+                DispatchQueue.main.async {
+                    // 盒子：保活 player/timer，防 continuation 多次 resume
+                    // 只在主队列上用（建播放器、轮询、超时都在主队列），不用 Sendable。
+                    final class ProbeBox {
+                        var done = false
+                        var player: AVPlayer?
+                        var timer: DispatchSourceTimer?
+                    }
+                    let box = ProbeBox()
+                    func finish(_ passed: Bool, _ step: String?, _ reason: String?) {
+                        guard !box.done else { return }
+                        box.done = true
+                        box.timer?.cancel()
+                        box.timer = nil
+                        box.player?.pause()
+                        box.player = nil
+                        continuation.resume(returning: DeepProbeResult(passed: passed, failedStep: step, reason: reason, checkedAt: Date()))
+                    }
+                    // 取消已经先到了（onCancel 在 setup 块之前跑）：直接按取消收尾，不建播放器。
+                    if cancelBox.cancelled {
+                        finish(false, "取消", "深探针已取消")
+                        return
+                    }
+                    cancelBox.finish = finish
+                    let asset = AVURLAsset(url: url, options: [
+                        "AVURLAssetHTTPHeaderFieldsKey": headers,
+                        "AVURLAssetHTTPUserAgentKey": userAgent,
+                    ])
+                    let item = AVPlayerItem(asset: asset)
+                    let output = AVPlayerItemVideoOutput(pixelBufferAttributes: nil)
+                    item.add(output)
+                    let player = AVPlayer(playerItem: item)
+                    player.isMuted = true
+                    player.volume = 0
+                    box.player = player
+                    let timer = DispatchSource.makeTimerSource(queue: .main)
+                    box.timer = timer
+                    timer.schedule(deadline: .now(), repeating: .milliseconds(100))
+                    timer.setEventHandler {
+                        if item.status == .failed {
+                            finish(false, "首片", item.error?.localizedDescription ?? "播放器失败")
+                            return
+                        }
+                        guard item.status == .readyToPlay else { return }
+                        // 有新像素帧 = 出画；或正在播且时间在前进（兜底）
+                        if output.hasNewPixelBuffer(forItemTime: item.currentTime()) {
+                            finish(true, nil, nil)
+                            return
+                        }
+                        if player.timeControlStatus == .playing && item.currentTime().seconds > 0 {
+                            finish(true, nil, nil)
+                            return
+                        }
+                    }
+                    timer.resume()
+                    player.play()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + deepProbeTimeoutSeconds) {
+                        finish(false, "首片", "深探针 15s 未出画")
+                    }
+                }
+            }
+        } onCancel: {
+            // 主队列上置位 + 收尾（finish 有 done 锁，只 resume 一次；
+            // setup 块还没跑时 finish 是 nil，只记 cancelled，setup 块进来自己收尾）。
             DispatchQueue.main.async {
-                let item = AVPlayerItem(url: url)
-                let output = AVPlayerItemVideoOutput(pixelBufferAttributes: nil)
-                item.add(output)
-                let player = AVPlayer(playerItem: item)
-                player.isMuted = true
-                player.volume = 0
-                // 盒子：保活 player/timer，防 continuation 多次 resume
-                // 只在主队列上用（建播放器、轮询、超时都在主队列），不用 Sendable。
-                final class ProbeBox {
-                    var done = false
-                    var player: AVPlayer?
-                    var timer: DispatchSourceTimer?
-                }
-                let box = ProbeBox()
-                box.player = player
-                func finish(_ passed: Bool, _ step: String?, _ reason: String?) {
-                    guard !box.done else { return }
-                    box.done = true
-                    box.timer?.cancel()
-                    box.timer = nil
-                    player.pause()
-                    box.player = nil
-                    continuation.resume(returning: DeepProbeResult(passed: passed, failedStep: step, reason: reason, checkedAt: Date()))
-                }
-                let timer = DispatchSource.makeTimerSource(queue: .main)
-                box.timer = timer
-                timer.schedule(deadline: .now(), repeating: .milliseconds(100))
-                timer.setEventHandler {
-                    if item.status == .failed {
-                        finish(false, "首片", item.error?.localizedDescription ?? "播放器失败")
-                        return
-                    }
-                    guard item.status == .readyToPlay else { return }
-                    // 有新像素帧 = 出画；或正在播且时间在前进（兜底）
-                    if output.hasNewPixelBuffer(forItemTime: item.currentTime()) {
-                        finish(true, nil, nil)
-                        return
-                    }
-                    if player.timeControlStatus == .playing && item.currentTime().seconds > 0 {
-                        finish(true, nil, nil)
-                        return
-                    }
-                }
-                timer.resume()
-                player.play()
-                DispatchQueue.main.asyncAfter(deadline: .now() + deepProbeTimeoutSeconds) {
-                    finish(false, "首片", "深探针 15s 未出画")
-                }
+                cancelBox.cancelled = true
+                cancelBox.finish?(false, "取消", "深探针已取消")
             }
         }
     }
@@ -1087,7 +1137,10 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             }
             if lightDue {
                 _ = await self.runCheckAll()
-                UserDefaults.standard.set(Date(), forKey: self.lastAutoCheckDefaultsKey)
+                // 取消了就不写时间戳：这一轮没跑完，下次还要跑（旧逻辑取消也写，等于谎报“已检完”）。
+                if !Task.isCancelled {
+                    UserDefaults.standard.set(Date(), forKey: self.lastAutoCheckDefaultsKey)
+                }
             }
             if deepDue, !Task.isCancelled {
                 await self.runDeepProbeRound()
