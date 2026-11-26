@@ -39,9 +39,6 @@ struct SourceDetailView: View {
             do {
                 let loaded = try store.loadHost(for: source)
                 host = loaded
-                // 点进模块：后台竞速固定验线，定本次首选线（只跑一次；
-                // 播放器点视频时读 host.preferredLine，快路径不再写死 memojav）。
-                loaded.raceLinesIfNeeded()
             } catch {
                 errorMessage = "加载源失败：\(error.localizedDescription)"
             }

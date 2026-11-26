@@ -40,8 +40,36 @@ final class WidgetHost: @unchecked Sendable {
         // 竞速还在跑时这里是 nil，播放器按现有逻辑走（与竞速前一样）。
         return SourceStore.shared.sessionPreferredLine(for: meta.id)
     }
+    /// sourceGeneration：源 JS 的内容指纹（SourceStore.loadHost 传）；
+    /// 线路竞速的种子只认同代种子，源换了 JS 旧种子作废。默认 ""（未知，
+    /// 种子校验时跳过代际比对）。
+    let sourceGeneration: String
     /// 是否已跑过竞速（一个 host 只跑一次，进模块时触发）。
     private var didRaceLines = false
+    /// 用户可见请求计数（列表/分类/搜索/详情）：竞速取样时看到它 >0 就让路，
+    /// 不跟首屏抢网。竞速自己的 loadResource 不计数（不然自己把自己堵死）。
+    private let userRequestLock = NSLock()
+    private var userRequestCount = 0
+    private var isUserRequestActive: Bool {
+        userRequestLock.lock()
+        defer { userRequestLock.unlock() }
+        return userRequestCount > 0
+    }
+    private func beginUserRequest() {
+        userRequestLock.lock()
+        userRequestCount += 1
+        userRequestLock.unlock()
+    }
+    private func endUserRequest() {
+        userRequestLock.lock()
+        userRequestCount = max(0, userRequestCount - 1)
+        userRequestLock.unlock()
+    }
+    /// slug→分类 id 缓存（host|slug → id，TTL 1 小时）：没数字编号时才查 slug，
+    /// 查一次记下来，同一 host 同一 slug 不重复发 /categories 请求。
+    private static let categoryIdCacheLock = NSLock()
+    private static var categoryIdCache: [String: (id: String, at: Date)] = [:]
+    private static let categoryIdCacheTTL: TimeInterval = 3600
 
     enum WidgetHostError: Error, LocalizedError {
         case invalidFormat(String)
@@ -66,7 +94,7 @@ final class WidgetHost: @unchecked Sendable {
     /// 建 context、注入 Widget 桥接、evaluate 模块源码、取出元数据与模块清单。
     /// 取不到或格式不对就 throw（中文人话）。本方法只 evaluate，不发任何请求。
     /// fallbackTitle：WidgetMetadata 缺标题时用的兜底（一般传文件名），再没有用 id。
-    init(jsSource: String, fallbackTitle: String? = nil) throws {
+    init(jsSource: String, fallbackTitle: String? = nil, sourceGeneration: String = "") throws {
         let built = try Self.buildOnMainThread(jsSource: jsSource, fallbackTitle: fallbackTitle)
         self.context = built.context
         self.meta = built.meta
@@ -74,6 +102,7 @@ final class WidgetHost: @unchecked Sendable {
         self.exceptionBox = built.exceptionBox
         self.requestInterceptor = built.requestInterceptor
         self.httpRegistry = built.httpRegistry
+        self.sourceGeneration = sourceGeneration
     }
 
     deinit {
@@ -545,7 +574,7 @@ final class WidgetHost: @unchecked Sendable {
                     if let taskID { httpRegistry.unregister(taskID) }
                 }
                 do {
-                    let (status, data, responseHeaders, rawData) = try await Self.fetchHTTP(
+                    let (status, data, responseHeaders, rawData) = try await Self.fetchBridgeHTTP(
                         urlString: effectiveURL,
                         headers: headers,
                         timeout: timeout
@@ -709,6 +738,50 @@ final class WidgetHost: @unchecked Sendable {
         return (status, httpDataObject(from: raw), responseHeaders(from: response), raw)
     }
 
+    /// 桥里模块 GET 的统一入口（run #20）：
+    /// WP /posts 请求走 B 查询（_embed=wp:featuredmedia + _fields 瘦身），
+    /// 结构失败时记一笔并一次性回退原查询；挑战直接抛（不重试、不回退——
+    /// 挑战跟 B 无关）。非 WP 请求走原 fetchHTTP。
+    private static func fetchBridgeHTTP(
+        urlString: String,
+        headers: [String: String],
+        timeout: TimeInterval
+    ) async throws -> (status: Int, data: Any, responseHeaders: [String: String], rawData: Data) {
+        guard let bURL = WPQueryOptimizer.bRewrittenURL(for: urlString) else {
+            return try await fetchHTTP(urlString: urlString, headers: headers, timeout: timeout)
+        }
+        let host = URL(string: urlString)?.host ?? ""
+        var result = try await fetchWPBridgeTuple(urlString: bURL, headers: headers, timeout: timeout)
+        if WPQueryOptimizer.isStructuralFailure(status: result.status, bodyData: result.rawData) {
+            WPQueryCapability.record(host: host, works: false)
+            result = try await fetchWPBridgeTuple(urlString: urlString, headers: headers, timeout: timeout)
+        } else {
+            WPQueryCapability.record(host: host, works: true)
+        }
+        return result
+    }
+
+    /// 经 WordPressHTTP（挑战检测 + 单次可控重试 + 请求合并）取一个 WP GET，
+    /// 拼成桥里 resolve 用的四元组。
+    private static func fetchWPBridgeTuple(
+        urlString: String,
+        headers: [String: String],
+        timeout: TimeInterval
+    ) async throws -> (status: Int, data: Any, responseHeaders: [String: String], rawData: Data) {
+        guard let url = URL(string: urlString) else {
+            throw WidgetHostError.callFailed("链接格式不对：\(urlString)")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = timeout
+        for (key, value) in headers {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+        let (raw, response) = try await WordPressHTTP.shared.fetch(request, source: "widget", timeout: timeout)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        return (status, httpDataObject(from: raw), responseHeaders(from: response), raw)
+    }
+
     /// HTTPURLResponse.allHeaderFields 扁平成 [String: String]。
     /// 原样 key 留一份（如 'Set-Cookie'），再补一份全小写 key（如 'set-cookie'），
     /// 模块按哪种写法查都能查到；值一律转字符串。
@@ -788,46 +861,118 @@ final class WidgetHost: @unchecked Sendable {
         }
     }
 
-    /// 进模块时后台竞速：每个模块、每次打开软件到关闭软件，最多自动竞速一次。
-    /// 旧行为是“一个 host 只跑一次”，但 loadHost 每次都 new host，等于每次进
-    /// 模块、从封面页返回都重竞（下测试片段抢网，感觉慢）。
+    /// 线路竞速的种子：只认原始 latest 第 1 页、120 秒内的新鲜种子。
+    /// sourceGeneration 是源 JS 指纹（loadHost 时算）：源换了 JS，旧种子作废。
+    struct LineRaceSeed {
+        let moduleID: String
+        let sourceGeneration: String
+        let page: Int
+        let items: [VideoItem]
+        let createdAt: Date
+
+        init(moduleID: String, sourceGeneration: String, page: Int, items: [VideoItem], createdAt: Date) {
+            self.moduleID = moduleID
+            self.sourceGeneration = sourceGeneration
+            self.page = page
+            self.items = items
+            self.createdAt = createdAt
+        }
+    }
+
+    /// 种子竞速（自动路，run #20）：首屏 latest 第 1 页画出来后，VideoGridView
+    /// 拿着刚取到的列表调进来；不再进模块就跑，不再为取样另调一次 latest
+    ///（180 秒 seenFilter 会把取样当成一次 latest 浏览，污染后续去重）。
+    /// 种子须满足：page == 1、120 秒内、同代、latest 模块；否则直接不跑。
+    /// 最多 4 个发现样本，低优先级，用户可见请求开始时暂停取样。
+    /// 每个模块、每次打开软件到关闭软件，最多自动竞速一次。
     /// 本会话已竞过 → 不再跑，直接用会话里定的首选线（preferredLine 兜底读它）。
-    /// force=true（检测页“重新竞速”）无视会话去重，强制重测一次。
-    /// 调固定验线拿样本，各调 loadResource 解线计时，最快且能播的线记为本次首选线。
-    /// 没分出胜负 / 两条都死 / 无固定验线 → preferredLine 保持 nil，按现有逻辑。
+    /// 没分出胜负 / 两条都死 → preferredLine 保持 nil，按现有逻辑。
     /// 不抛错、不阻塞调用方；后台跑，跑完写 preferredLine，并把结果
-    /// （胜出线、各线耗时）记到 SourceStore，供检测页显示。
+    ///（胜出线、各线耗时）记到 SourceStore，供检测页显示。
     /// 播放器读 preferredLine：首选 memojav 走快路径直拼；首选 nmcorp 先走 loadResource 拿 nmcorp 线。
-    func raceLinesIfNeeded(force: Bool = false) {
+    func raceLinesIfNeeded(seed: LineRaceSeed) {
         guard !didRaceLines else { return }
+        guard seed.page == 1,
+              Date().timeIntervalSince(seed.createdAt) < 120,
+              seed.moduleID == latestListModule()?.id,
+              seed.sourceGeneration.isEmpty || sourceGeneration.isEmpty
+                || seed.sourceGeneration == sourceGeneration,
+              !seed.items.isEmpty else { return }
         didRaceLines = true
         // 本会话已竞过：不再下测试片段抢网，首选线由 preferredLine 兜底读会话缓存。
-        if !force, SourceStore.shared.hasRacedThisSession(meta.id) {
-            return
+        if SourceStore.shared.hasRacedThisSession(meta.id) { return }
+        // 同步先把 id 记进本会话已竞集合：重入瞬间（进模块又立刻返回再进）
+        // 两个 host 不会都开竞。
+        SourceStore.shared.markRaceStarted(for: meta.id)
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            let outcome = await self.runLineRace(seed: seed)
+            await self.finishRace(outcome)
         }
+    }
+
+    /// 手动重竞（检测页“重新竞速”）：现取 latest 第 1 页做新鲜种子再竞；
+    /// latest 取不到时退回固定验线取样（手动动作，不抢首屏网；
+    /// 固定验线 kind 是 "fixed"，不污染 latest 的 seenFilter）。
+    /// force=true 无视本会话去重，强制重测一次。
+    func raceLinesIfNeeded(force: Bool) {
+        guard !didRaceLines else { return }
+        didRaceLines = true
         // 同步先把 id 记进本会话已竞集合：重入瞬间（进模块又立刻返回再进）
         // 两个 host 不会都开竞。手动重竞也记，防并发的自动竞速插进来。
         SourceStore.shared.markRaceStarted(for: meta.id)
-        Task.detached { [weak self] in
+        Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
-            let outcome = await self.runLineRace()
-            self.raceLock.lock()
-            self._preferredLine = outcome.winner
-            self.raceLock.unlock()
-            // 结果记到 SourceStore（检测页显示用；竞速算法本身不动）。
-            // key 是 WidgetMeta.id，与 SourceRecord.id 同一个值。
-            await SourceStore.shared.recordRaceResult(
-                LineRaceResult(
-                    winnerLabel: outcome.winner?.displayLabel,
-                    timings: outcome.timings,
-                    racedAt: Date(),
-                    note: outcome.note
-                ),
-                for: self.meta.id
-            )
-            // 首选线进会话缓存：同会话再进这个模块的新 host 直接用，不重竞。
-            SourceStore.shared.markRaceFinished(for: self.meta.id, preferredLine: outcome.winner)
+            let outcome: LineRaceOutcome
+            if let latest = self.latestListModule(),
+               let samples = try? await self.loadList(moduleId: latest.id, page: 1),
+               !samples.isEmpty {
+                let seed = LineRaceSeed(moduleID: latest.id, sourceGeneration: self.sourceGeneration, page: 1, items: samples, createdAt: Date())
+                outcome = await self.runLineRace(seed: seed)
+            } else {
+                outcome = await self.runLineRaceFromFixedProbe()
+            }
+            await self.finishRace(outcome)
         }
+    }
+
+    /// 点视频时的按需发现（run #20）：首播后台的 loadResource 已解出线路，
+    /// 若还没定首选线，用第一条能认出种类的线暂定下来（不另跑竞速、不阻塞播放）。
+    /// 只写内存里的 _preferredLine，不记会话“已竞”（种子竞速仍可跑、跑完覆盖它）。
+    func noteTappedVideoDiscovery(lines: [PlayLine]) {
+        raceLock.lock()
+        defer { raceLock.unlock() }
+        guard _preferredLine == nil,
+              SourceStore.shared.sessionPreferredLine(for: meta.id) == nil else { return }
+        for line in lines {
+            guard let kind = PlaybackEngine.preferredLineKind(of: line) else { continue }
+            _preferredLine = kind
+            break
+        }
+    }
+
+    /// 该模块是不是“最新”列表模块（VideoGridView 种子触发用）。
+    func isLatestListModule(_ moduleId: String) -> Bool {
+        latestListModule()?.id == moduleId
+    }
+
+    /// 竞速收尾（两路共用）：写 preferredLine、记结果到 SourceStore、进会话缓存。
+    /// key 是 WidgetMeta.id，与 SourceRecord.id 同一个值。
+    private func finishRace(_ outcome: LineRaceOutcome) async {
+        raceLock.lock()
+        _preferredLine = outcome.winner
+        raceLock.unlock()
+        await SourceStore.shared.recordRaceResult(
+            LineRaceResult(
+                winnerLabel: outcome.winner?.displayLabel,
+                timings: outcome.timings,
+                racedAt: Date(),
+                note: outcome.note
+            ),
+            for: meta.id
+        )
+        // 首选线进会话缓存：同会话再进这个模块的新 host 直接用，不重竞。
+        SourceStore.shared.markRaceFinished(for: meta.id, preferredLine: outcome.winner)
     }
 
     /// 一次竞速的内部结果：胜出线 + 每种线的最快耗时 + 没分出胜负的原因。
@@ -839,11 +984,13 @@ final class WidgetHost: @unchecked Sendable {
         let note: String?
     }
 
-    /// 真正跑竞速：固定验线取样本，并发调 loadResource 解线计时。
-    /// 每样本取第一条能播的线（.m3u8 或 .mp4）定种类；最快的那种线获胜。
-    /// 没样本 / 都解不出 / 种类认不出 → winner 为 nil（按现有逻辑），note 写清原因。
-    /// 并发跑：两条线同时解，总耗时取最慢的一条，不叠加。
-    private func runLineRace() async -> LineRaceOutcome {
+    /// 种子竞速：种子 items 里最多取 4 个发现样本，并发解线计时。
+    private func runLineRace(seed: LineRaceSeed) async -> LineRaceOutcome {
+        await raceSamples(Array(seed.items.prefix(4)))
+    }
+
+    /// 固定验线取样（手动重竞的兜底）：固定验线模块取样本，并发解线计时。
+    private func runLineRaceFromFixedProbe() async -> LineRaceOutcome {
         guard let probe = fixedProbeModule() else {
             return LineRaceOutcome(winner: nil, timings: [], note: "没有固定验线")
         }
@@ -856,11 +1003,27 @@ final class WidgetHost: @unchecked Sendable {
         guard !samples.isEmpty else {
             return LineRaceOutcome(winner: nil, timings: [], note: "固定验线没有返回样本")
         }
+        return await raceSamples(samples)
+    }
+
+    /// 竞速核心：给定样本，并发调 loadResource 解线计时；每样本第一条能播的线
+    /// 定种类，最快的那种线获胜。取样前先让路：用户可见请求（列表/分类/搜索/详情）
+    /// 在跑时等一等（每 0.3 秒看一次，最多让 60 秒），不跟首屏抢网。
+    private func raceSamples(_ samples: [VideoItem]) async -> LineRaceOutcome {
+        guard !samples.isEmpty else {
+            return LineRaceOutcome(winner: nil, timings: [], note: "没有样本")
+        }
+        let gateDeadline = Date().addingTimeInterval(60)
         var best: (kind: PreferredLine, elapsed: TimeInterval)?
         var fastestByKind: [PreferredLine: TimeInterval] = [:]
         await withTaskGroup(of: (PreferredLine, TimeInterval)?.self) { group in
             for sample in samples {
                 group.addTask {
+                    while self.isUserRequestActive && Date() < gateDeadline {
+                        try? await Task.sleep(nanoseconds: 300_000_000)
+                        if Task.isCancelled { return nil }
+                    }
+                    if Task.isCancelled { return nil }
                     let start = Date()
                     let lines = (try? await self.loadResource(link: sample.link, title: sample.title)) ?? []
                     let elapsed = Date().timeIntervalSince(start)
@@ -902,6 +1065,8 @@ final class WidgetHost: @unchecked Sendable {
     /// requiresWebView 的模块也能跑：列表本身是 JS 调 API，不依赖播放器；
     /// 播的时候按线路类型路由（直链→AVPlayer，嵌入页→解流/WebView）。
     func loadList(moduleId: String, page: Int) async throws -> [VideoItem] {
+        beginUserRequest()
+        defer { endUserRequest() }
         guard let module = modules.first(where: { $0.id == moduleId }) else {
             throw WidgetHostError.functionMissing("没有这个模块：\(moduleId)")
         }
@@ -924,6 +1089,8 @@ final class WidgetHost: @unchecked Sendable {
     /// 没有 loadDetail 函数的模块 throw functionMissing，调用方据此隐藏分集区（不是错误）。
     /// loadDetail 在模块里是 loadDetail(link) 单字符串参数，不是 params 对象。
     func loadDetail(link: String) async throws -> DetailItem {
+        beginUserRequest()
+        defer { endUserRequest() }
         let result = try await callFunction("loadDetail", args: [link])
         return try parseDetailItem(result)
     }
@@ -931,6 +1098,8 @@ final class WidgetHost: @unchecked Sendable {
     /// 调 WidgetMetadata.search.functionName（一般是 searchVideos）。
     /// requiresWebView 的模块也能跑（搜索是 JS 调 API，与播放器无关）。
     func search(keyword: String, page: Int) async throws -> [VideoItem] {
+        beginUserRequest()
+        defer { endUserRequest() }
         guard let functionName = meta.searchFunctionName, !functionName.isEmpty else {
             throw WidgetHostError.functionMissing("这个模块不支持搜索")
         }
@@ -944,43 +1113,53 @@ final class WidgetHost: @unchecked Sendable {
         return try parseVideoItems(result)
     }
 
-    /// 取某分类下的视频。模块零改动，宿主侧两条路（按顺序）：
-    /// (1) 请求拦截：调模块的 latest 列表，桥里把模块发出的同源 /wp-json/wp/v2/posts
-    ///     请求改成带 &categories=<id>，模块照原样返回视频；只作用于这一次调用，
-    ///     调用完立即撤掉；拦截没命中（模块没发这类请求）或没返回视频就走 (2)。
-    /// (2) 直调 WP REST：GET /wp-json/wp/v2/posts?categories=<id>&per_page=20&page=<n>&_embed=1，
-    ///     映射成 VideoItem；点视频时把帖子链接交回现有的 loadResource 解析播放。
+    /// 取某分类下的视频。模块零改动，宿主侧只走一条路（run #20）：
+    /// 直调 WP REST：GET /wp-json/wp/v2/posts?categories=<id>&per_page=20&page=<n>
+    /// + B 查询（_embed=wp:featuredmedia&_fields 瘦身），映射成 VideoItem；
+    /// 点视频时把帖子链接交回现有的 loadResource 解析播放。
+    /// 拦截路径只作兜底：直调抛错才走它（绝不与直调并行——两路串行 8–12 秒，
+    /// 且都会撞上同一面 Cloudflare 墙）；挑战/断路器打开的错不进兜底。
+    /// 空数组是合法空结果（分类真没帖子），直接返回，不再换路。
     /// 分类链接绝不送进 loadResource。
-    /// categoryId 是数字编号或 "pornjav-cat-33" 这类原始 id；siteHost / categorySlug
+    /// categoryId 是数字编号或模块给的 "pornjav-cat-321" 这类原始 id（数字从模块
+    /// 的 /categories 响应里来，不硬编码）；siteHost / categorySlug
     /// 没有时对应路径自动跳过（拦截要求同源、直调要求域名）。
     func loadCategoryVideos(categoryId: String, categoryName: String, page: Int, siteHost: String? = nil, categorySlug: String? = nil) async throws -> [VideoItem] {
+        beginUserRequest()
+        defer { endUserRequest() }
         let numericId = VideoItem.numericId(from: categoryId)
         let apiHost = siteHost.map { Self.stripWWWPrefix($0) }
 
-        // (1) 请求拦截：调模块 latest，桥里改写它发出的 WP 帖子请求
-        if let numericId, let apiHost, let latest = latestListModule() {
-            let token = requestInterceptor.arm(siteHost: apiHost, categoryId: numericId)
-            do {
-                let result = try await callFunction(latest.functionName, params: buildParams(for: latest, page: page, inputs: [:]))
-                let items = try parseVideoItems(result)
-                let hit = requestInterceptor.didRewrite(token: token)
-                requestInterceptor.disarm(token: token)
-                if hit && !items.isEmpty {
-                    return items
-                }
-                // 拦截命中但返回空，或没命中：都继续走直调 WP REST（真空还是假空由它判定）
-            } catch let e as CancellationError {
-                requestInterceptor.disarm(token: token)
-                throw e
-            } catch {
-                requestInterceptor.disarm(token: token)
-                // 模块这条路抛错也继续走直调；直调再失败才报
-            }
-        }
-
-        // (2) 直调 WP REST：有数字编号直接查帖子
+        // 直调 WP REST：有数字编号直接查帖子
         if let numericId, let apiHost {
-            return try await fetchCategoryPostsDirect(siteHost: apiHost, categoryId: numericId, categoryName: categoryName, page: page)
+            do {
+                return try await fetchCategoryPostsDirect(siteHost: apiHost, categoryId: numericId, categoryName: categoryName, page: page)
+            } catch {
+                // 挑战类错误（挑战/断路器打开）不进兜底：拦截走同一端点，
+                // 只会再撞一次同一面墙。
+                if let wpError = error as? WordPressHTTPError, wpError.isChallengeLike {
+                    throw error
+                }
+                // 直调失败 → 兜底走拦截路径（调模块 latest，桥里改写它发出的 WP 帖子请求）
+                if let latest = latestListModule() {
+                    let token = requestInterceptor.arm(siteHost: apiHost, categoryId: numericId)
+                    do {
+                        let result = try await callFunction(latest.functionName, params: buildParams(for: latest, page: page, inputs: [:]))
+                        let items = try parseVideoItems(result)
+                        let hit = requestInterceptor.didRewrite(token: token)
+                        requestInterceptor.disarm(token: token)
+                        if hit && !items.isEmpty {
+                            return items
+                        }
+                    } catch let e as CancellationError {
+                        requestInterceptor.disarm(token: token)
+                        throw e
+                    } catch {
+                        requestInterceptor.disarm(token: token)
+                    }
+                }
+                throw error
+            }
         }
         // 没数字编号时按 slug 查分类拿 id 再查帖子
         if let apiHost, let slug = categorySlug, !slug.isEmpty,
@@ -1006,7 +1185,7 @@ final class WidgetHost: @unchecked Sendable {
 
     /// 找“最新”列表模块：params 里 kind 常量是 "latest" 的那个。
     /// 拦截路径调它（loadList kind=latest），桥里改写它发出的 WP 帖子请求。
-    private func latestListModule() -> ModuleDescriptor? {
+    func latestListModule() -> ModuleDescriptor? {
         modules.first { module in
             module.params.contains { param in
                 (param["name"] as? String) == "kind"
@@ -1016,26 +1195,38 @@ final class WidgetHost: @unchecked Sendable {
         }
     }
 
-    /// 直调 WP REST 取某分类的帖子，映射成 VideoItem。
+    /// 直调 WP REST 取某分类的帖子，映射成 VideoItem（run #20：B 查询默认）。
     /// 标题 HTML 解码、链接用帖子原链接、封面用 _embedded wp:featuredmedia[0].source_url、
     /// category 字段用分类名；点视频时把帖子链接交回现有的 loadResource 解析播放。
+    /// B 查询结构失败时记一笔并一次性回退原 _embed=1 查询。
     private func fetchCategoryPostsDirect(siteHost: String, categoryId: String, categoryName: String, page: Int) async throws -> [VideoItem] {
-        var components = URLComponents()
-        components.scheme = "https"
-        components.host = siteHost
-        components.path = "/wp-json/wp/v2/posts"
-        components.queryItems = [
-            URLQueryItem(name: "categories", value: categoryId),
-            URLQueryItem(name: "per_page", value: "20"),
-            URLQueryItem(name: "page", value: "\(page)"),
-            URLQueryItem(name: "_embed", value: "1"),
-        ]
-        guard let url = components.url else {
+        let useB = WPQueryCapability.isBEnabled(for: siteHost)
+        guard let url = wpCategoryPostsURL(siteHost: siteHost, categoryId: categoryId, page: page, useB: useB) else {
             throw WidgetHostError.callFailed("分类地址拼不出来")
         }
-        let (status, items) = try await fetchWordPressArray(url: url)
+        let (status, items, raw) = try await fetchWordPressArray(url: url)
+        if useB, WPQueryOptimizer.isStructuralFailure(status: status, bodyData: raw) {
+            WPQueryCapability.record(host: siteHost, works: false)
+            guard let fallbackURL = wpCategoryPostsURL(siteHost: siteHost, categoryId: categoryId, page: page, useB: false) else {
+                throw WidgetHostError.callFailed("分类地址拼不出来")
+            }
+            return try await fetchCategoryPostsFromURL(fallbackURL, categoryName: categoryName)
+        }
+        return try categoryPostsResult(status: status, items: items, categoryName: categoryName)
+    }
+
+    /// 直调 WP REST（回退路共用）：取一个已拼好的帖子 URL，映射成 VideoItem。
+    private func fetchCategoryPostsFromURL(_ url: URL, categoryName: String) async throws -> [VideoItem] {
+        let (status, items, _) = try await fetchWordPressArray(url: url)
+        return try categoryPostsResult(status: status, items: items, categoryName: categoryName)
+    }
+
+    /// 分类直调的结果映射：200 → 帖子列表；400 → 空（页码超出总页数，
+    /// WP 用 400 表示没更多了）；别的 → 抛错。items 为 nil（不是 JSON 数组）
+    /// 也抛错——挑战由 WordPressHTTP 在前头拦截，不会走到这里。
+    private func categoryPostsResult(status: Int, items: [[String: Any]]?, categoryName: String) throws -> [VideoItem] {
         guard status == 200 else {
-            if status == 400 { return [] } // 页码超出总页数：WP 用 400 表示没更多了
+            if status == 400 { return [] }
             throw WidgetHostError.callFailed("分类加载失败（HTTP \(status)）")
         }
         guard let items else {
@@ -1044,24 +1235,66 @@ final class WidgetHost: @unchecked Sendable {
         return items.compactMap { wordpressPostToVideoItem($0, categoryName: categoryName) }
     }
 
+    /// 拼分类帖子 URL：categories + per_page 20 + page；B 开时用
+    /// _embed=wp:featuredmedia&_fields 瘦身，关时用原 _embed=1。
+    private func wpCategoryPostsURL(siteHost: String, categoryId: String, page: Int, useB: Bool) -> URL? {
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = siteHost
+        components.path = "/wp-json/wp/v2/posts"
+        var queryItems = [
+            URLQueryItem(name: "categories", value: categoryId),
+            URLQueryItem(name: "per_page", value: "20"),
+            URLQueryItem(name: "page", value: "\(page)"),
+        ]
+        if useB {
+            queryItems.append(contentsOf: WPQueryOptimizer.bQueryItems())
+        } else {
+            queryItems.append(URLQueryItem(name: "_embed", value: "1"))
+        }
+        components.queryItems = queryItems
+        return components.url
+    }
+
     /// 直调 WP REST 时没有数字编号：先按 slug 查分类拿 id。
+    /// 查到的映射记 1 小时缓存（host|slug → id），同一 slug 不重复发请求。
     private func resolveWordPressCategoryId(siteHost: String, slug: String) async throws -> String? {
+        let cacheKey = siteHost.lowercased() + "|" + slug.lowercased()
+        Self.categoryIdCacheLock.lock()
+        if let cached = Self.categoryIdCache[cacheKey],
+           Date().timeIntervalSince(cached.at) < Self.categoryIdCacheTTL {
+            Self.categoryIdCacheLock.unlock()
+            return cached.id
+        }
+        Self.categoryIdCacheLock.unlock()
         var components = URLComponents()
         components.scheme = "https"
         components.host = siteHost
         components.path = "/wp-json/wp/v2/categories"
         components.queryItems = [URLQueryItem(name: "slug", value: slug)]
         guard let url = components.url else { return nil }
-        let (status, items) = try await fetchWordPressArray(url: url)
+        let (status, items, _) = try await fetchWordPressArray(url: url)
         guard status == 200, let first = items?.first else { return nil }
-        if let id = first["id"] as? Int { return "\(id)" }
-        if let idString = first["id"] as? String, !idString.isEmpty { return idString }
-        return nil
+        let resolved: String?
+        if let id = first["id"] as? Int {
+            resolved = "\(id)"
+        } else if let idString = first["id"] as? String, !idString.isEmpty {
+            resolved = idString
+        } else {
+            resolved = nil
+        }
+        if let resolved {
+            Self.categoryIdCacheLock.lock()
+            Self.categoryIdCache[cacheKey] = (id: resolved, at: Date())
+            Self.categoryIdCacheLock.unlock()
+        }
+        return resolved
     }
 
-    /// 直调 WP REST 的通用 GET：返回 (status, JSON 数组或 nil)。
+    /// 直调 WP REST 的通用 GET：返回 (status, JSON 数组或 nil, 原始 body)。
+    /// 经 WordPressHTTP（挑战检测 + 单次可控重试 + 请求合并）发请求；
     /// 传输失败时 throw；HTTP 状态码原样返回，由调用方判定。
-    private func fetchWordPressArray(url: URL) async throws -> (status: Int, items: [[String: Any]]?) {
+    private func fetchWordPressArray(url: URL) async throws -> (status: Int, items: [[String: Any]]?, rawData: Data) {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 12
@@ -1072,15 +1305,10 @@ final class WidgetHost: @unchecked Sendable {
         for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
-        let (raw, response) = try await DiagnosticHTTPClient.shared.data(
-            for: request,
-            source: "wp-direct",
-            preservedHeaders: headers,
-            timeout: 12
-        )
+        let (raw, response) = try await WordPressHTTP.shared.fetch(request, source: "wp-direct", timeout: 12)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         let items = try? JSONSerialization.jsonObject(with: raw) as? [[String: Any]]
-        return (status, items)
+        return (status, items, raw)
     }
 
     /// 一篇 WP 帖子 → VideoItem（直调路径用）。标题为空或链接为空的帖子跳过。

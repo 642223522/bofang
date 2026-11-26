@@ -649,3 +649,311 @@ private final class PerRequestDelegate: NSObject, URLSessionTaskDelegate, @unche
         completionHandler(redirected)
     }
 }
+
+// MARK: - WordPress 请求层（run #20：B 查询 + 挑战检测 + 单次可控重试 + 请求合并）
+
+/// WordPress API 请求的错误：挑战（Cloudflare）与断路器打开。
+/// 结构不兼容（B 查询不被支持）不抛错——调用方在拿到响应后用
+/// WPQueryOptimizer.isStructuralFailure 判定并一次性回退原查询。
+enum WordPressHTTPError: Error, LocalizedError {
+    case challenge(host: String)
+    case circuitOpen(host: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .challenge(let host):
+            return "Cloudflare 验证中（\(host)），请稍后再试或开节点"
+        case .circuitOpen(let host):
+            return "刚撞上 Cloudflare 验证（\(host)），60 秒内不再重试"
+        }
+    }
+
+    /// 挑战类错误（挑战本身 / 断路器打开）：调用方不要再走拦截器兜底，
+    /// 同一端点再发一次也只会撞上同一面墙。
+    var isChallengeLike: Bool {
+        switch self {
+        case .challenge, .circuitOpen: return true
+        }
+    }
+}
+
+/// WordPress API 的统一请求层（run #20）：
+/// - 挑战检测：cf-mitigated: challenge 响应头，或 Content-Type: text/html
+///   （JSON 接口绝不该返回 HTML）；挑战不重试、不当 JSON、不当空列表；
+/// - 单次可控重试：429 遵 Retry-After（最多等 10 秒）重试 1 次；
+///   5xx/超时退避 1 秒重试 1 次；挑战用断路器（同一 host 60 秒内直接报，不再发请求）；
+/// - 请求合并：同一 URL 在途时只发一次，后到的等同一结果；按等待者计数取消，
+///   最后一个等待者走光才取消底层请求；
+/// - 底层仍是 DiagnosticHTTPClient（长寿命 URLSession + URLSessionTaskMetrics，
+///   不另起会话；metrics 由它记进 NetworkDiagnostics）。
+final class WordPressHTTP: @unchecked Sendable {
+    static let shared = WordPressHTTP()
+
+    private let lock = NSLock()
+    private struct InFlight {
+        var task: Task<(Data, HTTPURLResponse), Error>
+        var waiters: Int
+    }
+    private var inFlight: [String: InFlight] = [:]
+    /// 断路器：host → 上次撞挑战的时间（60 秒内不再发请求）。
+    private var lastChallengeAt: [String: Date] = [:]
+    private let circuitOpenSeconds: TimeInterval = 60
+    /// 429 Retry-After 最多等这么久（再大也不等，列表不能卡死）。
+    private let maxRetryAfterSeconds: TimeInterval = 10
+    /// 5xx/超时重试前的退避。
+    private let retryBackoffSeconds: TimeInterval = 1
+
+    private init() {}
+
+    /// 挑战判定：cf-mitigated 响应头含 challenge，或 Content-Type 是 text/html。
+    /// 只认这两个信号（规范定死）；body 不参与判定。
+    static func isChallenge(response: URLResponse?) -> Bool {
+        guard let http = response as? HTTPURLResponse else { return false }
+        if let mitigated = http.value(forHTTPHeaderField: "cf-mitigated")?.lowercased(),
+           mitigated.contains("challenge") {
+            return true
+        }
+        if let contentType = http.value(forHTTPHeaderField: "Content-Type")?.lowercased(),
+           contentType.contains("text/html") {
+            return true
+        }
+        return false
+    }
+
+    /// 发一个 WordPress GET（调用方已拼好 URL 与请求头；只用于 GET）。
+    /// 返回原始 body 与 HTTP 响应；挑战/断路器抛 WordPressHTTPError。
+    func fetch(_ request: URLRequest, source: String, timeout: TimeInterval = 12) async throws -> (Data, HTTPURLResponse) {
+        guard let url = request.url else { throw URLError(.badURL) }
+        let key = url.absoluteString
+        let task: Task<(Data, HTTPURLResponse), Error>
+        lock.lock()
+        if var entry = inFlight[key] {
+            entry.waiters += 1
+            inFlight[key] = entry
+            task = entry.task
+            lock.unlock()
+        } else {
+            let created = Task<(Data, HTTPURLResponse), Error> {
+                try await self.perform(request, source: source, timeout: timeout)
+            }
+            inFlight[key] = InFlight(task: created, waiters: 1)
+            task = created
+            lock.unlock()
+        }
+        do {
+            let result = try await task.value
+            release(key: key)
+            return result
+        } catch {
+            release(key: key)
+            throw error
+        }
+    }
+
+    /// 一个等待者离开：在途表里减数；减到 0 就从表里摘掉并取消底层请求
+    ///（还有等待者时底层请求继续跑，不因某一路取消而断）。
+    private func release(key: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var entry = inFlight[key] else { return }
+        entry.waiters -= 1
+        if entry.waiters <= 0 {
+            inFlight.removeValue(forKey: key)
+            entry.task.cancel()
+        } else {
+            inFlight[key] = entry
+        }
+    }
+
+    /// 真正发请求（含单次可控重试）。断路器打开时直接报，不发请求。
+    private func perform(_ request: URLRequest, source: String, timeout: TimeInterval) async throws -> (Data, HTTPURLResponse) {
+        let host = request.url?.host?.lowercased() ?? ""
+        lock.lock()
+        let lastChallenge = lastChallengeAt[host]
+        lock.unlock()
+        if let lastChallenge, Date().timeIntervalSince(lastChallenge) < circuitOpenSeconds {
+            throw WordPressHTTPError.circuitOpen(host: host)
+        }
+        var attempt = 0
+        while true {
+            attempt += 1
+            do {
+                let (data, response) = try await DiagnosticHTTPClient.shared.data(
+                    for: request,
+                    source: source,
+                    preservedHeaders: request.allHTTPHeaderFields ?? [:],
+                    timeout: timeout
+                )
+                guard let http = response as? HTTPURLResponse else {
+                    throw URLError(.badServerResponse)
+                }
+                if Self.isChallenge(response: response) {
+                    recordChallenge(host: host)
+                    throw WordPressHTTPError.challenge(host: host)
+                }
+                recordSuccess(host: host)
+                let status = http.statusCode
+                if status == 429, attempt == 1 {
+                    let wait = min(retryAfterSeconds(from: http) ?? retryBackoffSeconds, maxRetryAfterSeconds)
+                    try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                    continue
+                }
+                if (500...599).contains(status), attempt == 1 {
+                    try await Task.sleep(nanoseconds: UInt64(retryBackoffSeconds * 1_000_000_000))
+                    continue
+                }
+                return (data, http)
+            } catch {
+                // 取消立即出，不重试；挑战类错误也不重试。
+                if error is CancellationError { throw error }
+                if let wpError = error as? WordPressHTTPError { throw wpError }
+                // 超时/断连重试 1 次；别的传输错误不重试。
+                if attempt == 1, let urlError = error as? URLError,
+                   urlError.code == .timedOut || urlError.code == .networkConnectionLost {
+                    try await Task.sleep(nanoseconds: UInt64(retryBackoffSeconds * 1_000_000_000))
+                    continue
+                }
+                throw error
+            }
+        }
+    }
+
+    private func recordChallenge(host: String) {
+        guard !host.isEmpty else { return }
+        lock.lock()
+        lastChallengeAt[host] = Date()
+        lock.unlock()
+    }
+
+    private func recordSuccess(host: String) {
+        guard !host.isEmpty else { return }
+        lock.lock()
+        lastChallengeAt.removeValue(forKey: host)
+        lock.unlock()
+    }
+
+    /// Retry-After 头：整数秒；解析不出按 1 秒算（HTTP-date 形式不展开，
+    /// 直接退回默认退避，不让列表卡死）。
+    private func retryAfterSeconds(from response: HTTPURLResponse) -> TimeInterval? {
+        guard let raw = response.value(forHTTPHeaderField: "Retry-After")?.trimmingCharacters(in: .whitespaces),
+              let seconds = Double(raw), seconds.isFinite, seconds >= 0 else { return nil }
+        return seconds
+    }
+}
+
+/// WordPress B 查询（run #20）：把模块发出的 /posts?_embed=1 改写成
+/// _embed=wp:featuredmedia&_fields=id,title,slug,link,_links,_embedded，
+/// 只留模块真正读的 5 个字段（id / title.rendered / slug / link /
+/// _embedded["wp:featuredmedia"][0].source_url）。沙箱实测：484KB→129KB，
+/// TTFB 4.9→2.99s，总 5.8→3.55s，24 条全、封面齐全。
+/// 只改写 /wp-json/wp/v2/posts 且带 _embed=1 的 GET；别的 URL 一律不动。
+/// 兼容性回退：某 host 的 B 查询被证实结构不支持时记一笔（TTL 24 小时），
+/// 期间该 host 不再改写，走原 _embed=1 查询；挑战不算结构失败。
+enum WPQueryOptimizer {
+    static let slimFields = "id,title,slug,link,_links,_embedded"
+
+    /// B 改写后的 URL；不适用（不是 /posts、没带 _embed=1、已有 _fields、
+    /// 该 host 的 B 已被证实不支持）返回 nil。
+    static func bRewrittenURL(for urlString: String) -> String? {
+        guard var comps = URLComponents(string: urlString),
+              comps.path == "/wp-json/wp/v2/posts",
+              let host = comps.host, !host.isEmpty,
+              WPQueryCapability.isBEnabled(for: host),
+              let items = comps.queryItems,
+              items.contains(where: { $0.name == "_embed" && $0.value == "1" }),
+              !items.contains(where: { $0.name == "_fields" }) else { return nil }
+        var newItems: [URLQueryItem] = []
+        for item in items {
+            if item.name == "_embed" {
+                newItems.append(URLQueryItem(name: "_embed", value: "wp:featuredmedia"))
+            } else {
+                newItems.append(item)
+            }
+        }
+        newItems.append(URLQueryItem(name: "_fields", value: slimFields))
+        comps.queryItems = newItems
+        return comps.url?.absoluteString
+    }
+
+    /// B 查询用的 query items（直调路径拼 URL 用；与桥里改写同一款查询）。
+    static func bQueryItems() -> [URLQueryItem] {
+        [
+            URLQueryItem(name: "_embed", value: "wp:featuredmedia"),
+            URLQueryItem(name: "_fields", value: slimFields),
+        ]
+    }
+
+    /// 结构失败判定（B 查询本身不被支持的信号）：
+    /// - 400 且 body 含 rest_invalid_param（无效查询参数；注意页码超出的 400
+    ///   是 rest_invalid_page_number，不算）；
+    /// - 200 但 body 不是 JSON 数组；
+    /// - 200 且数组非空、首条缺 id/title/link（字段被裁坏了）。
+    /// 空数组 [] 是合法空结果，不是失败；别的 4xx/5xx 是服务端问题，不是 B 不兼容；
+    /// HTML 体（挑战页/错误页）也不是 B 的结构问题。
+    static func isStructuralFailure(status: Int, bodyData: Data) -> Bool {
+        if status == 400 {
+            if let text = String(data: bodyData, encoding: .utf8),
+               text.contains("rest_invalid_param") {
+                return true
+            }
+            return false
+        }
+        guard status == 200 else { return false }
+        // 空体是传输异常（WP /posts 永远回数组，至少是 []），不是 B 的结构问题。
+        guard !bodyData.isEmpty else { return false }
+        if let text = String(data: bodyData.prefix(32), encoding: .utf8),
+           text.trimmingCharacters(in: .whitespaces).hasPrefix("<") {
+            return false
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: bodyData) else { return true }
+        guard let array = json as? [Any] else { return true }
+        guard let first = array.first as? [String: Any] else { return false }
+        return first["id"] == nil || first["title"] == nil || first["link"] == nil
+    }
+}
+
+/// B 查询的兼容性记录：按 host 记，TTL 24 小时。
+/// 只记失败（B 被证实不支持）；成功不写盘（只清掉已有的失败记录），
+/// 避免每次列表加载都写一次 UserDefaults。
+/// 没记录 / 记录过期 → B 默认开。
+enum WPQueryCapability {
+    private static let lock = NSLock()
+    /// host（小写）→ B 失败的时间。
+    private static var memory: [String: Date] = [:]
+    private static let ttl: TimeInterval = 24 * 3600
+
+    private static func defaultsKey(for host: String) -> String {
+        "wp.bquery.failed." + host.lowercased()
+    }
+
+    static func isBEnabled(for host: String) -> Bool {
+        let key = host.lowercased()
+        lock.lock()
+        defer { lock.unlock() }
+        if let failedAt = memory[key] {
+            return Date().timeIntervalSince(failedAt) >= ttl
+        }
+        if let stored = UserDefaults.standard.object(forKey: defaultsKey(for: host)) as? Date {
+            if Date().timeIntervalSince(stored) < ttl {
+                memory[key] = stored
+                return false
+            }
+            UserDefaults.standard.removeObject(forKey: defaultsKey(for: host))
+        }
+        return true
+    }
+
+    static func record(host: String, works: Bool) {
+        let key = host.lowercased()
+        lock.lock()
+        defer { lock.unlock() }
+        if works {
+            memory.removeValue(forKey: key)
+            UserDefaults.standard.removeObject(forKey: defaultsKey(for: host))
+        } else {
+            let now = Date()
+            memory[key] = now
+            UserDefaults.standard.set(now, forKey: defaultsKey(for: host))
+        }
+    }
+}

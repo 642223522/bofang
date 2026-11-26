@@ -70,7 +70,10 @@ final class StagedNetworkProbe: NSObject {
         ProbeTarget(
             name: "onlybokep",
             apiURL: URL(string: "https://onlybokep.cam")!,
-            embedURL: nil,
+            // 嵌页样例码（run #20 诊断样本：诊断时某帖的 dood 码 37d1caxkeenh，
+            // 指向 playmogo /e/ 页；码会过期——这行只探“嵌页域本身通不通”，
+            // 不是业务线路，烂了也不影响播放，只说明样例过期）。
+            embedURL: URL(string: "https://playmogo.com/e/37d1caxkeenh")!,
             extraHosts: ["playmogo.com", "doodstream.com"]
         ),
     ]
@@ -175,8 +178,13 @@ final class StagedNetworkProbe: NSObject {
         }
 
         // 4. 干净 WKWebView 同 URL 探针（不改 UA、不注脚本，只看能不能加载）。
+        // 嵌页 URL 也跑一轮（run #20 F1）：只看 apiURL 通不通，定位不了白屏。
         if Task.isCancelled { return }
         emit(await probeCleanWKWebView(url: target.apiURL))
+        if let embedURL = target.embedURL {
+            if Task.isCancelled { return }
+            emit(await probeCleanWKWebView(url: embedURL, label: "WKWebView[Clean Embed]"))
+        }
         emit(ProbeLine(stage: .info, label: target.name, detail: "探针结束", ok: nil))
     }
 
@@ -473,8 +481,13 @@ final class StagedNetworkProbe: NSObject {
     }
 
     // MARK: - 4. Clean WKWebView Probe (Zero UA spoofing, zero script injection)
+    /// 干净 WKWebView 探针：页载完后读 body 文本前 200 字。
+    /// 挑战页不算 LOADED（run #20 F1）：文本含 "just a moment" /
+    /// "checking your browser" / "challenges.cloudflare.com"（或中文同款）
+    /// 时报 CHALLENGE，归 WAF 阶段、ok=false——以前它被当成 LOADED ok=true，
+    /// 挑战页和真加载成功分不出来。
     @MainActor
-    private func probeCleanWKWebView(url: URL) async -> ProbeLine {
+    private func probeCleanWKWebView(url: URL, label: String = "WKWebView[Clean]") async -> ProbeLine {
         let cfg = WKWebViewConfiguration()
         // 不用 .default() 持久 store：探针的 cookie/缓存不污染正常浏览，
         // 也不让上次探针的 CF 状态影响这次结果。
@@ -493,7 +506,17 @@ final class StagedNetworkProbe: NSObject {
             }
             func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
                 webView.evaluateJavaScript("document.body ? document.body.innerText.slice(0, 200) : ''") { val, _ in
-                    self.finish("LOADED snippet=\((val as? String ?? "").replacingOccurrences(of: "\n", with: " "))")
+                    let snippet = (val as? String ?? "").replacingOccurrences(of: "\n", with: " ")
+                    let lower = snippet.lowercased()
+                    if lower.contains("just a moment")
+                        || lower.contains("checking your browser")
+                        || lower.contains("challenges.cloudflare.com")
+                        || lower.contains("请稍候")
+                        || lower.contains("正在验证") {
+                        self.finish("CHALLENGE snippet=\(snippet)")
+                    } else {
+                        self.finish("LOADED snippet=\(snippet)")
+                    }
                 }
             }
             func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -527,7 +550,8 @@ final class StagedNetworkProbe: NSObject {
             }
         }
         let ok = result.hasPrefix("LOADED")
-        return ProbeLine(stage: .webview, label: "WKWebView[Clean]", detail: result, ok: ok)
+        let stage: ProbeStage = result.hasPrefix("CHALLENGE") ? .waf : .webview
+        return ProbeLine(stage: stage, label: label, detail: result, ok: ok)
     }
 }
 

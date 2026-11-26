@@ -80,7 +80,7 @@ struct DetailView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                 case .webView:
                     if let webViewURL = playerVM.webViewURL {
-                        WebViewPlayerView(url: webViewURL, onClose: { playerVM.closeWebView() }, onPlaying: { playerVM.markPlaying() })
+                        WebViewPlayerView(url: webViewURL, onClose: { playerVM.closeWebView() }, onPlaying: { playerVM.markPlaying() }, onEmbedFailed: { playerVM.markEmbedFailed($0) }, retryNonce: playerVM.embedRetryNonce)
                             .aspectRatio(16.0 / 9.0, contentMode: .fit)
                             .background(Color.black)
                             .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -101,6 +101,14 @@ struct DetailView: View {
                     Text(reason)
                         .foregroundColor(.red)
                         .font(.subheadline)
+                    // 嵌入播放失败（探针看门狗终局）：给重试按钮，重新走 playEmbedLine。
+                    // 直链失败不显示（直链失败走自动切线，重试按钮只属于嵌页）。
+                    if playerVM.webViewURL != nil {
+                        Button("重试嵌入播放") {
+                            playerVM.retryEmbed()
+                        }
+                        .buttonStyle(.bordered)
+                    }
                 } else if let failureReason = playerVM.failureReason {
                     Text(failureReason)
                         .foregroundColor(.red)

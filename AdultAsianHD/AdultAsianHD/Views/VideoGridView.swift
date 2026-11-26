@@ -25,6 +25,10 @@ struct VideoGridView: View {
     @State private var items: [VideoItem] = []
     @State private var currentPage = 1
     @State private var isLoading = false
+    /// 加载代次：每次 load(page:) +1；旧代次的结果回来时直接丢掉，
+    /// 不让下拉刷新/切页后旧请求覆盖新列表、也不让 isLoading 永远卡着
+    ///（run #20：分类空结果/失败也不能让转圈转到天荒地老）。
+    @State private var loadGeneration = 0
     @State private var hasMore = true
     @State private var errorMessage: String?
     @State private var searchText = ""
@@ -162,7 +166,16 @@ struct VideoGridView: View {
     private func load(page: Int, append: Bool) async {
         guard !isLoading else { return }
         isLoading = true
+        loadGeneration += 1
+        let generation = loadGeneration
         errorMessage = nil
+        // defer 清转圈：无论成功、失败、取消，isLoading 一定落回去；
+        // 旧代次的结果只清自己的圈（新代次的圈它管不着）。
+        defer {
+            if generation == loadGeneration {
+                isLoading = false
+            }
+        }
         do {
             let fetched: [VideoItem]
             if isSearching {
@@ -181,6 +194,8 @@ struct VideoGridView: View {
                     )
                 }
             }
+            // 旧代次的结果丢掉：下拉刷新/切页后旧请求回来了也不覆盖新列表。
+            guard generation == loadGeneration else { return }
             if append {
                 items.append(contentsOf: fetched)
             } else {
@@ -191,10 +206,22 @@ struct VideoGridView: View {
             }
             hasMore = !fetched.isEmpty
             currentPage = page
+            // 首屏画出来了：模块 latest 第 1 页 → 给竞速递新鲜种子
+            //（run #20 种子制；分类页/搜索/翻页不触发）。
+            if page == 1, !isSearching, case .module(let id) = mode,
+               host.isLatestListModule(id) {
+                host.raceLinesIfNeeded(seed: .init(
+                    moduleID: id,
+                    sourceGeneration: host.sourceGeneration,
+                    page: 1,
+                    items: fetched,
+                    createdAt: Date()
+                ))
+            }
         } catch {
+            guard generation == loadGeneration else { return }
             errorMessage = "加载失败：\(error.localizedDescription)"
         }
-        isLoading = false
     }
 }
 
@@ -202,7 +229,7 @@ struct VideoGridView: View {
 
 /// 分类列表页：点分类项进来，只加载该分类下的视频。
 /// 复用 VideoGridView（分页 / 下拉刷新 / 滚动恢复都一样），
-/// 取列表走 host.loadCategoryVideos（先请求拦截，不行再直调 WP REST）。
+/// 取列表走 host.loadCategoryVideos（直调 WP REST 为主，拦截只作兜底）。
 struct CategoryListView: View {
     let categoryItem: VideoItem
     let host: WidgetHost

@@ -57,6 +57,9 @@ final class CloudflareWarmup {
     ///（最多 3 次），暖完或暖失败都调 completion（调用方照常加载，
     /// 兜底是用户手动过验证）。container 为空时预热 WebView 不挂视图树
     ///（尽力而为）；给了就全尺寸插到最底层（在屏、不隐藏，CF 才认）。
+    /// 预热跑完记一条诊断（run #20 F1）：拿没拿到 clearance、几次、几秒，
+    /// 检测页能看到预热到底暖没暖出来；已有 clearance 的快路径不记
+    ///（每次加载都记会刷屏，那行没新信息）。
     func ensureClearance(for host: String, webView: WKWebView?, container: UIView?, completion: @escaping () -> Void) {
         guard let webView else { completion(); return }
         guard Self.needsWarmup(host: host) else { completion(); return }
@@ -66,12 +69,42 @@ final class CloudflareWarmup {
                 completion()
                 return
             }
-            await self.runWarmup(host: host, playbackWebView: webView, container: container)
+            let outcome = await self.runWarmup(host: host, playbackWebView: webView, container: container)
+            let event = NetworkDiagEvent(
+                id: UUID(),
+                at: Date(),
+                source: "warmup",
+                method: "GET",
+                host: host,
+                sanitizedPath: "/",
+                networkClass: PlaybackLedger.networkClass,
+                phase: outcome.cleared ? .ok : .waf,
+                statusCode: outcome.cleared ? 200 : 403,
+                errorDomain: nil,
+                errorCode: nil,
+                errorSummary: outcome.cleared
+                    ? "预热拿到 cf_clearance（\(outcome.attempts) 次，\(String(format: "%.1f", outcome.seconds)) 秒）"
+                    : "预热没拿到 cf_clearance（\(outcome.attempts) 次，\(String(format: "%.1f", outcome.seconds)) 秒）",
+                remoteAddress: nil,
+                protocolName: nil,
+                reusedConnection: false,
+                proxyConnection: false,
+                dnsMs: nil,
+                tcpMs: nil,
+                tlsMs: nil,
+                ttfbMs: nil,
+                totalMs: Int(outcome.seconds * 1000)
+            )
+            NetworkDiagnostics.record(event)
             completion()
         }
     }
 
-    private func runWarmup(host: String, playbackWebView: WKWebView, container: UIView?) async {
+    /// 预热并返回结果：cleared=有没有拿到并同步 cf_clearance，
+    /// attempts=实际跑了几次，seconds=总耗时秒数。
+    private func runWarmup(host: String, playbackWebView: WKWebView, container: UIView?) async -> (cleared: Bool, attempts: Int, seconds: Double) {
+        let started = Date()
+        let elapsed: () -> Double = { Date().timeIntervalSince(started) }
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .nonPersistent()
         config.defaultWebpagePreferences.allowsContentJavaScript = true
@@ -96,21 +129,22 @@ final class CloudflareWarmup {
             untrack(session.id)
             warmView.removeFromSuperview()
         }
-        guard let url = URL(string: "https://\(host)/") else { return }
-        for _ in 0..<maxAttempts {
-            if Task.isCancelled || session.cancelled { return }
+        guard let url = URL(string: "https://\(host)/") else { return (false, 0, elapsed()) }
+        for attempt in 1...maxAttempts {
+            if Task.isCancelled || session.cancelled { return (false, attempt - 1, elapsed()) }
             warmView.load(URLRequest(url: url, timeoutInterval: 15))
             // 轮询等 cf_clearance 出现（Task sleep，不用 Timer）。
             let deadline = Date().addingTimeInterval(perAttemptWait)
             while Date() < deadline {
-                if Task.isCancelled || session.cancelled { return }
+                if Task.isCancelled || session.cancelled { return (false, attempt - 1, elapsed()) }
                 try? await Task.sleep(nanoseconds: pollInterval)
                 if await hasValidClearance(for: host, in: warmView) {
                     await syncClearance(from: warmView, to: playbackWebView, host: host)
-                    return
+                    return (true, attempt, elapsed())
                 }
             }
         }
+        return (false, maxAttempts, elapsed())
     }
 
     /// 把预热 WebView 里的 cf_clearance 同步进播放 WebView 的 cookie store。

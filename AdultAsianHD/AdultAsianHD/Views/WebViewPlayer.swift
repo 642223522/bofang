@@ -271,6 +271,27 @@ enum AdStripScript {
 
 // MARK: - 嵌入页探针（读页内 video 元素的进度/状态，控制它播/停/快进/全屏；兼管底条显隐）
 
+/// 找页内 video 的 JS 片段（run #20 F5）：先查顶层 document，再查每个同源 iframe
+/// 的 contentDocument（跨域 iframe 读不到，try/catch 跳过）；播放器常把 video
+/// 藏在同源 iframe 里，只查顶层会漏。探针、播放/暂停、快进、全屏、零播踢一下共用。
+/// 注意：里面不能出现反引号或 ${}（会被 Swift 多行字符串插值误认）。
+private let findVideoJS = """
+(function(){
+  var v = document.querySelector('video');
+  if (v) return v;
+  var frames = document.querySelectorAll('iframe');
+  for (var i = 0; i < frames.length; i++) {
+    try {
+      var doc = frames[i].contentDocument;
+      if (!doc) continue;
+      var inner = doc.querySelector('video');
+      if (inner) return inner;
+    } catch (e) {}
+  }
+  return null;
+})()
+"""
+
 /// JS 探针状态：每 0.5 秒读一次页内第一个 video 元素的 currentTime/duration/paused。
 /// 探不到 video（跨域 iframe、还没加载出 video）时 hasVideo=false，外层只显示状态文案。
 /// 嵌页自己的播放控制不动（页内播放器照常用）；外层底条只是多一套统一外观的操作入口。
@@ -300,6 +321,26 @@ final class EmbedProbeState: ObservableObject {
     /// ViewModel.markPlaying()，账本才有“播放中”的终局。注意：只报“真在播”，
     /// 不报“WebView 接手了”——接手不等于播出（挑战页也会接手）。
     var onPlaying: (() -> Void)?
+    /// 嵌页终局失败时调一次（run #20 F3 看门狗）：外层据此调
+    /// ViewModel.markEmbedFailed(reason)，状态变 .failed + 给重试按钮。
+    /// 只报一次（同一 URL）；切 URL 时 stop() 清掉，下个 URL 重新计时。
+    var onEmbedFailed: ((String) -> Void)?
+    /// 底条显示的真实阶段（run #20 F2）：再也不写死“嵌入播放中”。
+    /// hasVideo → 在播；challengeRunning → 正在验证；warmingUp → 正在预热；
+    /// pageLoaded（页已载完仍没 video）→ 已加载未出画面；failed → 失败；
+    /// 其余 → 正在加载。
+    var statusText: String {
+        if failedReported { return "嵌入播放失败" }
+        if hasVideo { return "嵌入播放中" }
+        if challengeRunning { return "正在验证…" }
+        if warmingUp { return "正在预热验证…" }
+        if pageLoaded { return "已加载，未出画面" }
+        return "正在加载…"
+    }
+    /// 预热是不是正在跑（控制器在 ensureClearance 期间置 true，完事置 false）。
+    @Published var warmingUp = false
+    /// 主框架是不是已载完（控制器 didFinish 置 true，失败置 false）。
+    @Published var pageLoaded = false
     /// 本 URL 是否已报过一次 onPlaying（切 URL 时 stop() 清掉，下个 URL 重新报）。
     private var playingReported = false
     /// 上次探到的 currentTime：时间往前走了才算“在播”。
@@ -317,9 +358,18 @@ final class EmbedProbeState: ObservableObject {
     /// CF 挑战第一次被看到的时间；challengeReloaded=true 表示兜底已用过一次。
     private var challengeSince: Date?
     private var challengeReloaded = false
+    /// 看门狗（run #20 F3）：loadStartedAt 是本页开始探的时间；
+    /// lastVideoSeenAt 是上次探到 video 的时间（video 一度出现又消失时，
+    /// 从消失算起）；reloadAt 是 12 秒兜底重载的时间；failedReported 保证
+    /// 终局失败只报一次。
+    private var loadStartedAt: Date?
+    private var lastVideoSeenAt: Date?
+    private var reloadAt: Date?
+    private var failedReported = false
 
     func start() {
         stop()
+        loadStartedAt = Date()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.probe() }
         }
@@ -341,6 +391,12 @@ final class EmbedProbeState: ObservableObject {
         challengeRunning = false
         challengeReloaded = false
         challengeSince = nil
+        loadStartedAt = nil
+        lastVideoSeenAt = nil
+        reloadAt = nil
+        failedReported = false
+        warmingUp = false
+        pageLoaded = false
         hasVideo = false
         currentTime = 0
         duration = 0
@@ -355,7 +411,7 @@ final class EmbedProbeState: ObservableObject {
         webView.evaluateJavaScript(
             """
             (function(){
-              var v = document.querySelector('video');
+              var v = \(findVideoJS);
               var cf = false;
               var cfTitle = false;
               try {
@@ -393,12 +449,15 @@ final class EmbedProbeState: ObservableObject {
             } else {
                 self.challengeSince = nil
             }
+            // 看门狗（run #20 F3）：没 video 一直拖着就终局失败，不让白屏无限转。
+            self.checkWatchdog(challengeRunning: cfRunning)
             guard json["t"] != nil else {
                 self.hasVideo = false
                 self.challengeRunning = cfRunning
                 return
             }
             self.hasVideo = true
+            self.lastVideoSeenAt = Date()
             self.challengeRunning = false
             // 拖进度条锁：松手后 1.2 秒内不回写，避免探针把用户刚拖到的时间
             // 又 snap 回页内 video 还没 seek 完的旧时间。
@@ -426,7 +485,7 @@ final class EmbedProbeState: ObservableObject {
                 if !self.didNudgeZeroPlay && seenFor >= 2 {
                     self.didNudgeZeroPlay = true
                     webView.evaluateJavaScript(
-                        "var v=document.querySelector('video'); if(v){ var p=v.play(); if(p && p.catch) p.catch(function(){}); }",
+                        "var v=\(findVideoJS); if(v){ var p=v.play(); if(p && p.catch) p.catch(function(){}); }",
                         completionHandler: nil
                     )
                 }
@@ -447,10 +506,46 @@ final class EmbedProbeState: ObservableObject {
         }
     }
 
+    /// 看门狗（run #20 F3）：没 video 一直拖着就终局失败，不让白屏无限转。
+    /// - 挑战在跑：重载后 15 秒仍没 video，或挑战从头到尾跑满 45 秒没 video → 失败；
+    /// - 没挑战也没 video：重载后 15 秒仍没 video → 失败；从没重载过 → 45 秒没 video → 失败
+    ///   （video 一度出现过：从上次见到它算起 45 秒）。
+    /// 终局失败只报一次（failedReported），外层经 onEmbedFailed → markEmbedFailed，
+    /// 状态变 .failed + 给重试按钮；探针计时器本身不停（重试后同一探针继续探）。
+    private func checkWatchdog(challengeRunning cfRunning: Bool) {
+        guard !hasVideo, !failedReported, loadStartedAt != nil else { return }
+        if cfRunning {
+            if let since = challengeSince,
+               Date().timeIntervalSince(since) >= 45 {
+                failEmbed("Cloudflare 验证一直没通过（45 秒），请开节点或点重试")
+            }
+            return
+        }
+        if let reloadedAt = reloadAt {
+            if Date().timeIntervalSince(reloadedAt) >= 15 {
+                failEmbed("嵌页加载超时，重载后一直没出画面，请点重试")
+            }
+        } else if let lastSeen = lastVideoSeenAt {
+            if Date().timeIntervalSince(lastSeen) >= 45 {
+                failEmbed("嵌页加载超时，一直没出画面，请点重试")
+            }
+        } else if let started = loadStartedAt,
+                  Date().timeIntervalSince(started) >= 45 {
+            failEmbed("嵌页加载超时，一直没出画面，请点重试")
+        }
+    }
+
+    private func failEmbed(_ reason: String) {
+        guard !failedReported else { return }
+        failedReported = true
+        onEmbedFailed?(reason)
+    }
+
     /// CF 卡死兜底：关掉内容屏蔽规则、重载页面（只做一次），并记一条 WAF 诊断。
     private func reloadWithoutRules() {
         guard let webView else { return }
         onDisableAdRules?()
+        reloadAt = Date()
         webView.configuration.userContentController.removeAllContentRuleLists()
         if let currentURL = webView.url {
             let event = NetworkDiagEvent(
@@ -485,7 +580,7 @@ final class EmbedProbeState: ObservableObject {
     func togglePlayPause() {
         webView?.evaluateJavaScript(
             """
-            (function(){ var v = document.querySelector('video'); if (!v) return; if (v.paused) { v.play(); } else { v.pause(); } })();
+            (function(){ var v = \(findVideoJS); if (!v) return; if (v.paused) { v.play(); } else { v.pause(); } })();
             """,
             completionHandler: nil
         )
@@ -521,7 +616,7 @@ final class EmbedProbeState: ObservableObject {
         guard seconds.isFinite, seconds >= 0 else { return }
         webView?.evaluateJavaScript(
             """
-            (function(){ var v = document.querySelector('video'); if (!v) return; v.currentTime = \(seconds); })();
+            (function(){ var v = \(findVideoJS); if (!v) return; v.currentTime = \(seconds); })();
             """,
             completionHandler: nil
         )
@@ -533,7 +628,7 @@ final class EmbedProbeState: ObservableObject {
         webView?.evaluateJavaScript(
             """
             (function(){
-              var v = document.querySelector('video');
+              var v = \(findVideoJS);
               if (v) {
                 if (v.requestFullscreen) v.requestFullscreen();
                 else if (v.webkitRequestFullscreen) v.webkitRequestFullscreen();
@@ -670,25 +765,25 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
     /// 只做 URL 加载：探针 reset 不在这里做（SwiftUI 更新期调它会改
     /// @Published，撞上视图更新）；切 URL 时 WebViewPlayerView 的
     /// .onChange(of: url) 会调 probe.stop()/start()。
+    /// run #20 F2：/e/ URL 立即在播放 WebView 里加载，不再等 30 秒预热门；
+    /// 预热只在后台并行跑（给播放 WebView 预种 cf_clearance cookie，
+    /// 完事不改已在加载的页面）。以前：没 clearance 就先暖 3×10 秒，
+    /// 暖完才加载——白屏 10–30 秒就是这么来的。
     func loadIfNeeded(url: URL) {
         guard loadedURL != url else { return }
         loadedURL = url
         navigationStartAt = Date()
         // 上一页关掉广告规则后换了新 URL：规则重新开，新的一页重新评估。
         adRulesDisabled = false
-        // onlybokep 系嵌页常被 Cloudflare 拦：先看播放 WebView 的 cookie
-        // 里有没有有效的 cf_clearance；有就直接加载，没有就先预热
-        //（干净 WebView 打开目标域，让 CF 发 clearance，再同步进来），
-        // 暖完（或暖失败 3 次）都照常加载，兜底是用户手动过验证。
-        // 预热是异步的：加载发生在回调里；用户切走后 loadedURL 已变，
-        // 回调里不再加载旧 URL。
-        guard let host = url.host, CloudflareWarmup.needsWarmup(host: host) else {
-            load(request: url)
-            return
-        }
-        CloudflareWarmup.shared.ensureClearance(for: host, webView: webView, container: view) { [weak self] in
-            guard let self, self.loadedURL == url else { return }
-            self.load(request: url)
+        probe.pageLoaded = false
+        // 立即加载（不等预热）。
+        load(request: url)
+        // 预热并行跑：只做 cookie 预种，不挡加载、不改页面。
+        if let host = url.host, CloudflareWarmup.needsWarmup(host: host) {
+            probe.warmingUp = true
+            CloudflareWarmup.shared.ensureClearance(for: host, webView: webView, container: view) { [weak self] in
+                self?.probe.warmingUp = false
+            }
         }
     }
 
@@ -724,6 +819,11 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
         return nil
     }
 
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        // 主框架载完：探针的状态文案可以从“正在加载…”变成“已加载，未出画面”。
+        probe.pageLoaded = true
+    }
+
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         navigationStartAt = Date()
         if adRulesDisabled {
@@ -740,6 +840,7 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
     }
 
     private func recordNavigationError(_ error: Error, url: URL) {
+        probe.pageLoaded = false
         let nsErr = error as NSError
         // WKErrorCodeFrameLoadInterruptedByPolicyChange (102) 或 NSURLErrorCancelled (-999) 是正常切页/拦截，不刷屏
         if nsErr.code == NSURLErrorCancelled || (nsErr.domain == "WebKitErrorDomain" && nsErr.code == 102) {
@@ -838,6 +939,11 @@ struct WebViewPlayerView: View {
     /// 页内 video 真在播时调一次（有 video、没暂停、时间在走）：外层据此
     /// 调 ViewModel.markPlaying()。只报真在播，不报“WebView 接手了”。
     var onPlaying: (() -> Void)? = nil
+    /// 嵌页终局失败时调一次（探针看门狗）：外层据此调 ViewModel.markEmbedFailed(reason)。
+    var onEmbedFailed: ((String) -> Void)? = nil
+    /// 嵌入重试计数（DetailView 从 ViewModel 传）：变了就把探针整套状态清掉重开，
+    /// 同一 URL 重试也有新鲜的看门狗窗口。
+    var retryNonce: Int = 0
 
     @StateObject private var probe = EmbedProbeState()
 
@@ -881,7 +987,7 @@ struct WebViewPlayerView: View {
                         isFullscreen: false,
                         onFullscreen: { probe.requestFullscreen() },
                         onClose: onClose,
-                        statusText: "嵌入播放中",
+                        statusText: probe.statusText,
                         onPlayPause: { probe.togglePlayPause() },
                         onScrubStart: { probe.beginScrub() },
                         onScrub: { probe.scrub(to: $0) },
@@ -893,6 +999,7 @@ struct WebViewPlayerView: View {
         .background(Color.black)
         .onAppear {
             probe.onPlaying = onPlaying
+            probe.onEmbedFailed = onEmbedFailed
             probe.start()
             probe.showControlsTemporarily()
         }
@@ -901,6 +1008,13 @@ struct WebViewPlayerView: View {
             // hasVideo、playingReported 都归零），不然 Line B 沿用 Line A
             // 的状态，CF 兜底跳过、markPlaying 也不再报。
             // 放这里不放 loadIfNeeded：SwiftUI 更新期改 @Published 会撞上视图更新。
+            probe.stop()
+            probe.start()
+        }
+        .onChange(of: retryNonce) { _, _ in
+            // 同一 URL 点“重试嵌入播放”：探针也清掉重开（看门狗的
+            // failedReported/loadStartedAt/challengeReloaded 归零），
+            // 不然重试后 45 秒窗口早已过期、挑战兜底也用过了。
             probe.stop()
             probe.start()
         }

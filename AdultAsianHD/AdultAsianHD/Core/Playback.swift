@@ -272,6 +272,11 @@ final class PlayerViewModel: ObservableObject {
     @Published var failureReason: String?
     /// 正在用页内 WebView 播的嵌入页地址（非 nil 时 DetailView 显示 WebView 播放器，不显示 AVPlayer）。
     @Published var webViewURL: URL?
+    /// 嵌入重试计数（run #20 F3）：retryEmbed() 每点一次 +1；
+    /// WebViewPlayerView 监听它，重试时把探针整套状态清掉重开
+    ///（看门狗的 failedReported/loadStartedAt/challengeReloaded 都归零，
+    /// 同一 URL 重试也有新鲜的 45 秒窗口）。
+    @Published var embedRetryNonce = 0
     /// 正在跑混合解流（无界面 WebView 抽直链）时为 true，DetailView 显示“正在解析嵌入播放…”。
     @Published var isResolvingEmbed = false
 
@@ -1024,6 +1029,9 @@ final class PlayerViewModel: ObservableObject {
                     merged.append(line)
                 }
                 self.lines = merged
+                // 按需发现（run #20）：后台解出的线若能认出种类，先暂定为首选线
+                //（竞速被推迟到首屏之后时，首点不因此慢；种子竞速跑完再覆盖它）。
+                host.noteTappedVideoDiscovery(lines: merged)
                 // 没快路径时，直接上第一条备线
                 if self.currentURL == nil {
                     if let first = merged.first {
@@ -1315,9 +1323,45 @@ final class PlayerViewModel: ObservableObject {
         }
     }
 
+    /// 嵌入播放终局失败（run #20 F3，探针看门狗调）：嵌页一直没出画面，
+    /// 不是直链失败——markFailed 走不通（currentURL 是 nil，会被它早退拦掉），
+    /// 所以单开一条路：状态 .failed + 原因，嵌入 URL 记一次失败、账本终局，
+    /// 但 webViewURL / lines 都留着（DetailView 的“重试嵌入播放”按钮靠它们重播）。
+    func markEmbedFailed(_ reason: String) {
+        assert(Thread.isMainThread)
+        if let embedURL = webViewURL?.absoluteString {
+            failedURLs.insert(embedURL)
+        }
+        failureReason = reason
+        status = .failed(reason)
+        finalizeLedgerAttempt(outcome: "嵌入播放失败", playedOK: false)
+    }
+
+    /// 重试嵌入播放（run #20 F3，DetailView 的“重试嵌入播放”按钮调）：
+    /// 找到 webViewURL 对应的线，清掉它的失败/回退标记，重新走路由
+    ///（→ playEmbedLine，探针看门狗重新开始计时）。
+    func retryEmbed() {
+        guard let embedURL = webViewURL else { return }
+        let urlString = embedURL.absoluteString
+        failedURLs.remove(urlString)
+        clearFallbackState(for: urlString)
+        failureReason = nil
+        status = .loading
+        // 探针重开：同一 URL 重试不触发 WebViewPlayerView 的 onChange(of: url)，
+        // 靠这个计数让它把探针状态清掉重开（看门狗重新计时）。
+        embedRetryNonce += 1
+        if let line = lines.first(where: { $0.url == urlString }) {
+            routeLine(line)
+        } else {
+            routeLine(PlayLine(name: "嵌入播放", url: urlString, description: "嵌页重试"))
+        }
+    }
+
     /// 离开详情页即停播：清 URL 与线路，旧的后台备线任务回来也会被 generation 拦住。
     /// 正在跑的解流也取消、WebView 也清掉（嵌入页不继续在后台跑）。
     /// 开着的账本尝试按停播终局（已终局过的是空操作）；代理随停播释放。
+    /// lines 故意留着（run #20 F3）：切 Tab 回来/重进详情页时，线路表还在，
+    /// 失败的嵌入线能重试；play() 开头会重置 lines，不会残留到下一部片。
     func stop() {
         finalizeLedgerAttempt(outcome: "停播", playedOK: false)
         embedTask?.cancel()
@@ -1341,7 +1385,6 @@ final class PlayerViewModel: ObservableObject {
         expiredTokenURLs = []
         keyRecastAttemptedURLs = []
         currentItemLink = nil
-        lines = []
         status = .idle
         failureReason = nil
     }

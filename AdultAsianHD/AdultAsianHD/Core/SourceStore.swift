@@ -200,7 +200,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         guard let text = jsSource(for: source) else {
             throw ImportError.unreadable
         }
-        return try WidgetHost(jsSource: text, fallbackTitle: source.fileName)
+        return try WidgetHost(jsSource: text, fallbackTitle: source.fileName, sourceGeneration: Self.fingerprint(of: text))
     }
 
     /// 按模块 title/description 猜国家（主页按国家分框用）。
