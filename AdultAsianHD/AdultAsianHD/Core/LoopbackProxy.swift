@@ -604,7 +604,7 @@ final class LoopbackProxyServer: NSObject {
                 let absolute = absoluteURL(trimmed, base: baseURL)
                 let kind: BookKind = isPlaylistURL(absolute) ? .variant : .segment
                 if let loopback = loopbackURL(for: absolute, kind: kind) {
-                    out.append(loopback)
+                    out.append(loopback.absoluteString)
                 } else {
                     out.append(line)
                 }
@@ -666,7 +666,7 @@ final class LoopbackProxyServer: NSObject {
             }
             let kind = kindFor(tag: tag, url: absolute)
             guard let loopback = loopbackURL(for: absolute, kind: kind) else { continue }
-            mutable.replaceCharacters(in: valueRange, with: loopback)
+            mutable.replaceCharacters(in: valueRange, with: loopback.absoluteString)
         }
         return mutable as String
     }
