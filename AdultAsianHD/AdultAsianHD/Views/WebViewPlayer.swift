@@ -115,157 +115,541 @@ enum AdBlockRuleStore {
 
 // MARK: - 第三层：CF 通过后删广告 DOM + playsinline（分两阶段）
 
-/// 广告 DOM 清理脚本（document-start 注入，主框架 + 子框架都跑）。
+/// 广告 DOM 清理脚本（document-start 注入，主框架 + 子框架都跑，每帧独立实例）。
 /// 两阶段：每轮先查有没有 Cloudflare 验证在跑（标题 "Just a moment"、
 /// 挑战 iframe、cf- 标记，含中文标题“请稍候/正在验证/您是真人吗”），有就跳过这轮、什么都不碰；验证过了才删广告。
-/// 删什么：① 假 Download 按钮/弹窗（playmogo 常见悬浮下载框）；
-/// ② 覆盖在 <video> 上方的高 z-index 透明点击劫持层（绝不碰 <video> 及其祖先容器与播放器控制条）；
-/// ③ 文本命中的广告卡片（录屏里那种 "Your Next Adventure Starts Here!" 旅行卡）；
-/// ④ 类名/id 带广告标记的元素；⑤ src 落在广告域的 iframe
-/// （视频播放器本身在 iframe 里，只按域名删，不碰别的 iframe）。
+/// 删什么（run #21 XSPModalGuard v5 合成版，Gemini v2/v4 + ChatGPT v3/v5 四轮互撕收敛）：
+/// ① 弹窗层（新增，治 onlybokep 那三个假弹窗）：文本签名 + CTA 组合评分
+///    （Finish Download / Download pending / REMINDER (N) / Resume playing?，
+///    单个 Download 或 Continue > 不够分）；受保护祖先集合（每轮从 video 与
+///    播放器控件沿 composed 树上行，限 10 跳，绝不藏 video 祖先）；Shadow DOM
+///    扫描（document-start 钩 attachShadow 抓 closed 根）；节点原地保留 +
+///    私有标记 + !important 隐藏，样式被广告 SDK 改回去就由观察器恢复；
+///    原生 <dialog> 先 close() 再藏；恢复播放只看归因（页面 JS 调了 pause 且
+///    近 3 秒内藏过已识别弹窗，且不是用户点停、不是 Media Session 系统暂停、
+///    不是视频播完）；跨域 iframe 子帧上报 + 父帧独立几何校验才藏 iframe。
+/// ② 假 Download 按钮（老规则 1）；③ 全屏点击劫持层（老规则 2）；
+/// ④ 文本命中的广告卡片（老规则 3）；⑤ 类名/id 广告标记（老规则 4）；
+/// ⑥ src 落在广告域的 iframe（老规则 5）。
 /// 另：所有 video 元素都打上 playsinline，让嵌页视频在页内播、
 /// 走我们的外层控制条，而不是一播就跳系统全屏播放器。
 enum AdStripScript {
     static let source = """
-    (function(){
-      var AD_DOMAINS = ['doubleclick.net','googlesyndication.com','googleadservices.com',
-        'taboola.com','outbrain.com','mgid.com','adsrvr.org','adnxs.com','criteo.com',
-        'popads.net','popcash.net','adcash.com','propellerads.com','adsterra.com',
-        'hilltopads.com','clickadu.com','amazon-adsystem.com','moatads.com'];
-      var AD_TEXTS = ['Your Next Adventure', 'Starts Here!', 'Discover amazing attractions'];
-      var FAKE_DL_RE = /^(fast\\s*)?(free\\s*)?download(\\s*(now|hd|video|app|file|here|free))*\\s*$/i;
-      var FAKE_DL_TEXTS = ['高速下载', '立即下载', '免费下载', '下载视频', '极速下载'];
-      function cfRunning(){
-        try {
-          var t = (document.title || '').toLowerCase();
-          if (t.indexOf('just a moment') >= 0) return true;
-          if (t.indexOf('checking your browser') >= 0) return true;
-          if (t.indexOf('请稍候') >= 0) return true;
-          if (t.indexOf('正在验证') >= 0) return true;
-          if (t.indexOf('您是真人吗') >= 0) return true;
-          if (document.querySelector('iframe[src*="challenges.cloudflare.com"]')) return true;
-          if (document.querySelector('iframe[src*="turnstile"]')) return true;
-          if (document.querySelector('[id*="cf-"], [class*="cf-challenge"], [class*="challenge-running"], [class*="turnstile"]')) return true;
-        } catch(e){}
-        return false;
-      }
-      function hasVideoInside(el){
-        return el && (el.tagName === 'VIDEO' || (el.querySelector && el.querySelector('video')));
-      }
-      function isAdSrc(u){
-        if (!u) return false;
-        u = String(u).toLowerCase();
-        for (var i = 0; i < AD_DOMAINS.length; i++) {
-          if (u.indexOf(AD_DOMAINS[i]) >= 0) return true;
+// XSPModalGuard v5 synthesis (run #21) — replaces the old AdStripScript.
+// Lives inside a Swift triple-quote string: NO backticks, NO dollar-brace sequences in this file.
+// Backslashes are single here; the splice step doubles them for Swift.
+(function(){
+  // ---------- config: signatures live here, copy changes only touch this block ----------
+  var AD_DOMAINS = ['doubleclick.net','googlesyndication.com','googleadservices.com',
+    'taboola.com','outbrain.com','mgid.com','adsrvr.org','adnxs.com','criteo.com',
+    'popads.net','popcash.net','adcash.com','propellerads.com','adsterra.com',
+    'hilltopads.com','clickadu.com','amazon-adsystem.com','moatads.com'];
+  var AD_TEXTS = ['Your Next Adventure', 'Starts Here!', 'Discover amazing attractions'];
+  var FAKE_DL_RE = /^(fast\\s*)?(free\\s*)?download(\\s*(now|hd|video|app|file|here|free))*\\s*$/i;
+  var FAKE_DL_TEXTS = ['高速下载', '立即下载', '免费下载', '下载视频', '极速下载'];
+  // Modal signatures: strong text is the primary signal, geometry only secondary.
+  // Points: a lone "Download" (+1) or a lone "Continue >" (+1) never fires alone.
+  var MODAL_RES = [
+    { re: /finish\\s+(your\\s+)?download/i, pts: 3 },
+    { re: /download\\s+pending/i, pts: 3 },
+    { re: /resume\\s+playing/i, pts: 3 },
+    { re: /reminder\\s*\\(\\d+\\)/i, pts: 2 },
+    { re: /download/i, pts: 1 }
+  ];
+  var CTA_CONT_RE = /continue\\s*[>›→]/i;
+  var CTA_NO_RE = /no,?\\s*thanks/i;
+  var MODAL_SCORE_MIN = 3;
+  var MAX_TEXT_NODES_PER_SCAN = 5000;
+  var MAX_CARD_TEXT = 2000;
+  var MAX_PROTECT_HOPS = 10;
+
+  // ---------- per-frame state ----------
+  var shadowRoots = [];
+  var hiddenNodes = [];
+  var rafPending = false;
+  var lastJsPauseAt = 0;            // page JS called video.pause() (evidence, not a verdict)
+  var lastMediaSessionPauseAt = 0;  // system pause routed through a page Media Session handler
+  var lastTrustedAt = 0;            // trusted pointer/key interaction on this page
+  var lastModalHiddenAt = 0;
+  var lastPauseAt = 0;
+
+  // ---------- 0. attachShadow hook FIRST (document-start runs before any page script) ----------
+  try {
+    var nativeAttachShadow = Element.prototype.attachShadow;
+    Element.prototype.attachShadow = function(init){
+      var root = nativeAttachShadow.call(this, init);
+      try { if (root && shadowRoots.indexOf(root) < 0) shadowRoots.push(root); } catch(e){}
+      return root;
+    };
+  } catch(e){}
+
+  function cfRunning(){
+    try {
+      var t = (document.title || '').toLowerCase();
+      if (t.indexOf('just a moment') >= 0) return true;
+      if (t.indexOf('checking your browser') >= 0) return true;
+      if (t.indexOf('请稍候') >= 0) return true;
+      if (t.indexOf('正在验证') >= 0) return true;
+      if (t.indexOf('您是真人吗') >= 0) return true;
+      if (document.querySelector('iframe[src*="challenges.cloudflare.com"]')) return true;
+      if (document.querySelector('iframe[src*="turnstile"]')) return true;
+      if (document.querySelector('[id*="cf-"], [class*="cf-challenge"], [class*="challenge-running"], [class*="turnstile"]')) return true;
+    } catch(e){}
+    return false;
+  }
+
+  function hasVideoInside(el){
+    return el && (el.tagName === 'VIDEO' || (el.querySelector && el.querySelector('video')));
+  }
+
+  function isAdSrc(u){
+    if (!u) return false;
+    u = String(u).toLowerCase();
+    for (var i = 0; i < AD_DOMAINS.length; i++) {
+      if (u.indexOf(AD_DOMAINS[i]) >= 0) return true;
+    }
+    return false;
+  }
+
+  function isFakeDownloadLabel(label){
+    var s = (label || '').trim();
+    if (s.length === 0 || s.length > 28) return false;
+    if (FAKE_DL_RE.test(s)) return true;
+    for (var i = 0; i < FAKE_DL_TEXTS.length; i++) {
+      if (s === FAKE_DL_TEXTS[i]) return true;
+    }
+    return false;
+  }
+
+  // ---------- 1. protected ancestors: walk up from every <video> + player controls ----------
+  // Composed traversal (cross shadow boundaries via getRootNode().host), capped hops.
+  // Only video/control ancestors are protected — never the whole player host, or
+  // sibling modals inside the host would become untouchable.
+  function buildProtectedSet(){
+    var set = [];
+    function addAncestors(el){
+      var hops = 0, cur = el;
+      while (cur && hops < MAX_PROTECT_HOPS) {
+        if (set.indexOf(cur) < 0) set.push(cur);
+        var parent = cur.parentElement;
+        if (!parent) {
+          try {
+            var root = cur.getRootNode && cur.getRootNode();
+            if (root && root.host) { cur = root.host; hops++; continue; }
+          } catch(e){}
+          break;
         }
-        return false;
+        cur = parent; hops++;
       }
-      function isFakeDownloadLabel(label){
-        var s = (label || '').trim();
-        if (s.length === 0 || s.length > 28) return false;
-        if (FAKE_DL_RE.test(s)) return true;
-        for (var i = 0; i < FAKE_DL_TEXTS.length; i++) {
-          if (s === FAKE_DL_TEXTS[i]) return true;
-        }
-        return false;
-      }
-      function hideEl(el){
+    }
+    try {
+      var vs = document.querySelectorAll('video');
+      for (var i = 0; i < vs.length; i++) addAncestors(vs[i]);
+      var ctrls = document.querySelectorAll('[class*="plyr"], [class*="vjs-"], [class*="jwplayer"]');
+      for (var j = 0; j < ctrls.length; j++) addAncestors(ctrls[j]);
+      for (var k = 0; k < shadowRoots.length; k++) {
         try {
-          el.style.setProperty('display', 'none', 'important');
-          el.style.setProperty('pointer-events', 'none', 'important');
+          var sv = shadowRoots[k].querySelectorAll ? shadowRoots[k].querySelectorAll('video') : [];
+          for (var m = 0; m < sv.length; m++) addAncestors(sv[m]);
         } catch(e){}
       }
-      function stripOnce(){
-        if (cfRunning()) return;
-        try {
-          // 1. 假 Download 按钮/弹窗（playmogo 常见悬浮下载框）：往上找
-          // fixed/absolute 定位的弹窗容器一起藏（最多 3 层），绝不碰含 video 的祖先。
-          var clickables = document.querySelectorAll('a, button, div[role="button"]');
-          for (var d = 0; d < clickables.length; d++) {
-            var c = clickables[d];
-            if (hasVideoInside(c)) continue;
-            var label = (c.innerText || c.textContent || '').trim();
-            if (isFakeDownloadLabel(label)) {
-              var box = c;
-              for (var up = 0; up < 3 && box.parentElement; up++) {
-                var p = box.parentElement;
-                if (hasVideoInside(p)) break;
-                var ps = getComputedStyle(p);
-                if (ps.position === 'fixed' || ps.position === 'absolute') { box = p; }
-              }
-              hideEl(box);
-            }
+    } catch(e){}
+    return set;
+  }
+
+  function isProtected(el, set){
+    return el && set.indexOf(el) >= 0;
+  }
+
+  // ---------- 2. modal detection: one bounded text-node pass, no innerText ----------
+  function scanTextNodes(root, out){
+    try {
+      var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+        acceptNode: function(n){
+          var p = n.parentElement;
+          if (!p) return NodeFilter.FILTER_REJECT;
+          var t = p.tagName;
+          if (t === 'SCRIPT' || t === 'STYLE' || t === 'NOSCRIPT') return NodeFilter.FILTER_REJECT;
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      });
+      var node, count = 0;
+      while ((node = walker.nextNode())) {
+        if (++count > MAX_TEXT_NODES_PER_SCAN) break;
+        var txt = node.data || '';
+        if (txt.length < 3 || txt.length > 400) continue;
+        for (var i = 0; i < MODAL_RES.length; i++) {
+          if (MODAL_RES[i].re.test(txt)) { out.push(node); break; }
+        }
+      }
+    } catch(e){}
+  }
+
+  // Walk up from a matching text node to the modal card: first <dialog>,
+  // role=dialog / aria-modal ancestor, or fixed/absolute ancestor (the
+  // backdrop counts — hiding it hides the card too). Stop at protected
+  // ancestors: use the inner node instead, never cross into video territory.
+  function findModalCard(textNode, prot){
+    var cur = textNode.parentElement, prev = null, hops = 0;
+    while (cur && hops < 6) {
+      if (isProtected(cur, prot)) return prev;
+      if (cur.tagName === 'DIALOG') return cur;
+      try {
+        if (cur.getAttribute('role') === 'dialog' || cur.getAttribute('aria-modal') === 'true') return cur;
+      } catch(e){}
+      var pos = '';
+      try { pos = getComputedStyle(cur).position; } catch(e){}
+      if (pos === 'fixed' || pos === 'absolute') return cur;
+      prev = cur;
+      cur = cur.parentElement;
+      hops++;
+    }
+    return null;
+  }
+
+  function scoreCard(card){
+    var txt = '';
+    try { txt = (card.textContent || '').slice(0, MAX_CARD_TEXT); } catch(e){}
+    if (!txt) return 0;
+    var score = 0, hasDownload = false;
+    for (var i = 0; i < MODAL_RES.length; i++) {
+      if (MODAL_RES[i].re.test(txt)) {
+        score += MODAL_RES[i].pts;
+        if (MODAL_RES[i].re === MODAL_RES[4].re) hasDownload = true;
+      }
+    }
+    if (hasDownload && CTA_CONT_RE.test(txt) && CTA_NO_RE.test(txt)) score += 2;
+    // Cross-origin <a href> / target=_blank is supporting evidence ONLY
+    // inside an already-identified modal (never a standalone signal:
+    // subtitle downloads, share, trailers and account pages are legit).
+    if (score >= 2) {
+      try {
+        var links = card.querySelectorAll ? card.querySelectorAll('a[href]') : [];
+        for (var j = 0; j < links.length; j++) {
+          var a = links[j];
+          var href = a.getAttribute('href') || '';
+          var isBlank = (a.getAttribute('target') || '') === '_blank';
+          var cross = false;
+          if (href.indexOf('http') === 0) {
+            try { cross = new URL(href).origin !== location.origin; } catch(e){ cross = true; }
           }
-          // 2. 覆盖在视频上的透明点击劫持层（不碰 video 及常见播放器控制条）。
+          if (isBlank || cross) { score += 1; break; }
+        }
+      } catch(e){}
+    }
+    return score;
+  }
+
+  // ---------- 3. hiding: keep the node, mark it, !important hide, restore on reset ----------
+  function hideTarget(el){
+    if (!el) return false;
+    try {
+      // Native <dialog>: close() first — display:none alone leaves the page
+      // stuck in top-layer modal inert state + body overflow locked.
+      // Only called on scored modal cards, never on every dialog.
+      var dialogs = [];
+      if (el.tagName === 'DIALOG') dialogs.push(el);
+      else if (el.querySelectorAll) {
+        var ds = el.querySelectorAll('dialog');
+        for (var i = 0; i < ds.length; i++) dialogs.push(ds[i]);
+      }
+      for (var d = 0; d < dialogs.length; d++) {
+        try { HTMLDialogElement.prototype.close.call(dialogs[d]); } catch(e){}
+      }
+      el.setAttribute('data-xsp-hidden', '1');
+      el.style.setProperty('display', 'none', 'important');
+      el.style.setProperty('pointer-events', 'none', 'important');
+      el.style.setProperty('visibility', 'hidden', 'important');
+      if (hiddenNodes.indexOf(el) < 0) hiddenNodes.push(el);
+      return true;
+    } catch(e){ return false; }
+  }
+
+  function reapplyHide(el){
+    try {
+      if (!el.getAttribute('data-xsp-hidden')) return;
+      if (el.style.getPropertyValue('display') !== 'none') {
+        el.style.setProperty('display', 'none', 'important');
+      }
+      if (el.style.getPropertyValue('visibility') !== 'hidden') {
+        el.style.setProperty('visibility', 'hidden', 'important');
+      }
+      if (el.style.getPropertyValue('pointer-events') !== 'none') {
+        el.style.setProperty('pointer-events', 'none', 'important');
+      }
+    } catch(e){}
+  }
+
+  // ---------- 4. resume attribution: pause() is EVIDENCE, four-way classification ----------
+  // Native iOS pauses (Control Center / lock screen / AirPods) never call the JS
+  // prototype — EXCEPT through a page-registered Media Session handler, which
+  // we instrument separately. Resume ONLY when: a page-JS pause happened AND
+  // an identified modal was hidden in the same window AND no user-pause signal.
+  try {
+    var nativePause = HTMLMediaElement.prototype.pause;
+    HTMLMediaElement.prototype.pause = function(){
+      lastJsPauseAt = Date.now();
+      return nativePause.apply(this, arguments);
+    };
+  } catch(e){}
+
+  try {
+    if (navigator.mediaSession && navigator.mediaSession.setActionHandler) {
+      var nativeSAH = navigator.mediaSession.setActionHandler.bind(navigator.mediaSession);
+      navigator.mediaSession.setActionHandler = function(action, handler){
+        if (action === 'pause' && typeof handler === 'function') {
+          var wrapped = function(){
+            lastMediaSessionPauseAt = Date.now();
+            try { return handler.apply(this, arguments); } catch(e){}
+          };
+          return nativeSAH(action, wrapped);
+        }
+        return nativeSAH(action, handler);
+      };
+    }
+  } catch(e){}
+
+  function findVideo(){
+    try {
+      var v = document.querySelector('video');
+      if (v) return v;
+      for (var i = 0; i < shadowRoots.length; i++) {
+        try {
+          var sv = shadowRoots[i].querySelector ? shadowRoots[i].querySelector('video') : null;
+          if (sv) return sv;
+        } catch(e){}
+      }
+    } catch(e){}
+    return null;
+  }
+
+  function maybeResume(){
+    try {
+      var v = findVideo();
+      if (!v || !v.paused || v.ended) return;
+      if (document.hidden) return;
+      var now = Date.now();
+      if (now - lastJsPauseAt > 3000) return;       // no recent page-JS pause
+      if (now - lastModalHiddenAt > 3000) return;   // no recently hidden modal
+      if (now - lastMediaSessionPauseAt < 3000) return; // system pause via Media Session
+      if (lastTrustedAt <= lastJsPauseAt && lastJsPauseAt - lastTrustedAt < 700) return; // user tapped pause
+      v.play();
+    } catch(e){}
+  }
+
+  // ---------- 5. cross-origin iframe protocol (versioned, source-checked, no nonce) ----------
+  // Child frame: after hiding a high-confidence modal, report to the parent ONLY
+  // when this frame has no <video> (a player frame never reports). Parent: hide
+  // the iframe only when event.source matches one of its iframes AND it
+  // independently judges that iframe floating/covering.
+  function reportToParent(){
+    try {
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage({ type: '__xspModalHidden', v: 1 }, '*');
+      }
+    } catch(e){}
+  }
+
+  window.addEventListener('message', function(ev){
+    try {
+      var d = ev.data || {};
+      if (d.type !== '__xspModalHidden' || d.v !== 1) return;
+      var frames = document.querySelectorAll('iframe');
+      for (var i = 0; i < frames.length; i++) {
+        if (frames[i].contentWindow === ev.source) {
+          var st = getComputedStyle(frames[i]);
+          if (st.position !== 'fixed' && st.position !== 'absolute') return;
+          var r = frames[i].getBoundingClientRect();
           var vw = window.innerWidth || 0, vh = window.innerHeight || 0;
-          if (vw > 0 && vh > 0 && document.querySelector('video')) {
-            var overlays = document.querySelectorAll('div, a');
-            for (var o = 0; o < overlays.length; o++) {
-              var ov = overlays[o];
-              if (hasVideoInside(ov)) continue;
-              var cls = String(ov.className || '').toLowerCase();
-              if (cls.indexOf('plyr') >= 0 || cls.indexOf('vjs') >= 0 || cls.indexOf('player') >= 0 || cls.indexOf('control') >= 0) continue;
-              var st = getComputedStyle(ov);
-              if (st.position !== 'fixed' && st.position !== 'absolute') continue;
-              var z = parseInt(st.zIndex, 10);
-              if (!isFinite(z) || z < 100) continue;
-              var rect = ov.getBoundingClientRect();
-              if (rect.width >= vw * 0.5 && rect.height >= vh * 0.5) {
-                var txtLen = (ov.innerText || '').trim().length;
-                if (ov.tagName === 'A' || txtLen === 0 || isFakeDownloadLabel(ov.innerText || '')) {
-                  hideEl(ov);
-                }
-              }
+          if (vw > 0 && vh > 0 && r.width >= vw * 0.5 && r.height >= vh * 0.5) {
+            if (hideTarget(frames[i])) lastModalHiddenAt = Date.now();
+          }
+          return;
+        }
+      }
+    } catch(e){}
+  });
+
+  // ---------- 6. the scan: modal layer first, then the old rules ----------
+  function stripOnce(){
+    if (cfRunning()) return;
+    try {
+      var prot = buildProtectedSet();
+
+      // --- modal layer ---
+      var hits = [];
+      scanTextNodes(document, hits);
+      for (var s = 0; s < shadowRoots.length; s++) {
+        try { scanTextNodes(shadowRoots[s], hits); } catch(e){}
+      }
+      var hiddenAny = false;
+      var seenCards = [];
+      for (var h = 0; h < hits.length; h++) {
+        var card = findModalCard(hits[h], prot);
+        if (!card || seenCards.indexOf(card) >= 0) continue;
+        seenCards.push(card);
+        if (scoreCard(card) >= MODAL_SCORE_MIN) {
+          if (hideTarget(card)) {
+            hiddenAny = true;
+            lastModalHiddenAt = Date.now();
+          }
+        }
+      }
+      if (hiddenAny) {
+        // This frame has no video of its own: let the parent judge the iframe.
+        if (!document.querySelector('video')) reportToParent();
+        maybeResume();
+      }
+
+      // --- rule 1: fake Download buttons (kept verbatim) ---
+      var clickables = document.querySelectorAll('a, button, div[role="button"]');
+      for (var d = 0; d < clickables.length; d++) {
+        var c = clickables[d];
+        if (hasVideoInside(c)) continue;
+        var label = (c.innerText || c.textContent || '').trim();
+        if (isFakeDownloadLabel(label)) {
+          var box = c;
+          for (var up = 0; up < 3 && box.parentElement; up++) {
+            var p = box.parentElement;
+            if (hasVideoInside(p)) break;
+            var ps = getComputedStyle(p);
+            if (ps.position === 'fixed' || ps.position === 'absolute') { box = p; }
+          }
+          hideTarget(box);
+        }
+      }
+      // --- rule 2: full-screen clickjack overlays (kept verbatim) ---
+      var vw = window.innerWidth || 0, vh = window.innerHeight || 0;
+      if (vw > 0 && vh > 0 && document.querySelector('video')) {
+        var overlays = document.querySelectorAll('div, a');
+        for (var o = 0; o < overlays.length; o++) {
+          var ov = overlays[o];
+          if (hasVideoInside(ov)) continue;
+          var cls = String(ov.className || '').toLowerCase();
+          if (cls.indexOf('plyr') >= 0 || cls.indexOf('vjs') >= 0 || cls.indexOf('player') >= 0 || cls.indexOf('control') >= 0) continue;
+          var st = getComputedStyle(ov);
+          if (st.position !== 'fixed' && st.position !== 'absolute') continue;
+          var z = parseInt(st.zIndex, 10);
+          if (!isFinite(z) || z < 100) continue;
+          var rect = ov.getBoundingClientRect();
+          if (rect.width >= vw * 0.5 && rect.height >= vh * 0.5) {
+            var txtLen = (ov.innerText || '').trim().length;
+            if (ov.tagName === 'A' || txtLen === 0 || isFakeDownloadLabel(ov.innerText || '')) {
+              hideTarget(ov);
             }
           }
-          // 3. 文本命中的广告卡片：往上找带关闭按钮/卡片样的容器一起藏（最多 4 层）。
-          var all = document.querySelectorAll('div, section, aside, article');
-          for (var i = 0; i < all.length; i++) {
-            var el = all[i];
-            if (hasVideoInside(el)) continue;
-            var txt = el.textContent || '';
-            for (var k = 0; k < AD_TEXTS.length; k++) {
-              if (txt.indexOf(AD_TEXTS[k]) >= 0 && txt.length < 500) {
-                var node = el;
-                for (var up2 = 0; up2 < 4 && node; up2++) {
-                  if (hasVideoInside(node)) break;
-                  if (node.querySelector && node.querySelector('[aria-label*="lose" i], [class*="close" i], [id*="close" i]')) { hideEl(node); break; }
-                  node = node.parentElement;
-                }
-                if (up2 >= 4) hideEl(el);
-                break;
-              }
+        }
+      }
+      // --- rule 3: ad-text cards (kept verbatim) ---
+      var all = document.querySelectorAll('div, section, aside, article');
+      for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        if (hasVideoInside(el)) continue;
+        var txt = el.textContent || '';
+        for (var k = 0; k < AD_TEXTS.length; k++) {
+          if (txt.indexOf(AD_TEXTS[k]) >= 0 && txt.length < 500) {
+            var node = el;
+            for (var up2 = 0; up2 < 4 && node; up2++) {
+              if (hasVideoInside(node)) break;
+              if (node.querySelector && node.querySelector('[aria-label*="lose" i], [class*="close" i], [id*="close" i]')) { hideTarget(node); break; }
+              node = node.parentElement;
             }
+            if (up2 >= 4) hideTarget(el);
+            break;
           }
-          // 4. 类名/id 带广告标记的元素（不碰 video、播放器、CF）。
-          var ads = document.querySelectorAll('[id*="ad-"], [id*="-ad-"], [class*="ad-banner"], [class*="ad-popup"], [class*="advertisement"], [class*="ads-container"], [class*="popunder"], [class*="overlay-ad"]');
-          for (var j = 0; j < ads.length; j++) {
-            if (hasVideoInside(ads[j])) continue;
-            var a = ads[j];
-            if (a.tagName === 'VIDEO' || a.querySelector('video')) continue;
-            hideEl(a);
-          }
-          // src 落在广告域的 iframe 才藏（播放器 iframe 不动）。
-          var frames = document.querySelectorAll('iframe[src]');
-          for (var f = 0; f < frames.length; f++) {
-            if (isAdSrc(frames[f].src)) hideEl(frames[f]);
-          }
-        } catch(e){}
+        }
       }
-      function forceInline(){
-        try {
-          var vs = document.querySelectorAll('video');
-          for (var i = 0; i < vs.length; i++) {
-            vs[i].setAttribute('playsinline', '');
-            vs[i].setAttribute('webkit-playsinline', '');
-            vs[i].playsInline = true;
-          }
-        } catch(e){}
+      // --- rule 4: ad class/id markers (kept verbatim) ---
+      var ads = document.querySelectorAll('[id*="ad-"], [id*="-ad-"], [class*="ad-banner"], [class*="ad-popup"], [class*="advertisement"], [class*="ads-container"], [class*="popunder"], [class*="overlay-ad"]');
+      for (var j = 0; j < ads.length; j++) {
+        if (hasVideoInside(ads[j])) continue;
+        var a = ads[j];
+        if (a.tagName === 'VIDEO' || a.querySelector('video')) continue;
+        hideTarget(a);
       }
+      // --- rule 5: ad-domain iframes only (kept verbatim) ---
+      var frames = document.querySelectorAll('iframe[src]');
+      for (var f = 0; f < frames.length; f++) {
+        if (isAdSrc(frames[f].src)) hideTarget(frames[f]);
+      }
+    } catch(e){}
+  }
+
+  function forceInline(){
+    try {
+      var vs = document.querySelectorAll('video');
+      for (var i = 0; i < vs.length; i++) {
+        vs[i].setAttribute('playsinline', '');
+        vs[i].setAttribute('webkit-playsinline', '');
+        vs[i].playsInline = true;
+      }
+    } catch(e){}
+  }
+
+  function scheduleScan(){
+    if (rafPending) return;
+    rafPending = true;
+    try {
+      requestAnimationFrame(function(){
+        rafPending = false;
+        stripOnce();
+        forceInline();
+      });
+    } catch(e){
+      rafPending = false;
       stripOnce();
       forceInline();
-      setInterval(function(){ stripOnce(); forceInline(); }, 1000);
-    })();
+    }
+  }
+
+  // ---------- 7. wiring ----------
+  // Trusted interaction: a pause within 700ms after a tap/keypress is a user pause.
+  document.addEventListener('pointerdown', function(){ lastTrustedAt = Date.now(); }, true);
+  document.addEventListener('keydown', function(){ lastTrustedAt = Date.now(); }, true);
+  // Capture-phase pause: WebKit pause does not bubble; this catches every
+  // <video> pause, including pre-mounted modals that appear on class/style flips
+  // (childList-only observers never fire for those).
+  document.addEventListener('pause', function(){
+    lastPauseAt = Date.now();
+    scheduleScan();
+    maybeResume();
+  }, true);
+
+  // Main observer: childList + attributes (style/class/hidden/open/marker) +
+  // characterData. Re-apply hiding when the ad SDK resets a hidden node's style.
+  // characterData only schedules a scan when the changed text matches a signature.
+  try {
+    var obs = new MutationObserver(function(muts){
+      var needScan = false;
+      for (var i = 0; i < muts.length; i++) {
+        var m = muts[i];
+        if (m.type === 'attributes' && m.target && m.target.getAttribute) {
+          if (m.target.getAttribute('data-xsp-hidden')) {
+            reapplyHide(m.target);
+            continue;
+          }
+          needScan = true;
+        } else if (m.type === 'childList') {
+          needScan = true;
+        } else if (m.type === 'characterData' && m.target && m.target.data) {
+          for (var k = 0; k < MODAL_RES.length; k++) {
+            if (MODAL_RES[k].re.test(m.target.data)) { needScan = true; break; }
+          }
+        }
+      }
+      if (needScan) scheduleScan();
+    });
+    obs.observe(document.documentElement || document, {
+      childList: true, attributes: true,
+      attributeFilter: ['style', 'class', 'hidden', 'open', 'data-xsp-hidden'],
+      characterData: true, subtree: true
+    });
+  } catch(e){}
+
+  stripOnce();
+  forceInline();
+  setInterval(function(){ stripOnce(); forceInline(); }, 1000);
+})();
     """
 }
 
