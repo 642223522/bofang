@@ -509,6 +509,7 @@ final class LoopbackProxyServer: NSObject {
         }
         var request = URLRequest(url: mapping.upstream)
         request.httpMethod = "GET"
+        request.assumesHTTP3Capable = false
         request.timeoutInterval = 15
         // 身份头由代理统一带（UA/Referer/模块头/Cookie）；AVPlayer 发来的头只转发 Range
         //（MP4 用它；其余一律以代理的为准，不把 AppleCoreMedia 之类带去上游）。
@@ -864,10 +865,25 @@ extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
     /// 跨域 302 会丢自定义头，重定向请求上把身份头补回去。
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         var redirected = request
+        redirected.assumesHTTP3Capable = false
         for (key, value) in headers {
             redirected.setValue(value, forHTTPHeaderField: key)
         }
         completionHandler(redirected)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+        guard let request = task.originalRequest else { return }
+        let event = NetworkDiagnostics.makeEvent(
+            source: "proxy",
+            request: request,
+            response: task.response,
+            bodyData: nil,
+            error: task.error,
+            metrics: metrics,
+            fallbackDurationMs: 0
+        )
+        NetworkDiagnostics.record(event)
     }
 
     /// 上游响应头到了：流式模式立刻把头送给 AVPlayer（首字节预算）；

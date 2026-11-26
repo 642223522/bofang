@@ -126,15 +126,24 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
 
     /// headers：已合并好的子请求头（iPhone UA + Referer + 模块自定义头 + Cookie）。
     init(headers: [String: String], cookie: String?) {
-        var merged = headers
+        var overrides = headers
         if let cookie, !cookie.isEmpty {
-            merged["Cookie"] = cookie
+            overrides["Cookie"] = cookie
         }
+        let merged = NetConstants.mergeHeaders(
+            base: NetConstants.defaultBrowserHeaders,
+            overrides: overrides
+        )
         self.allHeaders = merged
         let handler = RedirectHandler()
         handler.headers = merged
         self.redirectHandler = handler
-        self.session = URLSession(configuration: .ephemeral, delegate: handler, delegateQueue: nil)
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 12
+        config.timeoutIntervalForResource = 25
+        config.httpMaximumConnectionsPerHost = 8
+        config.waitsForConnectivity = false
+        self.session = URLSession(configuration: config, delegate: handler, delegateQueue: nil)
         super.init()
     }
 
@@ -274,6 +283,8 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     private func fetch(url: URL, range: RequestedRange?) async throws -> (Data, URLResponse) {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        request.assumesHTTP3Capable = false
+        request.timeoutInterval = 12
         for (key, value) in allHeaders {
             request.setValue(value, forHTTPHeaderField: key)
         }
@@ -284,7 +295,12 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
                 request.setValue("bytes=\(range.offset)-", forHTTPHeaderField: "Range")
             }
         }
-        let result = try await session.data(for: request)
+        let result = try await DiagnosticHTTPClient.shared.data(
+            for: request,
+            source: "hlsloader",
+            preservedHeaders: allHeaders,
+            timeout: 12
+        )
         // 记实际账本：每一次代发请求都记（成功/非 2xx 都记；抛错的由 handle 的 catch 记 nil）。
         appendRequestBook(url: url, statusCode: (result.1 as? HTTPURLResponse)?.statusCode)
         return result
@@ -566,9 +582,24 @@ private final class RedirectHandler: NSObject, URLSessionTaskDelegate {
 
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
         var redirected = request
+        redirected.assumesHTTP3Capable = false
         for (key, value) in headers {
             redirected.setValue(value, forHTTPHeaderField: key)
         }
         completionHandler(redirected)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+        guard let request = task.originalRequest else { return }
+        let event = NetworkDiagnostics.makeEvent(
+            source: "hlsloader",
+            request: request,
+            response: task.response,
+            bodyData: nil,
+            error: task.error,
+            metrics: metrics,
+            fallbackDurationMs: 0
+        )
+        NetworkDiagnostics.record(event)
     }
 }

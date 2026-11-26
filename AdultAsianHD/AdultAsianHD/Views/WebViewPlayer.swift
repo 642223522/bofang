@@ -78,13 +78,17 @@ enum AdBlockRuleStore {
     private static var compiling = false
     private static var pending: [(WKContentRuleList?) -> Void] = []
 
-    static func install(into controller: WKUserContentController, siteHost: String) {
+    /// shouldInstall：编译完成时再判断一次（CF 兜底关规则后编译才完成时不装回去，
+    /// 堵 reloadWithoutRules 与异步编译的竞态；不传则默认装）。
+    static func install(into controller: WKUserContentController, siteHost: String, shouldInstall: (() -> Bool)? = nil) {
         if let list = cached {
             controller.add(list)
             return
         }
         pending.append { list in
-            if let list { controller.add(list) }
+            guard let list else { return }
+            if let shouldInstall, !shouldInstall() { return }
+            controller.add(list)
         }
         guard !compiling else { return }
         compiling = true
@@ -220,9 +224,12 @@ final class EmbedProbeState: ObservableObject {
     @Published var controlsVisible = true
 
     weak var webView: WKWebView?
+    /// 回调通知容器禁用广告规则（防止异步编译完成后把刚移除的规则又装回去）。
+    var onDisableAdRules: (() -> Void)?
     private var timer: Timer?
     private var hideTask: Task<Void, Never>?
     private var wasPaused = true
+    private var isScrubbing = false
     /// CF 挑战第一次被看到的时间；challengeReloaded=true 表示兜底已用过一次。
     private var challengeSince: Date?
     private var challengeReloaded = false
@@ -239,6 +246,7 @@ final class EmbedProbeState: ObservableObject {
         timer = nil
         hideTask?.cancel()
         hideTask = nil
+        isScrubbing = false
         challengeRunning = false
     }
 
@@ -295,7 +303,9 @@ final class EmbedProbeState: ObservableObject {
             }
             self.hasVideo = true
             self.challengeRunning = false
-            self.currentTime = (json["t"] as? Double) ?? 0
+            if !self.isScrubbing {
+                self.currentTime = (json["t"] as? Double) ?? 0
+            }
             let d = (json["d"] as? Double) ?? 0
             self.duration = (d.isFinite && d > 0) ? d : 0
             let nowPaused = (json["p"] as? Bool) ?? true
@@ -311,10 +321,37 @@ final class EmbedProbeState: ObservableObject {
         }
     }
 
-    /// CF 卡死兜底：关掉内容屏蔽规则、重载页面（只做一次）。
+    /// CF 卡死兜底：关掉内容屏蔽规则、重载页面（只做一次），并记一条 WAF 诊断。
     private func reloadWithoutRules() {
         guard let webView else { return }
+        onDisableAdRules?()
         webView.configuration.userContentController.removeAllContentRuleLists()
+        if let currentURL = webView.url {
+            let event = NetworkDiagEvent(
+                id: UUID(),
+                at: Date(),
+                source: "webview",
+                method: "GET",
+                host: currentURL.host ?? "",
+                sanitizedPath: NetworkDiagEvent.sanitizePath(from: currentURL),
+                networkClass: PlaybackLedger.networkClass,
+                phase: .waf,
+                statusCode: 403,
+                errorDomain: nil,
+                errorCode: nil,
+                errorSummary: "嵌页触发 Cloudflare 质询，已关规则重载",
+                remoteAddress: nil,
+                protocolName: nil,
+                reusedConnection: false,
+                proxyConnection: false,
+                dnsMs: nil,
+                tcpMs: nil,
+                tlsMs: nil,
+                ttfbMs: nil,
+                totalMs: 0
+            )
+            NetworkDiagnostics.record(event)
+        }
         webView.reload()
     }
 
@@ -328,8 +365,32 @@ final class EmbedProbeState: ObservableObject {
         )
     }
 
+    /// 拖动开始：冻结探针对 currentTime 的回写，保持底条常显。
+    func beginScrub() {
+        isScrubbing = true
+        hideTask?.cancel()
+        controlsVisible = true
+    }
+
+    /// 拖动中：只更新本地时间显示，不向 WKWebView 狂发 JS seek。
+    func scrub(to seconds: Double) {
+        guard seconds.isFinite, duration > 0 else { return }
+        currentTime = min(max(seconds, 0), duration)
+    }
+
+    /// 松手：只发一次 JS seek。
+    func endScrub(to seconds: Double) {
+        isScrubbing = false
+        guard seconds.isFinite else { return }
+        let clamped = duration > 0 ? min(max(seconds, 0), duration) : max(seconds, 0)
+        currentTime = clamped
+        seek(to: clamped)
+        showControlsTemporarily()
+    }
+
     /// 外层进度条快进：直接设页内 video 的 currentTime（播着就继续播，停着就停着）。
     func seek(to seconds: Double) {
+        guard seconds.isFinite, seconds >= 0 else { return }
         webView?.evaluateJavaScript(
             """
             (function(){ var v = document.querySelector('video'); if (!v) return; v.currentTime = \(seconds); })();
@@ -395,6 +456,9 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
     private let adStrip: Bool
     private var webView: WKWebView?
     private var loadedURL: URL?
+    private var navigationStartAt: Date?
+    /// CF 兜底已关过广告规则：为 true 后不再装规则（堵异步编译完成又把规则装回去的竞态）。
+    private var adRulesDisabled = false
 
     init(url: URL, probe: EmbedProbeState, adStrip: Bool = true) {
         self.url = url
@@ -422,7 +486,9 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
         // 第一层：内容屏蔽规则（只拦已知广告域的第三方请求，加载前装好）。
         if adStrip {
-            AdBlockRuleStore.install(into: config.userContentController, siteHost: url.host ?? "")
+            AdBlockRuleStore.install(into: config.userContentController, siteHost: url.host ?? "") { [weak self] in
+                !(self?.adRulesDisabled ?? true)
+            }
         }
         // 第三层：CF 通过后删广告 DOM + video 打 playsinline（document-start，每秒再扫）。
         if adStrip {
@@ -449,6 +515,9 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
         ])
         self.webView = webView
         probe.webView = webView
+        probe.onDisableAdRules = { [weak self] in
+            self?.adRulesDisabled = true
+        }
 
         loadIfNeeded(url: url)
     }
@@ -457,12 +526,16 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
     func loadIfNeeded(url: URL) {
         guard loadedURL != url else { return }
         loadedURL = url
-        webView?.load(URLRequest(url: url))
+        navigationStartAt = Date()
+        var request = URLRequest(url: url, timeoutInterval: 20)
+        request.assumesHTTP3Capable = false
+        webView?.load(request)
     }
 
     /// 停掉 WebView、释放资源（关闭 / 离开详情页时调）：停加载、清页面、摘代理、移出视图。
     func teardown() {
         probe.webView = nil
+        probe.onDisableAdRules = nil
         webView?.stopLoading()
         webView?.loadHTMLString("", baseURL: nil)
         webView?.navigationDelegate = nil
@@ -476,11 +549,45 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
         teardown()
     }
 
-    // MARK: - 第二层：代理层拦弹窗与站外跳转
+    // MARK: - 第二层：代理层拦弹窗、站外跳转与网络诊断记录
 
     /// window.open / target=_blank 的新窗口：一律不建（广告弹窗就死在这里）。
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         return nil
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        navigationStartAt = Date()
+        if adRulesDisabled {
+            webView.configuration.userContentController.removeAllContentRuleLists()
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        recordNavigationError(error, url: webView.url ?? loadedURL ?? url)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        recordNavigationError(error, url: webView.url ?? loadedURL ?? url)
+    }
+
+    private func recordNavigationError(_ error: Error, url: URL) {
+        let nsErr = error as NSError
+        // WKErrorCodeFrameLoadInterruptedByPolicyChange (102) 或 NSURLErrorCancelled (-999) 是正常切页/拦截，不刷屏
+        if nsErr.code == NSURLErrorCancelled || (nsErr.domain == "WebKitErrorDomain" && nsErr.code == 102) {
+            return
+        }
+        let elapsedMs = navigationStartAt.map { Int(Date().timeIntervalSince($0) * 1000) } ?? 0
+        let event = NetworkDiagnostics.makeEvent(
+            source: "webview",
+            request: URLRequest(url: url),
+            response: nil,
+            bodyData: nil,
+            error: error,
+            metrics: nil,
+            fallbackDurationMs: elapsedMs
+        )
+        NetworkDiagnostics.record(event)
     }
 
     /// 主框架导航：只放行嵌页自己（当前播的嵌页 host 及其子域）或 dood 家各门面；
@@ -491,9 +598,10 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
             decisionHandler(.allow)
             return
         }
-        let embedHost = url.host?.lowercased() ?? ""
+        let embedHost = (loadedURL ?? url).host?.lowercased() ?? ""
         if host == embedHost
             || (!embedHost.isEmpty && host.hasSuffix("." + embedHost))
+            || host == "challenges.cloudflare.com"
             || isWalledEmbedHost(host) {
             decisionHandler(.allow)
             return
@@ -582,9 +690,9 @@ struct WebViewPlayerView: View {
                         onClose: onClose,
                         statusText: "嵌入播放中",
                         onPlayPause: { probe.togglePlayPause() },
-                        onScrubStart: {},
-                        onScrub: { probe.seek(to: $0) },
-                        onScrubEnd: { probe.seek(to: $0) }
+                        onScrubStart: { probe.beginScrub() },
+                        onScrub: { probe.scrub(to: $0) },
+                        onScrubEnd: { probe.endScrub(to: $0) }
                     )
                 }
             }

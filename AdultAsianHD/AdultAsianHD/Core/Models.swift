@@ -275,4 +275,32 @@ struct SourceRecord: Identifiable, Codable {
 enum NetConstants {
     /// 发请求时默认带的 iPhone UA；模块自己传了 headers 时以模块的为准
     static let iPhoneUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+
+    /// 默认浏览器请求头（大小写不敏感合并，模块显式传的字段永远优先）
+    static let defaultBrowserHeaders: [String: String] = [
+        "User-Agent": iPhoneUserAgent,
+        "Accept": "application/json, text/plain, text/html, */*;q=0.8",
+        "Accept-Language": "zh-CN,zh-Hans;q=0.9,en;q=0.8"
+    ]
+
+    /// 大小写不敏感合并请求头：overrides 中若含 "user-agent" 会替换 base 中的 "User-Agent"，
+    /// 不会出现两个大小写不同的同名键导致字典遍历顺序随机覆盖。
+    static func mergeHeaders(base: [String: String], overrides: [String: String]) -> [String: String] {
+        var result: [String: String] = [:]
+        var canonicalKeyByLower: [String: String] = [:]
+        for (key, value) in base {
+            let lower = key.lowercased()
+            canonicalKeyByLower[lower] = key
+            result[key] = value
+        }
+        for (key, value) in overrides {
+            let lower = key.lowercased()
+            if let existing = canonicalKeyByLower[lower], existing != key {
+                result.removeValue(forKey: existing)
+            }
+            canonicalKeyByLower[lower] = key
+            result[key] = value
+        }
+        return result
+    }
 }

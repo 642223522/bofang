@@ -282,12 +282,9 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     /// 同步是覆盖式：同名旧源先清掉再导入，避免反复同步产生 xxx-2.js。
     /// 返回成功导入的个数；失败给人话原因。
     func syncFromGitee(token: String) async -> Result<Int, ImportError> {
-        let effectiveToken = token.isEmpty ? (KeychainHelper.load(forKey: giteeTokenKey) ?? "") : token
+        let effectiveToken = resolveGiteeToken(token)
         guard !effectiveToken.isEmpty else {
             return .failure(.network("请先在源页面填写 Gitee Token，才能同步"))
-        }
-        if !token.isEmpty {
-            KeychainHelper.save(token, forKey: giteeTokenKey)
         }
 
         guard let listURL = URL(string: "https://gitee.com/api/v5/repos/individual-freedom/ziyong-ziliao-beifang/contents/?ref=js") else {
@@ -587,9 +584,14 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         guard let url = URL(string: urlString) else { throw CheckStepError.badURL }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
-        request.timeoutInterval = 10
-        let (_, response) = try await URLSession.shared.data(for: request)
+        request.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 12
+        let (_, response) = try await DiagnosticHTTPClient.shared.data(
+            for: request,
+            source: "selfcheck",
+            preservedHeaders: ["User-Agent": NetConstants.iPhoneUserAgent],
+            timeout: 12
+        )
         return (response as? HTTPURLResponse)?.statusCode ?? 0
     }
 
@@ -597,10 +599,17 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     private static func httpBody(of urlString: String, referer: String? = nil) async throws -> String {
         guard let url = URL(string: urlString) else { throw CheckStepError.badURL }
         var request = URLRequest(url: url)
-        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        request.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
         if let referer { request.setValue(referer, forHTTPHeaderField: "Referer") }
-        request.timeoutInterval = 10
-        let (data, response) = try await URLSession.shared.data(for: request)
+        request.timeoutInterval = 12
+        var preservedHeaders: [String: String] = ["User-Agent": NetConstants.iPhoneUserAgent]
+        if let referer { preservedHeaders["Referer"] = referer }
+        let (data, response) = try await DiagnosticHTTPClient.shared.data(
+            for: request,
+            source: "selfcheck",
+            preservedHeaders: preservedHeaders,
+            timeout: 12
+        )
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             throw CheckStepError.http((response as? HTTPURLResponse)?.statusCode ?? 0)
         }
@@ -611,11 +620,18 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     private static func httpRangeData(of urlString: String, length: Int, referer: String? = nil) async throws -> Data {
         guard let url = URL(string: urlString) else { throw CheckStepError.badURL }
         var request = URLRequest(url: url)
-        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        request.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
         if let referer { request.setValue(referer, forHTTPHeaderField: "Referer") }
         request.setValue("bytes=0-\(length - 1)", forHTTPHeaderField: "Range")
-        request.timeoutInterval = 10
-        let (data, response) = try await URLSession.shared.data(for: request)
+        request.timeoutInterval = 12
+        var preservedHeaders: [String: String] = ["User-Agent": NetConstants.iPhoneUserAgent]
+        if let referer { preservedHeaders["Referer"] = referer }
+        let (data, response) = try await DiagnosticHTTPClient.shared.data(
+            for: request,
+            source: "selfcheck",
+            preservedHeaders: preservedHeaders,
+            timeout: 12
+        )
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) || http.statusCode == 206 else {
             throw CheckStepError.http((response as? HTTPURLResponse)?.statusCode ?? 0)
         }
@@ -1121,7 +1137,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     /// token 为空时用 Keychain 里存过的；两个都没有就失败。
     /// 返回成功上传的源个数（一个源算成功要 .js 和报告都传上去）。
     func uploadBrokenSources(token: String) async -> Result<Int, ImportError> {
-        let effectiveToken = token.isEmpty ? (KeychainHelper.load(forKey: giteeTokenKey) ?? "") : token
+        let effectiveToken = resolveGiteeToken(token)
         guard !effectiveToken.isEmpty else {
             return .failure(.network("请先在源页面填写 Gitee Token，才能上传"))
         }
@@ -1170,12 +1186,35 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
 
     // MARK: - 上传播放账本（reports 分支）
 
+    /// 归一化 Token：去首尾空白与换行；传入非空则顺手存入 Keychain，传入为空则读 Keychain。
+    private func resolveGiteeToken(_ rawToken: String) -> String {
+        let trimmed = rawToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            KeychainHelper.save(trimmed, forKey: giteeTokenKey)
+            return trimmed
+        }
+        return (KeychainHelper.load(forKey: giteeTokenKey) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// 从 Gitee 错误响应体提取人话信息（优先 JSON["message"]，否则取前 120 字符）。
+    private static func giteeErrorMessage(from data: Data) -> String? {
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let message = json["message"] as? String {
+            let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        let raw = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return nil }
+        return String(raw.prefix(120))
+    }
+
     /// 播放账本快照传到码云 reports 分支（一天一个文件：ledger-YYYY-MM-DD.json，就地更新）。
     /// 和自检报告放同一个分支，Muse 每天读报告时一起读到——真机上没开节点失败的站，
     /// 账本里 network=direct、stage/verdict 写明死在哪步，不用靠录屏猜。
     /// token 为空时用 Keychain 里存过的；两个都没有就失败。成功返回文件名。
     func uploadLedger(token: String) async -> Result<String, ImportError> {
-        let effectiveToken = token.isEmpty ? (KeychainHelper.load(forKey: giteeTokenKey) ?? "") : token
+        let effectiveToken = resolveGiteeToken(token)
         guard !effectiveToken.isEmpty else {
             return .failure(.network("请先在源页面填写 Gitee Token，才能上传"))
         }
@@ -1222,33 +1261,40 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         return lines.joined(separator: "\n")
     }
 
+    /// 固定公历 + POSIX，避免佛历/民国历等非公历系统设置把文件名年份算错。
     private static func reportDateString(_ date: Date) -> String {
         let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        formatter.locale = Locale(identifier: "zh_CN")
         return formatter.string(from: date)
     }
 
     /// 指定分支不存在就建一个（从仓库默认分支拉出来）；已存在直接成功。
     private func ensureBranch(_ branch: String, token: String) async -> Result<Void, ImportError> {
-        guard let branchURL = URL(string: "https://gitee.com/api/v5/repos/\(giteeRepo)/branches/\(branch)") else {
+        let encodedBranch = branch.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? branch
+        guard let branchURL = URL(string: "https://gitee.com/api/v5/repos/\(giteeRepo)/branches/\(encodedBranch)") else {
             return .failure(.network("上传地址不对"))
         }
         var getRequest = URLRequest(url: branchURL)
+        getRequest.cachePolicy = .reloadIgnoringLocalCacheData
         getRequest.setValue("token \(token)", forHTTPHeaderField: "Authorization")
         getRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
         getRequest.timeoutInterval = 30
         do {
-            let (_, response) = try await URLSession.shared.data(for: getRequest)
+            let (data, response) = try await URLSession.shared.data(for: getRequest)
             if let http = response as? HTTPURLResponse {
                 if (200...299).contains(http.statusCode) {
                     return .success(()) // 分支已在
                 }
                 if http.statusCode == 401 || http.statusCode == 403 {
-                    return .failure(.network("Token 不对或没权限（HTTP \(http.statusCode)），检查一下 Token"))
+                    let detail = Self.giteeErrorMessage(from: data).map { "：\($0)" } ?? ""
+                    return .failure(.network("Token 不对或没权限（HTTP \(http.statusCode)\(detail)），检查一下 Token"))
                 }
                 if http.statusCode != 404 {
-                    return .failure(.network("查 \(branch) 分支失败（HTTP \(http.statusCode)），稍后再试"))
+                    let detail = Self.giteeErrorMessage(from: data).map { "：\($0)" } ?? ""
+                    return .failure(.network("查 \(branch) 分支失败（HTTP \(http.statusCode)\(detail)），稍后再试"))
                 }
                 // 404：分支不存在，往下建
             }
@@ -1256,23 +1302,30 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             return .failure(.network("连不上码云：\(friendlyNetworkError(error))"))
         }
 
-        // 查仓库默认分支（master 还是 main），从它建 broken。
+        // 查仓库默认分支（master 还是 main），从它建目标分支。
         guard let repoURL = URL(string: "https://gitee.com/api/v5/repos/\(giteeRepo)") else {
             return .failure(.network("上传地址不对"))
         }
         var repoRequest = URLRequest(url: repoURL)
+        repoRequest.cachePolicy = .reloadIgnoringLocalCacheData
         repoRequest.setValue("token \(token)", forHTTPHeaderField: "Authorization")
         repoRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
         repoRequest.timeoutInterval = 30
         let defaultBranch: String
         do {
             let (data, response) = try await URLSession.shared.data(for: repoRequest)
-            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let branch = json["default_branch"] as? String, !branch.isEmpty else {
-                return .failure(.network("查不到仓库默认分支，没法建 \(branch) 分支"))
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if status == 401 || status == 403 {
+                let detail = Self.giteeErrorMessage(from: data).map { "：\($0)" } ?? ""
+                return .failure(.network("Token 不对或没权限（HTTP \(status)\(detail)），检查一下 Token"))
             }
-            defaultBranch = branch
+            guard (200...299).contains(status),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let resolvedDefault = json["default_branch"] as? String, !resolvedDefault.isEmpty else {
+                let detail = Self.giteeErrorMessage(from: data).map { "：\($0)" } ?? ""
+                return .failure(.network("查不到仓库默认分支（HTTP \(status)\(detail)），没法建 \(branch) 分支"))
+            }
+            defaultBranch = resolvedDefault
         } catch {
             return .failure(.network("连不上码云：\(friendlyNetworkError(error))"))
         }
@@ -1286,77 +1339,138 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         createRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
         createRequest.setValue("application/json;charset=UTF-8", forHTTPHeaderField: "Content-Type")
         createRequest.timeoutInterval = 30
-        let body: [String: Any] = ["branch_name": branch, "refs": defaultBranch]
+        let body: [String: Any] = [
+            "access_token": token,
+            "branch_name": branch,
+            "refs": defaultBranch
+        ]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
             return .failure(.network("建分支失败（请求拼不出来）"))
         }
         createRequest.httpBody = bodyData
         do {
-            let (_, response) = try await URLSession.shared.data(for: createRequest)
-            if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) {
+            let (data, response) = try await URLSession.shared.data(for: createRequest)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if (200...299).contains(status) {
                 return .success(())
             }
-            // 422：并发时分支可能刚被建好，已存在也算成功
-            if let http = response as? HTTPURLResponse, http.statusCode == 422 {
-                return .success(())
+            if status == 401 || status == 403 {
+                let detail = Self.giteeErrorMessage(from: data).map { "：\($0)" } ?? ""
+                return .failure(.network("Token 没建分支权限（HTTP \(status)\(detail)）"))
             }
-            return .failure(.network("建 \(branch) 分支失败（HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)）"))
+            // 422：只有重新 GET 确认分支真的存在，才按并发已建好放行；否则把码云报错原样透出。
+            if status == 422 {
+                if let (_, recheck) = try? await URLSession.shared.data(for: getRequest),
+                   let recheckHTTP = recheck as? HTTPURLResponse,
+                   (200...299).contains(recheckHTTP.statusCode) {
+                    return .success(())
+                }
+            }
+            let detail = Self.giteeErrorMessage(from: data).map { "：\($0)" } ?? ""
+            return .failure(.network("建 \(branch) 分支失败（HTTP \(status)\(detail)）"))
         } catch {
             return .failure(.network("连不上码云：\(friendlyNetworkError(error))"))
         }
     }
 
     /// 用 Gitee contents API 写一个文件到指定分支（默认 broken）：
-    /// 先 GET 看文件在不在（在就拿 sha 走更新，不在直接新建），内容 base64。
-    /// 路径如 broken/<源id>.js；账本快照走 reports 分支，路径如 ledger-2026-11-26.json。
-    private func uploadFileToGitee(token: String, path: String, content: String, message: String, branch: String = "broken") async -> Result<Void, ImportError> {
-        guard let encodedPath = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
-              let fileURL = URL(string: "https://gitee.com/api/v5/repos/\(giteeRepo)/contents/\(encodedPath)?ref=\(branch)") else {
+    /// 1) 禁缓存 GET 查文件是否已存在：
+    ///    - Gitee 文件不存在时常返回 200 [] 或 404 → existingSHA = nil；
+    ///    - 已存在返回 200 {"sha": "..."} → existingSHA = sha；
+    ///    - 其他错误（401/403/5xx）直接失败，不再误判为新建。
+    /// 2) Gitee v5 规范：新建文件必须用 POST（不带 sha），更新已有文件必须用 PUT（必带 sha）。
+    /// 3) 若遇 400/409 SHA 冲突或“已存在”，自动重查 SHA 重试一次。
+    private func uploadFileToGitee(
+        token: String,
+        path: String,
+        content: String,
+        message: String,
+        branch: String = "broken",
+        allowConflictRetry: Bool = true
+    ) async -> Result<Void, ImportError> {
+        let encodedPath = path
+            .split(separator: "/")
+            .map { String($0).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }
+            .joined(separator: "/")
+        let encodedBranch = branch.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? branch
+        guard let fileURL = URL(string: "https://gitee.com/api/v5/repos/\(giteeRepo)/contents/\(encodedPath)?ref=\(encodedBranch)"),
+              let writeURL = URL(string: "https://gitee.com/api/v5/repos/\(giteeRepo)/contents/\(encodedPath)") else {
             return .failure(.network("上传地址不对"))
         }
+
+        // 1. 查文件是否存在并取最新 sha（禁止读本地旧缓存，防止同日二次上传 SHA 冲突）
         var existingSHA: String?
         do {
             var getRequest = URLRequest(url: fileURL)
+            getRequest.cachePolicy = .reloadIgnoringLocalCacheData
             getRequest.setValue("token \(token)", forHTTPHeaderField: "Authorization")
             getRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
             getRequest.timeoutInterval = 30
             let (data, response) = try await URLSession.shared.data(for: getRequest)
-            if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                existingSHA = json["sha"] as? String
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if status == 401 || status == 403 {
+                let detail = Self.giteeErrorMessage(from: data).map { "：\($0)" } ?? ""
+                return .failure(.network("Token 不对或没权限（HTTP \(status)\(detail)），检查一下 Token"))
+            }
+            if (200...299).contains(status) {
+                // Gitee 对不存在的文件常返回 HTTP 200 + "[]"，只有字典且带非空 sha 才算文件已存在
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let sha = json["sha"] as? String, !sha.isEmpty {
+                    existingSHA = sha
+                }
+            } else if status != 404 {
+                let detail = Self.giteeErrorMessage(from: data).map { "：\($0)" } ?? ""
+                return .failure(.network("查询 \(path) 状态失败（HTTP \(status)\(detail)）"))
             }
         } catch {
             return .failure(.network("连不上码云：\(friendlyNetworkError(error))"))
         }
 
-        guard let putURL = URL(string: "https://gitee.com/api/v5/repos/\(giteeRepo)/contents/\(encodedPath)") else {
-            return .failure(.network("上传地址不对"))
-        }
-        var putRequest = URLRequest(url: putURL)
-        putRequest.httpMethod = "PUT"
-        putRequest.setValue("token \(token)", forHTTPHeaderField: "Authorization")
-        putRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
-        putRequest.setValue("application/json;charset=UTF-8", forHTTPHeaderField: "Content-Type")
-        putRequest.timeoutInterval = 30
+        // 2. 新建用 POST（无 sha），更新用 PUT（带 sha）
+        let isUpdate = (existingSHA != nil)
+        var writeRequest = URLRequest(url: writeURL)
+        writeRequest.httpMethod = isUpdate ? "PUT" : "POST"
+        writeRequest.setValue("token \(token)", forHTTPHeaderField: "Authorization")
+        writeRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
+        writeRequest.setValue("application/json;charset=UTF-8", forHTTPHeaderField: "Content-Type")
+        writeRequest.timeoutInterval = 30
         var body: [String: Any] = [
+            "access_token": token,
             "content": Data(content.utf8).base64EncodedString(),
             "message": message,
             "branch": branch
         ]
-        if let sha = existingSHA { body["sha"] = sha }
+        if let sha = existingSHA {
+            body["sha"] = sha
+        }
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
             return .failure(.network("上传失败（请求拼不出来）"))
         }
-        putRequest.httpBody = bodyData
+        writeRequest.httpBody = bodyData
+
         do {
-            let (_, response) = try await URLSession.shared.data(for: putRequest)
-            if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) {
+            let (data, response) = try await URLSession.shared.data(for: writeRequest)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if (200...299).contains(status) {
                 return .success(())
             }
-            if let http = response as? HTTPURLResponse, http.statusCode == 401 || http.statusCode == 403 {
-                return .failure(.network("Token 不对或没权限（HTTP \(http.statusCode)），检查一下 Token"))
+            if status == 401 || status == 403 {
+                let detail = Self.giteeErrorMessage(from: data).map { "：\($0)" } ?? ""
+                return .failure(.network("Token 不对或没权限（HTTP \(status)\(detail)），检查一下 Token"))
             }
-            return .failure(.network("上传 \(path) 失败（HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)）"))
+            // 并发冲突或文件刚被创建：重查一次最新 SHA 重试一次
+            if allowConflictRetry && (status == 400 || status == 409) {
+                return await uploadFileToGitee(
+                    token: token,
+                    path: path,
+                    content: content,
+                    message: message,
+                    branch: branch,
+                    allowConflictRetry: false
+                )
+            }
+            let detail = Self.giteeErrorMessage(from: data).map { "：\($0)" } ?? ""
+            return .failure(.network("上传 \(path) 失败（\(isUpdate ? "PUT" : "POST") HTTP \(status)\(detail)）"))
         } catch {
             return .failure(.network("连不上码云：\(friendlyNetworkError(error))"))
         }
@@ -1394,9 +1508,9 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     private func friendlyNetworkError(_ error: Error) -> String {
         if let urlError = error as? URLError {
             switch urlError.code {
-            case .timedOut: return "下载超时（15 秒没下完）"
+            case .timedOut: return "请求超时，稍后再试"
             case .notConnectedToInternet: return "没联网，检查一下网络"
-            case .cancelled: return "下载已取消"
+            case .cancelled: return "请求已取消"
             case .cannotFindHost, .cannotConnectToHost: return "连不上服务器，稍后再试"
             default: break
             }

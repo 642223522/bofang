@@ -51,10 +51,16 @@ struct MyView: View {
 // MARK: - 第二层：播放账本（从检测 Tab 挪过来，2026-11-26 用户决定）
 
 struct LedgerHomeView: View {
-    @StateObject private var ledger = PlaybackLedger.shared
+    @ObservedObject private var ledger = PlaybackLedger.shared
+    @ObservedObject private var netDiag = NetworkDiagnostics.shared
     @EnvironmentObject private var store: SourceStore
     @State private var isUploading = false
     @State private var uploadStatus: String?
+    @State private var uploadFailed = false
+
+    private var hasSavedToken: Bool {
+        !(store.loadSavedGiteeToken()?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+    }
 
     var body: some View {
         WideContent {
@@ -85,6 +91,12 @@ struct LedgerHomeView: View {
                     Text("\(ledger.routeMemoryCount) 条")
                         .foregroundColor(.secondary)
                 }
+                HStack {
+                    Text("网络诊断")
+                    Spacer()
+                    Text("\(netDiag.events.count) 条")
+                        .foregroundColor(.secondary)
+                }
                 Section {
                     Button {
                         uploadLedger()
@@ -92,16 +104,26 @@ struct LedgerHomeView: View {
                         HStack {
                             Text(isUploading ? "正在上传…" : "上传账本到码云")
                             Spacer()
-                            Image(systemName: "square.and.arrow.up")
+                            if isUploading {
+                                ProgressView()
+                            } else {
+                                Image(systemName: "square.and.arrow.up")
+                            }
                         }
                     }
                     .disabled(isUploading)
+                    if !hasSavedToken {
+                        Text("尚未保存 Gitee Token：请先到「源」Tab 填写并同步一次，或填写 Token 后再上传。")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    }
                     if let uploadStatus {
                         Text(uploadStatus)
                             .font(.caption)
-                            .foregroundColor(.secondary)
+                            .foregroundColor(uploadFailed ? .red : .green)
+                            .textSelection(.enabled)
                     }
-                    Text("传到码云 reports 分支（一天一个文件），Muse 每天读自检报告时一起读到；没开节点失败的站，账本里会标 direct。")
+                    Text("传到码云 reports 分支（一天一个文件），包含播放记录、路由不匹配、路线记忆与网络阶段诊断；没开节点失败的站会标 direct。")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 } footer: {
@@ -116,16 +138,19 @@ struct LedgerHomeView: View {
     }
 
     private func uploadLedger() {
+        guard !isUploading else { return }
         isUploading = true
         uploadStatus = nil
-        Task {
-            // 传空串：store 里先用 Keychain 存过的 Token，没有才报错。
+        uploadFailed = false
+        Task { @MainActor in
             let result = await store.uploadLedger(token: "")
             isUploading = false
             switch result {
             case .success(let file):
+                uploadFailed = false
                 uploadStatus = "已上传（\(file)）"
             case .failure(let error):
+                uploadFailed = true
                 uploadStatus = error.localizedDescription
             }
         }
@@ -248,7 +273,7 @@ private func ledgerVerdictColor(_ verdict: LedgerVerdict) -> Color {
 
 /// 播放记录列表（最新在前；点一行看期望 vs 实际账本明细）。
 private struct LedgerAttemptListView: View {
-    @StateObject private var ledger = PlaybackLedger.shared
+    @ObservedObject private var ledger = PlaybackLedger.shared
 
     var body: some View {
         List {
@@ -289,6 +314,7 @@ private struct LedgerAttemptDetailView: View {
                 LedgerKeyValueRow(key: "线路 host", value: attempt.lineHost)
                 LedgerKeyValueRow(key: "线路模板哈希", value: attempt.lineTemplateHash)
                 LedgerKeyValueRow(key: "hint", value: attempt.hint.isEmpty ? "无" : attempt.hint)
+                LedgerKeyValueRow(key: "网络", value: attempt.networkClass)
                 LedgerKeyValueRow(key: "阶段", value: attempt.stageReached.label)
                 LedgerKeyValueRow(key: "判定", value: attempt.verdict.label)
                 LedgerKeyValueRow(key: "结果", value: attempt.outcome.isEmpty ? "—" : attempt.outcome)
@@ -352,7 +378,7 @@ private struct LedgerBookRow: View {
 
 /// 路由不匹配列表（最新在前；点一行看完整字段）。
 private struct RouteMismatchListView: View {
-    @StateObject private var ledger = PlaybackLedger.shared
+    @ObservedObject private var ledger = PlaybackLedger.shared
 
     var body: some View {
         List {

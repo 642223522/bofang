@@ -439,7 +439,9 @@ final class PlaybackLedger: ObservableObject {
     /// 账本快照 JSON：播放尝试 + 路由不匹配 + 路线记忆。
     /// 只含 host + 路径模板哈希，不含 token、Cookie、完整 URL。
     /// 每条尝试只取前 20 条期望/实际账本（播单、密钥等诊断关键项在前，分片再多也不撑大文件）。
-    /// 空账本返回 "{}"，调用方按“不用上传”处理。
+    /// 网络诊断事件（最近 40 条）也一并导出：真机上列表/API 还没开始播就失败的，
+    /// 账本里也有据可查，不再被“账本是空的”挡住上传。
+    /// 全部为空返回 "{}"，调用方按“不用上传”处理。
     func snapshotJSON() -> String {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime]
@@ -509,13 +511,39 @@ final class PlaybackLedger: ObservableObject {
             ]
             return d
         }
+        let netDiagJSON: [[String: Any]] = NetworkDiagnostics.shared.events.prefix(40).map { e in
+            var d: [String: Any] = [
+                "at": iso.string(from: e.at),
+                "source": e.source,
+                "method": e.method,
+                "host": e.host,
+                "path": e.sanitizedPath,
+                "network": e.networkClass,
+                "phase": e.phase.rawValue,
+                "totalMs": e.totalMs,
+                "reused": e.reusedConnection,
+                "proxyConn": e.proxyConnection
+            ]
+            if let s = e.statusCode { d["status"] = s }
+            if let c = e.errorCode { d["errorCode"] = c }
+            if let dom = e.errorDomain { d["errorDomain"] = dom }
+            if let msg = e.errorSummary { d["errorSummary"] = msg }
+            if let ip = e.remoteAddress { d["remoteIP"] = ip }
+            if let proto = e.protocolName { d["protocol"] = proto }
+            if let v = e.dnsMs { d["dnsMs"] = v }
+            if let v = e.tcpMs { d["tcpMs"] = v }
+            if let v = e.tlsMs { d["tlsMs"] = v }
+            if let v = e.ttfbMs { d["ttfbMs"] = v }
+            return d
+        }
         let root: [String: Any] = [
             "exportedAt": iso.string(from: Date()),
             "attempts": attemptsJSON,
             "mismatches": mismatchesJSON,
-            "routeMemory": routesJSON
+            "routeMemory": routesJSON,
+            "networkDiagnostics": netDiagJSON
         ]
-        guard attemptsJSON.count + mismatchesJSON.count > 0,
+        guard attemptsJSON.count + mismatchesJSON.count + routesJSON.count + netDiagJSON.count > 0,
               let data = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys]),
               let text = String(data: data, encoding: .utf8), !text.isEmpty else {
             return "{}"

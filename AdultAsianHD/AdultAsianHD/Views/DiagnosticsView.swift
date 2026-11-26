@@ -11,6 +11,7 @@ import SwiftUI
 
 struct DiagnosticsView: View {
     @EnvironmentObject private var store: SourceStore
+    @ObservedObject private var netDiag = NetworkDiagnostics.shared
 
     @State private var isCheckingAll = false
     @State private var resultMessage = ""
@@ -56,6 +57,37 @@ struct DiagnosticsView: View {
                             infoRow("自检失败", "\(failedCheckCount) 个")
                             infoRow("竞速已测", "\(store.raceResults.count) 个")
                             infoRow("后台自检", store.autoCheckCycleDescription)
+                        }
+
+                        Section("网络诊断（DNS/TCP/TLS/HTTP/WAF）") {
+                            infoRow("当前网络", PlaybackLedger.networkClass == "proxy" ? "proxy（代理/VPN）" : "direct（直连无节点）")
+                            if netDiag.events.isEmpty {
+                                Text("暂无请求记录：浏览列表或播放后，这里会显示每条请求死在哪一层（DNS/TCP/TLS/HTTP/WAF）与各阶段耗时。")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            } else {
+                                let failedCount = netDiag.events.filter { $0.phase != .ok && $0.phase != .cancelled }.count
+                                infoRow("最近记录", "\(netDiag.events.count) 条（异常 \(failedCount) 条）")
+                                ForEach(netDiag.events.prefix(15)) { event in
+                                    NavigationLink {
+                                        NetworkDiagDetailView(event: event)
+                                    } label: {
+                                        netDiagRow(for: event)
+                                    }
+                                }
+                                if netDiag.events.count > 15 {
+                                    NavigationLink {
+                                        NetworkDiagAllView()
+                                    } label: {
+                                        Text("查看全部 \(netDiag.events.count) 条记录")
+                                            .font(.subheadline)
+                                    }
+                                }
+                                Button("清空网络诊断记录", role: .destructive) {
+                                    netDiag.clear()
+                                }
+                                .font(.subheadline)
+                            }
                         }
 
                     }
@@ -192,6 +224,38 @@ struct DiagnosticsView: View {
             showResultAlert = true
         }
     }
+
+    // MARK: - 网络诊断行
+
+    @ViewBuilder
+    private func netDiagRow(for event: NetworkDiagEvent) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(event.phase.label)
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundColor(netDiagPhaseColor(event.phase))
+                Text(event.host.isEmpty ? "—" : event.host)
+                    .font(.subheadline)
+                    .lineLimit(1)
+                Spacer()
+                Text(event.networkClass)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            Text("\(event.source) · \(event.statusCode.map { "HTTP \($0)" } ?? (event.errorSummary ?? "无响应")) · \(event.timingSummary)")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .lineLimit(2)
+            if let ip = event.remoteAddress, !ip.isEmpty {
+                Text("IP: \(ip)\(event.protocolName.map { " · \($0)" } ?? "")")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(.vertical, 2)
+    }
 }
 
 // MARK: - 竞速明细（点一行进来）
@@ -324,5 +388,108 @@ private struct RaceDetailView: View {
                 raceError = "加载源失败：\(error.localizedDescription)"
             }
         }
+    }
+}
+
+// MARK: - 网络诊断明细
+
+private func netDiagPhaseColor(_ phase: NetworkDiagPhase) -> Color {
+    switch phase {
+    case .ok: return .green
+    case .dns, .tcp, .tls, .waf: return .red
+    case .http: return .orange
+    case .cancelled, .unknown: return .secondary
+    }
+}
+
+private struct NetworkDiagAllView: View {
+    @ObservedObject private var netDiag = NetworkDiagnostics.shared
+
+    var body: some View {
+        WideContent {
+            List {
+                ForEach(netDiag.events) { event in
+                    NavigationLink {
+                        NetworkDiagDetailView(event: event)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 6) {
+                                Text(event.phase.label)
+                                    .font(.caption)
+                                    .fontWeight(.semibold)
+                                    .foregroundColor(netDiagPhaseColor(event.phase))
+                                Text(event.host.isEmpty ? "—" : event.host)
+                                    .font(.subheadline)
+                                    .lineLimit(1)
+                            }
+                            Text("\(event.source) · \(event.networkClass) · \(event.timingSummary)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+        }
+        .navigationTitle("网络诊断记录")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct NetworkDiagDetailView: View {
+    let event: NetworkDiagEvent
+
+    var body: some View {
+        WideContent {
+            List {
+                Section("判定") {
+                    row("阶段/结果", event.phase.label, color: netDiagPhaseColor(event.phase))
+                    row("网络类", event.networkClass)
+                    row("来源", event.source)
+                    row("方法", event.method)
+                    row("Host", event.host.isEmpty ? "—" : event.host)
+                    row("路径（已脱敏）", event.sanitizedPath)
+                    if let status = event.statusCode {
+                        row("HTTP 状态", "\(status)")
+                    }
+                    if let summary = event.errorSummary, !summary.isEmpty {
+                        row("错误摘要", summary)
+                    }
+                    if let domain = event.errorDomain, let code = event.errorCode {
+                        row("错误码", "\(domain) (\(code))")
+                    }
+                    row("时间", event.at.formatted(date: .numeric, time: .standard))
+                }
+                Section("连接与耗时（URLSessionTaskMetrics）") {
+                    row("对端 IP", event.remoteAddress ?? "未知")
+                    row("协议", event.protocolName ?? "未知")
+                    row("连接复用", event.reusedConnection ? "是" : "否")
+                    row("经代理连接", event.proxyConnection ? "是" : "否")
+                    row("DNS", event.dnsMs.map { "\($0) ms" } ?? "—")
+                    row("TCP", event.tcpMs.map { "\($0) ms" } ?? "—")
+                    row("TLS/SNI", event.tlsMs.map { "\($0) ms" } ?? "—")
+                    row("TTFB", event.ttfbMs.map { "\($0) ms" } ?? "—")
+                    row("总耗时", "\(event.totalMs) ms")
+                }
+            }
+            .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
+        }
+        .navigationTitle(event.host.isEmpty ? "请求详情" : event.host)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func row(_ key: String, _ value: String, color: Color = .secondary) -> some View {
+        HStack(alignment: .top) {
+            Text(key)
+                .foregroundColor(.secondary)
+            Spacer()
+            Text(value)
+                .foregroundColor(color)
+                .multilineTextAlignment(.trailing)
+                .textSelection(.enabled)
+        }
+        .font(.subheadline)
     }
 }

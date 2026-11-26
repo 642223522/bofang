@@ -690,22 +690,19 @@ final class PlayerViewModel: ObservableObject {
     /// 拦截器用的子请求头：Referer（线路 referer，缺失时用当前帖页）+ iPhone UA，
     /// 模块自定义头后合并（模块的为准）；Cookie 也放进头里一份，供 HLS.js 回退复用，
     /// 拦截器自己另从 line.cookie 取（见 makeResourceLoader）。
+    /// 全部合并走大小写不敏感的 NetConstants.mergeHeaders，避免 "user-agent" 与
+    /// "User-Agent" 两个键同时存在时被字典遍历顺序随机覆盖。
     private func interceptedHeaders(for line: PlayLine) -> [String: String] {
-        var headers: [String: String] = ["User-Agent": PlaybackEngine.iPhoneUserAgent]
+        var base: [String: String] = ["User-Agent": PlaybackEngine.iPhoneUserAgent]
         if let referer = line.referer, !referer.isEmpty {
-            headers["Referer"] = referer
+            base["Referer"] = referer
         } else if let referer = currentItemLink, !referer.isEmpty {
-            headers["Referer"] = referer
-        }
-        if let extra = line.headers {
-            for (key, value) in extra {
-                headers[key] = value
-            }
+            base["Referer"] = referer
         }
         if let cookie = line.cookie, !cookie.isEmpty {
-            headers["Cookie"] = cookie
+            base["Cookie"] = cookie
         }
-        return headers
+        return NetConstants.mergeHeaders(base: base, overrides: line.headers ?? [:])
     }
 
     /// 给一条拦截线路建 HLSResourceLoader：头用 interceptedHeaders，Cookie 单独传；

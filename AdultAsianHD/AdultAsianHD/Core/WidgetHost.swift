@@ -471,11 +471,15 @@ final class WidgetHost: @unchecked Sendable {
                     var method = String(options.method || 'GET').toUpperCase();
                     var headers = normalizeHeaders(options.headers);
                     var requestURL = (url && typeof url === 'object' && url.url) ? String(url.url) : String(url);
+                    var reqOpts = { headers: headers };
+                    if (options.timeout !== undefined && options.timeout !== null) {
+                        reqOpts.timeout = options.timeout;
+                    }
                     var httpCall;
                     if (method === 'GET') {
-                        httpCall = Widget.http.get(requestURL, { headers: headers });
+                        httpCall = Widget.http.get(requestURL, reqOpts);
                     } else if (method === 'POST') {
-                        httpCall = Widget.http.post(requestURL, options.body, { headers: headers });
+                        httpCall = Widget.http.post(requestURL, options.body, reqOpts);
                     } else {
                         return Promise.reject(new Error('fetch: 只支持 GET/POST，暂不支持 ' + method));
                     }
@@ -511,17 +515,18 @@ final class WidgetHost: @unchecked Sendable {
               !promiseConstructor.isUndefined else {
             fatalError("WidgetHost: JS 环境里没有 Promise")
         }
-        // headers 在 executor 里同步抠出来（当时还在主线程），Task 只带纯 Swift 值走，
-        // resolve/reject 装进 Sendable 盒子带进 Task（JSValue 本身不是 Sendable）。
         let headers = headers(from: options)
-        // 分类拦截：武装窗口内、且是同源 WP 帖子请求时，改成带 categories=<id> 的 URL；
-        // 不命中返回原 URL。改写在发请求前同步完成（JS 调 http.get 时还在主线程）。
+        let timeout = timeoutInterval(from: options)
         let effectiveURL = interceptor.rewrittenURL(for: urlString) ?? urlString
         let executor: @convention(block) (JSValue, JSValue) -> Void = { resolve, reject in
             let box = JSCallbackBox(resolve: resolve, reject: reject)
             Task {
                 do {
-                    let (status, data, responseHeaders, rawData) = try await Self.fetchHTTP(urlString: effectiveURL, headers: headers)
+                    let (status, data, responseHeaders, rawData) = try await Self.fetchHTTP(
+                        urlString: effectiveURL,
+                        headers: headers,
+                        timeout: timeout
+                    )
                     await MainActor.run {
                         guard let ctx = box.resolve.context else { return }
                         let result = JSValue(newObjectIn: ctx)!
@@ -552,23 +557,25 @@ final class WidgetHost: @unchecked Sendable {
         return promise
     }
 
-    /// Widget.http.post 的 Promise：与 get 同一套机制（后台发请求，主线程 resolve/reject），
-    /// 只是 method 是 POST、带 body、不套分类拦截器。
-    /// 只在传输层失败时 reject；HTTP 状态码是多少都 resolve 回去，让模块自己按 status 判断。
     private static func makeHttpPostPromise(in context: JSContext, urlString: String, body: JSValue?, options: JSValue?) -> JSValue {
         guard let promiseConstructor = context.objectForKeyedSubscript("Promise"),
               !promiseConstructor.isUndefined else {
             fatalError("WidgetHost: JS 环境里没有 Promise")
         }
-        // headers 与 body 在 executor 外同步抠出来（当时还在主线程），Task 只带纯 Swift 值走，
-        // resolve/reject 装进 Sendable 盒子带进 Task（JSValue 本身不是 Sendable）。
         let headers = headers(from: options)
+        let timeout = timeoutInterval(from: options)
         let bodyData = httpBodyData(from: body)
         let executor: @convention(block) (JSValue, JSValue) -> Void = { resolve, reject in
             let box = JSCallbackBox(resolve: resolve, reject: reject)
             Task {
                 do {
-                    let (status, data, responseHeaders, rawData) = try await Self.fetchHTTP(urlString: urlString, method: "POST", body: bodyData, headers: headers)
+                    let (status, data, responseHeaders, rawData) = try await Self.fetchHTTP(
+                        urlString: urlString,
+                        method: "POST",
+                        body: bodyData,
+                        headers: headers,
+                        timeout: timeout
+                    )
                     await MainActor.run {
                         guard let ctx = box.resolve.context else { return }
                         let result = JSValue(newObjectIn: ctx)!
@@ -599,49 +606,74 @@ final class WidgetHost: @unchecked Sendable {
         return promise
     }
 
-    /// POST 的 body 转 Data：字符串直接 UTF-8；对象转 JSON；没有/空返回 nil。
+    /// POST 的 body 转 Data：字符串直接 UTF-8；数组/对象转 JSON；没有/空返回 nil。
     private static func httpBodyData(from body: JSValue?) -> Data? {
         guard let body, !body.isUndefined, !body.isNull else { return nil }
         if body.isString {
             return body.toString().data(using: .utf8)
         }
+        if body.isArray,
+           let array = body.toArray(),
+           JSONSerialization.isValidJSONObject(array),
+           let data = try? JSONSerialization.data(withJSONObject: array) {
+            return data
+        }
         if let dict = body.toDictionary() as? [String: Any],
+           JSONSerialization.isValidJSONObject(dict),
            let data = try? JSONSerialization.data(withJSONObject: dict) {
             return data
         }
         return body.toString().data(using: .utf8)
     }
 
+    /// 从 options 提取超时时间（兼容毫秒如 8000 和秒如 8）；未传时默认 12 秒，
+    /// 让模块在 30 秒 awaitPromise 窗口内至少有余量切到备用镜像域名。
+    private static func timeoutInterval(from options: JSValue?) -> TimeInterval {
+        guard let raw = options?.objectForKeyedSubscript("timeout"),
+              !raw.isUndefined, !raw.isNull else {
+            return 12
+        }
+        let value = raw.toDouble()
+        guard value.isFinite, value > 0 else { return 12 }
+        let seconds = value > 120 ? (value / 1000.0) : value
+        return min(max(seconds, 3), 25)
+    }
+
     private static func headers(from options: JSValue?) -> [String: String] {
-        var headers: [String: String] = ["User-Agent": NetConstants.iPhoneUserAgent]
+        var overrides: [String: String] = [:]
         if let dict = options?.objectForKeyedSubscript("headers")?.toDictionary() {
             for (key, value) in dict {
                 if let keyString = key as? String {
-                    headers[keyString] = "\(value)"
+                    overrides[keyString] = "\(value)"
                 }
             }
         }
-        return headers
+        return NetConstants.mergeHeaders(base: NetConstants.defaultBrowserHeaders, overrides: overrides)
     }
 
-    /// 真正发请求。只在传输层失败时 throw（对应 Promise reject）；
-    /// HTTP 状态码是多少都 resolve 回去（{status, data, headers, arrayBuffer}），让模块自己按 status 判断，
-    /// pornjav 的 httpGetStatus 就是这么用的（404 也要看 status）。
-    /// method/body 默认 GET/无 body，老的 GET 调用不用改。
-    /// 返回四元组：status、data（JSON 对象/数组或文本，见 httpDataObject）、
-    /// responseHeaders（响应头全量）、rawData（响应体原字节，供 arrayBuffer 用）。
-    private static func fetchHTTP(urlString: String, method: String = "GET", body: Data? = nil, headers: [String: String]) async throws -> (status: Int, data: Any, responseHeaders: [String: String], rawData: Data) {
+    private static func fetchHTTP(
+        urlString: String,
+        method: String = "GET",
+        body: Data? = nil,
+        headers: [String: String],
+        timeout: TimeInterval = 12
+    ) async throws -> (status: Int, data: Any, responseHeaders: [String: String], rawData: Data) {
         guard let url = URL(string: urlString) else {
             throw WidgetHostError.callFailed("链接格式不对：\(urlString)")
         }
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.timeoutInterval = 30
+        request.timeoutInterval = timeout
         if let body { request.httpBody = body }
         for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
-        let (raw, response) = try await URLSession.shared.data(for: request)
+        let (raw, response) = try await DiagnosticHTTPClient.shared.data(
+            for: request,
+            source: "widget",
+            preservedHeaders: headers,
+            timeout: timeout
+        )
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         return (status, httpDataObject(from: raw), responseHeaders(from: response), raw)
     }
@@ -1001,10 +1033,20 @@ final class WidgetHost: @unchecked Sendable {
     private func fetchWordPressArray(url: URL) async throws -> (status: Int, items: [[String: Any]]?) {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.timeoutInterval = 30
-        request.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        let (raw, response) = try await URLSession.shared.data(for: request)
+        request.timeoutInterval = 12
+        let headers = NetConstants.mergeHeaders(
+            base: NetConstants.defaultBrowserHeaders,
+            overrides: ["Accept": "application/json"]
+        )
+        for (key, value) in headers {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+        let (raw, response) = try await DiagnosticHTTPClient.shared.data(
+            for: request,
+            source: "wp-direct",
+            preservedHeaders: headers,
+            timeout: 12
+        )
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         let items = try? JSONSerialization.jsonObject(with: raw) as? [[String: Any]]
         return (status, items)

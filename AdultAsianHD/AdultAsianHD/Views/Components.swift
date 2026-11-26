@@ -1,6 +1,7 @@
 // Components.swift — 共用小组件（v2 重建）
 
 import CommonCrypto
+import CryptoKit
 import SwiftUI
 import UIKit
 
@@ -74,30 +75,177 @@ enum CryptoImage {
     }
 }
 
-// MARK: - 封面加载（带重试 + 解密 + 内存缓存）
+// MARK: - 封面加载（带重试 + 解密 + 内存/磁盘二级缓存）
 
-/// 封面内存缓存（NSCache 本身线程安全）。
-final class CoverImageCache {
+/// 封面二级缓存：
+/// - L1 内存（NSCache，限 200 张 / 40MB，主线程零延迟命中）；
+/// - L2 磁盘（Library/Caches/CoverImageCache/<sha256>.img，存已解密/解码后的图片字节，
+///   重启或内存回收后直接读盘、不再抢视频带宽，且免去黄果封面重复 AES 解密）；
+/// - 容量上限 100MB、最长保留 14 天，按访问时间 LRU 异步淘汰。
+final class CoverImageCache: @unchecked Sendable {
     static let shared = CoverImageCache()
-    private let cache = NSCache<NSString, UIImage>()
-    private init() { cache.countLimit = 200 }
-    func image(for key: String) -> UIImage? { cache.object(forKey: key as NSString) }
-    func store(_ image: UIImage, for key: String) { cache.setObject(image, forKey: key as NSString) }
+
+    static let maxDiskBytes: Int64 = 100 * 1024 * 1024 // 100 MB
+    static let targetDiskBytes: Int64 = 80 * 1024 * 1024 // 淘汰回落到 80 MB，避免频繁触发
+    static let maxDiskAge: TimeInterval = 14 * 24 * 3600 // 14 天
+
+    private let memoryCache = NSCache<NSString, UIImage>()
+    private let diskDirectory: URL
+    private let ioQueue = DispatchQueue(label: "com.liudehen.xiaoshipin.covercache.io", qos: .utility)
+    private var writesSinceCleanup = 0
+
+    private init() {
+        memoryCache.countLimit = 200
+        memoryCache.totalCostLimit = 40 * 1024 * 1024
+
+        let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        self.diskDirectory = cachesDir.appendingPathComponent("CoverImageCache", isDirectory: true)
+        try? FileManager.default.createDirectory(at: diskDirectory, withIntermediateDirectories: true)
+
+        // 启动后后台做一次过期/超容巡检（不挡首屏）
+        ioQueue.async { [weak self] in
+            self?.evictDiskIfNeeded()
+        }
+    }
+
+    /// 同步查 L1 内存缓存（快速路径，无闪烁）。
+    func image(for key: String) -> UIImage? {
+        memoryCache.object(forKey: key as NSString)
+    }
+
+    /// 先查 L1 内存，未命中再异步读 L2 磁盘并回填 L1；均未命中返回 nil（调用方才发网络请求）。
+    func cachedImage(for key: String) async -> UIImage? {
+        if let mem = memoryCache.object(forKey: key as NSString) {
+            return mem
+        }
+        let fileURL = diskFileURL(for: key)
+        return await withCheckedContinuation { continuation in
+            ioQueue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                guard let data = try? Data(contentsOf: fileURL),
+                      let uiImage = UIImage(data: data) else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                // 更新修改时间用于 LRU 淘汰
+                var mutableURL = fileURL
+                var values = URLResourceValues()
+                values.contentModificationDate = Date()
+                try? mutableURL.setResourceValues(values)
+
+                self.memoryCache.setObject(uiImage, forKey: key as NSString, cost: Self.memoryCost(of: uiImage))
+                continuation.resume(returning: uiImage)
+            }
+        }
+    }
+
+    /// 存 L1 内存 + 异步写 L2 磁盘。
+    /// rawDecodedData：已解密/校验好的原图片字节（直接落盘，零重压缩损失）；未传时自动转 JPEG 0.85。
+    func store(_ image: UIImage, rawDecodedData: Data? = nil, for key: String) {
+        memoryCache.setObject(image, forKey: key as NSString, cost: Self.memoryCost(of: image))
+        let fileURL = diskFileURL(for: key)
+        ioQueue.async { [weak self] in
+            guard let self else { return }
+            let payload: Data? = rawDecodedData ?? image.jpegData(compressionQuality: 0.85)
+            guard let payload, !payload.isEmpty else { return }
+            try? FileManager.default.createDirectory(at: self.diskDirectory, withIntermediateDirectories: true)
+            try? payload.write(to: fileURL, options: .atomic)
+            self.writesSinceCleanup += 1
+            if self.writesSinceCleanup >= 25 {
+                self.writesSinceCleanup = 0
+                self.evictDiskIfNeeded()
+            }
+        }
+    }
+
+    /// 兼容旧签名（直接存 UIImage）。
+    func store(_ image: UIImage, for key: String) {
+        store(image, rawDecodedData: nil, for: key)
+    }
+
+    /// 清空封面内存与磁盘缓存。
+    func clearAll() {
+        memoryCache.removeAllObjects()
+        ioQueue.async { [weak self] in
+            guard let self else { return }
+            try? FileManager.default.removeItem(at: self.diskDirectory)
+            try? FileManager.default.createDirectory(at: self.diskDirectory, withIntermediateDirectories: true)
+        }
+    }
+
+    private func diskFileURL(for key: String) -> URL {
+        let digest = SHA256.hash(data: Data(key.utf8))
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        return diskDirectory.appendingPathComponent(hex + ".img")
+    }
+
+    private static func memoryCost(of image: UIImage) -> Int {
+        if let cg = image.cgImage {
+            return cg.bytesPerRow * cg.height
+        }
+        return Int(image.size.width * image.size.height * image.scale * image.scale * 4)
+    }
+
+    /// 磁盘 LRU + TTL 淘汰（只在 ioQueue 调用）。
+    private func evictDiskIfNeeded() {
+        let fm = FileManager.default
+        let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
+        guard let urls = try? fm.contentsOfDirectory(
+            at: diskDirectory,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        let now = Date()
+        var entries: [(url: URL, size: Int64, date: Date)] = []
+        var totalSize: Int64 = 0
+
+        for url in urls {
+            guard let values = try? url.resourceValues(forKeys: keys),
+                  values.isRegularFile == true else { continue }
+            let modDate = values.contentModificationDate ?? .distantPast
+            let size = Int64(values.fileSize ?? 0)
+            if now.timeIntervalSince(modDate) > Self.maxDiskAge {
+                try? fm.removeItem(at: url)
+                continue
+            }
+            totalSize += size
+            entries.append((url: url, size: size, date: modDate))
+        }
+
+        guard totalSize > Self.maxDiskBytes else { return }
+        // 最久未访问的先删，直到回落至 targetDiskBytes 以下
+        entries.sort { $0.date < $1.date }
+        for entry in entries {
+            guard totalSize > Self.targetDiskBytes else { break }
+            try? fm.removeItem(at: entry.url)
+            totalSize -= entry.size
+        }
+    }
 }
 
 /// 封面图：替代裸 AsyncImage。
-/// AsyncImage 不重试、不带请求头、慢网一张失败就一直灰——
-/// 黄果的图床本来就慢（沙箱快网拉一张也要 2 秒），4G 下经常首拉失败。
-/// 这里 URLSession 带 iPhone UA + 站点 Referer 拉，失败 0.5 秒后重试一次，
-/// 拉到的字节过 CryptoImage.decodeCover（黄果密文自动解密），
-/// 成功进内存缓存（NSCache；URLSession.shared 自带 URLCache 磁盘缓存，
-/// 两级缓存）；失败就一直灰色占位，不报错、不闪。
+/// 优先读 CoverImageCache（内存 → 磁盘），都未命中才走专用低并发 URLSession 拉图（不和视频抢带宽）；
+/// 失败 0.5 秒后重试一次，拉到的字节过 CryptoImage.decodeCover（黄果密文自动解密）后同时写入内存与磁盘。
 struct CoverImage: View {
     let urlString: String?
     @State private var image: UIImage?
 
-    /// 图床域名 → 站点 Referer（按站配；四家 AI 一致的 VideoSiteConfig 思路，
-    /// 目前就这两家有图床防盗链需要，够了再加）。
+    /// 封面专用会话：限每域 4 并发（不抢视频分片带宽）、关掉 URLCache 避免和 CoverImageCache 重复写盘。
+    private static let imageSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.urlCache = nil
+        config.httpMaximumConnectionsPerHost = 4
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 30
+        config.waitsForConnectivity = false
+        return URLSession(configuration: config)
+    }()
+
+    /// 图床域名 → 站点 Referer（按站配）。
     static func referer(for url: URL) -> String {
         let host = (url.host ?? "").lowercased()
         if host.contains("qnlycc.cn") { return "https://huangguoai.com/" }
@@ -121,29 +269,33 @@ struct CoverImage: View {
 
     private func load() async {
         guard let urlString, !urlString.isEmpty,
-              let url = URL(string: urlString) else { return }
-        if let cached = CoverImageCache.shared.image(for: urlString) {
-            image = cached
+              let url = URL(string: urlString) else {
+            image = nil
             return
         }
+        // 1. 先查 L1 内存 → L2 磁盘，命中直接显示，绝不发网络请求
+        if let cached = await CoverImageCache.shared.cachedImage(for: urlString) {
+            if !Task.isCancelled { image = cached }
+            return
+        }
+        // 2. 缓存均未命中：带 UA + Referer 拉图，禁用 HTTP/3 规避无节点 UDP 443 卡顿
         for attempt in 0..<2 {
+            if Task.isCancelled { return }
             do {
-                var request = URLRequest(url: url, timeoutInterval: 20)
+                var request = URLRequest(url: url, timeoutInterval: 15)
+                request.assumesHTTP3Capable = false
                 request.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
-                // 防盗链 Referer 按站配（四家 AI 一致：按站点配 imageReferer，
-                // 别用裸 AsyncImage）：图床域名 → 它的站。没配到的用图床自己。
-                // 实测：黄果图床不带 Referer 也 200，但站内 Referer 更稳；
-                // 真正让黄果封面出不来的是密文（见 CryptoImage），不是 Referer。
                 request.setValue(Self.referer(for: url), forHTTPHeaderField: "Referer")
-                let (data, response) = try await URLSession.shared.data(for: request)
+                let (data, response) = try await Self.imageSession.data(for: request)
+                if Task.isCancelled { return }
                 guard (response as? HTTPURLResponse)?.statusCode == 200 else { continue }
                 guard let decoded = CryptoImage.decodeCover(data),
                       let uiImage = UIImage(data: decoded) else { continue }
-                CoverImageCache.shared.store(uiImage, for: urlString)
-                image = uiImage
+                CoverImageCache.shared.store(uiImage, rawDecodedData: decoded, for: urlString)
+                if !Task.isCancelled { image = uiImage }
                 return
             } catch {
-                if attempt == 1 { return }
+                if Task.isCancelled || attempt == 1 { return }
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
         }

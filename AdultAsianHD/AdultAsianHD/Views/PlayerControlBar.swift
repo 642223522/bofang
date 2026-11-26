@@ -39,7 +39,8 @@ func formatPlayerTime(_ seconds: Double) -> String {
 // MARK: - 进度条
 
 /// 自定义进度条：已播（白）/已缓冲（浅灰）/未播（深灰），圆点手柄；拖动跟手、点按可跳。
-/// 拖动时只改本地显示位置，松手才由调用方 seek（调用方在 onScrub 里实时 seek、onScrubEnd 里收尾）。
+/// 拖动时只改本地显示位置（onScrub 只更新 UI 时间，不发 AVPlayer.seek），
+/// 松手时 onScrubEnd 发唯一一次精确 seek；零时长时不启动拖动、不丢 onScrubEnd。
 struct PlayerProgressSlider: View {
     var currentTime: Double
     var duration: Double
@@ -84,25 +85,26 @@ struct PlayerProgressSlider: View {
             .highPriorityGesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { value in
+                        guard duration > 0, geo.size.width > 0 else { return }
                         if !isDragging {
                             isDragging = true
                             dragTime = displayedTime
                             onScrubStart()
                         }
-                        guard duration > 0 else { return }
                         let ratio = min(max(value.location.x / geo.size.width, 0), 1)
                         let t = ratio * duration
                         dragTime = t
                         onScrub(t)
                     }
                     .onEnded { value in
-                        guard duration > 0 else {
-                            isDragging = false
-                            dragTime = nil
-                            return
+                        guard isDragging else { return }
+                        let t: Double
+                        if duration > 0, geo.size.width > 0 {
+                            let ratio = min(max(value.location.x / geo.size.width, 0), 1)
+                            t = ratio * duration
+                        } else {
+                            t = dragTime ?? currentTime
                         }
-                        let ratio = min(max(value.location.x / geo.size.width, 0), 1)
-                        let t = ratio * duration
                         dragTime = nil
                         isDragging = false
                         onScrubEnd(t)
