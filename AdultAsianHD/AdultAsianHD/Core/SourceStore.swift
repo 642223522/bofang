@@ -106,11 +106,11 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         guard validation.ok, let meta = validation.meta else {
             return .failure(.notModule(validation.error ?? "这个脚本不是 ForwardWidget 模块格式"))
         }
-        // 去重：同模块 id 或同站点域名已存在，不重复添加（提示已存在相同源并跳过）
-        if let duplicate = await existingDuplicate(for: meta, jsSource: text) {
-            return .failure(.duplicate(duplicate.title))
-        }
-        let finalName = uniqueFileName(sanitizedFileName(fileName, fallback: meta.id))
+        // 不去重（2026-11-26 用户定：源去重删了——同站不同模块也是独立的源；
+        // 朋友的去重是帖子内容去重，跟源去重不是一回事）。
+        // 同模块 id：原地更新（覆盖旧文件、更新记录）；否则当新源追加。
+        let existing = await MainActor.run { self.sources.first(where: { $0.id == meta.id }) }
+        let finalName = existing?.fileName ?? uniqueFileName(sanitizedFileName(fileName, fallback: meta.id))
         let fileURL = sourcesDirectory.appendingPathComponent(finalName)
         do {
             try data.write(to: fileURL, options: .atomic)
@@ -122,12 +122,16 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             title: meta.title,
             fileName: finalName,
             origin: origin,
-            country: countryGuess(for: meta),
+            country: existing?.country ?? countryGuess(for: meta),
             version: meta.version,
             importedAt: Date()
         )
         await MainActor.run {
-            self.sources.append(record)
+            if let idx = self.sources.firstIndex(where: { $0.fileName == finalName }) {
+                self.sources[idx] = record
+            } else {
+                self.sources.append(record)
+            }
             self.saveManifest()
         }
         return .success(record)
@@ -160,69 +164,6 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             name = ""
         }
         return await importData(data, fileName: name, origin: "外部导入")
-    }
-
-    // MARK: - 去重（导入时 + 自检时）
-
-    /// 从 JS 源码提取站点域名：优先 WidgetMetadata.site；其次 SITE / BASE_URL 变量；
-    /// 再其次含 /wp-json/ 的 URL 的 host。归一化：小写、去 www. 前缀。
-    /// 提不出返回 nil（该模块只按模块 id 去重）。
-    static func siteDomain(fromJS js: String, metaSite: String? = nil) -> String? {
-        if let site = metaSite, let host = URL(string: site)?.host, !host.isEmpty {
-            return normalizedDomain(host)
-        }
-        // SITE / BASE_URL 变量，如 var SITE = "https://pornjav.tv";
-        if let urlString = firstMatch(in: js, pattern: "(?:var|let|const)\\s+(?:SITE|site|BASE_URL|baseUrl|HOST|host|DOMAIN|domain)\\s*=\\s*[\"'](https?://[^\"'\\s]+)"),
-           let host = URL(string: urlString)?.host, !host.isEmpty {
-            return normalizedDomain(host)
-        }
-        // 含 /wp-json/ 的 URL（如 WP API 地址），取它的 host
-        if let urlString = firstMatch(in: js, pattern: "https?://[A-Za-z0-9.-]+[^\"'\\s]*?/wp-json/"),
-           let host = URL(string: urlString)?.host, !host.isEmpty {
-            return normalizedDomain(host)
-        }
-        return nil
-    }
-
-    /// 某源的站点域名（读它的 JS 文件提取；提不出为 nil）。
-    func siteDomain(for source: SourceRecord) -> String? {
-        guard let js = jsSource(for: source) else { return nil }
-        return Self.siteDomain(fromJS: js)
-    }
-
-    /// 找已存在的重复源：同模块 id，或同站点域名（读对方 JS 文件算域名）。
-    /// 返回重复的那个源（没有返回 nil）。同 id 优先于同域名。
-    /// 同一站点/内容池被不同域名或不同模块重复收录时，只留一个。
-    func existingDuplicate(for meta: WidgetMeta, jsSource jsText: String) async -> SourceRecord? {
-        let all = await MainActor.run { self.sources }
-        if let sameId = all.first(where: { $0.id == meta.id }) {
-            return sameId
-        }
-        guard let domain = Self.siteDomain(fromJS: jsText, metaSite: meta.site) else { return nil }
-        for source in all {
-            guard let js = jsSource(for: source),
-                  Self.siteDomain(fromJS: js) == domain else { continue }
-            return source
-        }
-        return nil
-    }
-
-    /// 正则取第一个匹配的第 1 个捕获组（没有捕获组取整个匹配）；没有返回 nil。
-    private static func firstMatch(in text: String, pattern: String) -> String? {
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: text, options: [], range: NSRange(text.startIndex..., in: text)) else {
-            return nil
-        }
-        let groupIndex = match.numberOfRanges > 1 ? 1 : 0
-        let range = match.range(at: groupIndex)
-        guard range.location != NSNotFound, let swiftRange = Range(range, in: text) else { return nil }
-        return String(text[swiftRange])
-    }
-
-    /// 域名归一化：小写、去 www. 前缀（pornjav.tv 与 www.pornjav.tv 算同一个站）。
-    private static func normalizedDomain(_ host: String) -> String {
-        let lower = host.lowercased()
-        return lower.hasPrefix("www.") ? String(lower.dropFirst(4)) : lower
     }
 
     // MARK: - 删除 / 导出 / 取用
@@ -371,14 +312,10 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
                     continue
                 }
 
-                // 3. 确认下载+校验全部通过，再原子替换同名/同 id 旧源
+                // 3. 确认下载+校验全部通过，再原子替换同名/同 id 旧源（不去重：同站不同模块也是独立的源）
                 let sanitized = sanitizedFileName(name, fallback: meta.id)
                 let existing = await MainActor.run {
                     self.sources.first(where: { $0.fileName == sanitized || $0.id == meta.id })
-                }
-                if existing == nil, let dup = await existingDuplicate(for: meta, jsSource: text) {
-                    _ = dup // 已存在同域名其他源：跳过不重复加
-                    continue
                 }
                 let finalName = existing?.fileName ?? uniqueFileName(sanitized)
                 let targetURL = sourcesDirectory.appendingPathComponent(finalName)
@@ -897,50 +834,8 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
 
     /// 自检分组（去重）：按模块 id / 站点域名分组，同一组只跑一次固定验线。
     /// 并查集：同 id 或同域名（任一相同）即同一组。
-    /// 返回 [[源]]，每组第一个为代表（跑自检），其余标记跳过；组按第一个源的原顺序排。
-    private func checkGroups(for all: [SourceRecord]) -> [[SourceRecord]] {
-        var parent: [String: String] = [:]
-        for source in all { parent[source.id] = source.id }
-        func find(_ x: String) -> String {
-            var root = x
-            while let p = parent[root], p != root { root = p }
-            var node = x
-            while let p = parent[node], p != root {
-                parent[node] = root
-                node = p
-            }
-            return root
-        }
-        func union(_ a: String, _ b: String) {
-            let ra = find(a), rb = find(b)
-            if ra != rb { parent[rb] = ra }
-        }
-        var domainOwner: [String: String] = [:]
-        for source in all {
-            if let domain = siteDomain(for: source) {
-                if let owner = domainOwner[domain] {
-                    union(owner, source.id)
-                } else {
-                    domainOwner[domain] = source.id
-                }
-            }
-        }
-        var groups: [String: [SourceRecord]] = [:]
-        for source in all { groups[find(source.id), default: []].append(source) }
-        var ordered: [[SourceRecord]] = []
-        var seenRoots = Set<String>()
-        for source in all {
-            let root = find(source.id)
-            guard !seenRoots.contains(root) else { continue }
-            seenRoots.insert(root)
-            if let group = groups[root] { ordered.append(group) }
-        }
-        return ordered
-    }
-
-    /// 自检全部源：增量 + 去重 + 让路。
+    /// 自检全部源：增量 + 让路（不去重：每个源都单独跑，同站不同模块也是独立的源）。
     /// - 增量：只跑新增/改过（JS 指纹变了）或没测过的源；没动过的跳过，显示上次结果。
-    /// - 去重：同一组（同模块 id 或同站点域名）只跑代表一次，其余标记 skipped（与 X 重复，跳过）。
     /// - 让路：每测完一个源检查 Task.isCancelled（用户点屏/切页/播放/进后台即停）；
     ///   下次从断点接着跑（已测过且指纹没变的源跳过，不重跑）。
     /// 返回（正常数，失败数，跳过数）。取消时返回已统计到的数（未测的源下次接着跑）。
@@ -967,13 +862,11 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         var failed = 0
         var skipped = 0
         let all = await MainActor.run { self.sources }
-        let groups = checkGroups(for: all)
-        for group in groups {
+        for source in all {
             if Task.isCancelled { break }
-            guard let representative = group.first else { continue }
-            // 代表：增量——指纹没变且有上次结果（非跳过），跳过不重测（显示上次结果）
-            let currentFingerprint = fingerprint(for: representative)
-            let previous = await MainActor.run { self.checkResults[representative.id] }
+            // 增量——指纹没变且有上次结果（非跳过），跳过不重测（显示上次结果）
+            let currentFingerprint = fingerprint(for: source)
+            let previous = await MainActor.run { self.checkResults[source.id] }
             let needsCheck: Bool
             if let prev = previous, prev.status != .skipped {
                 needsCheck = prev.sourceFingerprint != currentFingerprint
@@ -981,7 +874,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
                 needsCheck = true
             }
             if needsCheck {
-                guard let result = await runCheck(for: representative) else { break }
+                guard let result = await runCheck(for: source) else { break }
                 switch result.status {
                 case .ok: ok += 1
                 case .failed: failed += 1
@@ -993,19 +886,6 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
                 case .failed: failed += 1
                 case .skipped: skipped += 1
                 }
-            }
-            // 同组其余源：标记为与代表重复，跳过
-            for duplicate in group.dropFirst() {
-                if Task.isCancelled { break }
-                let skippedResult = SourceCheckResult(
-                    status: .skipped,
-                    failedLines: [:],
-                    checkedAt: Date(),
-                    duplicateOf: representative.id,
-                    sourceFingerprint: fingerprint(for: duplicate)
-                )
-                await storeCheckResult(skippedResult, for: duplicate.id)
-                skipped += 1
             }
         }
         return (ok, failed, skipped)
@@ -1695,18 +1575,18 @@ struct DeepProbeResult: Codable {
 /// ok = 样本全部走完五步；failed = 至少一个样本死在某步，
 /// failedStep/failedReason 写清死在哪步 + 原因（如 "解析" / "首片 6000ms 超时"）。
 /// failedLines 记每条样本的失败原因（key 是样本标题，如 "JUQ-984"，旧版字段保留兼容）。
-/// skipped = 去重跳过（与另一个源重复，同模块 id 或同站点域名），duplicateOf 记重复的那个源 id。
+/// skipped = 旧版去重跳过（2026-11-26 已删，不再产生；字段保留只为解码旧存数据）。
 struct SourceCheckResult: Codable {
     enum Status: String, Codable {
         case ok
         case failed
-        /// 去重跳过：与另一个源重复（同模块 id 或同站点域名），没跑
+        /// 旧版去重跳过（已删，不再产生；保留只为解码旧存数据）
         case skipped
     }
     var status: Status
     var failedLines: [String: String]
     var checkedAt: Date?
-    /// 跳过时：重复的那个源的 id
+    /// 旧版跳过时重复的那个源的 id（已删，不再产生；保留只为解码旧存数据）
     var duplicateOf: String?
     /// 五步验真（决定本次结果的那个样本的五步；旧数据为 nil）
     var steps: [CheckStepResult]?
@@ -1729,8 +1609,6 @@ enum ImportError: Error, LocalizedError {
     case notModule(String)
     /// 网络问题（带具体原因）
     case network(String)
-    /// 已存在相同源（同模块 id 或同站点域名），不重复添加；关联值是已存在那个源的标题
-    case duplicate(String)
 
     var errorDescription: String? {
         switch self {
@@ -1738,8 +1616,6 @@ enum ImportError: Error, LocalizedError {
             return "这个文件读不出来（不是有效的文本文件）"
         case .notModule(let reason):
             return reason
-        case .duplicate(let existingTitle):
-            return "已存在相同源：\(existingTitle)，跳过导入"
         case .network(let reason):
             return reason
         }

@@ -427,7 +427,6 @@ struct SourcesView: View {
         readingLabel = "正在导入 1/\(urls.count)…"
         Task { @MainActor in
             var importedTitles: [String] = []
-            var skippedTitles: [String] = []
             var failedLines: [String] = []
             for (index, url) in urls.enumerated() {
                 readingLabel = "正在导入 \(index + 1)/\(urls.count)…"
@@ -446,21 +445,13 @@ struct SourcesView: View {
                 case .success(let record):
                     importedTitles.append(record.title)
                 case .failure(let error):
-                    // 已存在相同源：算跳过，不算失败
-                    if case .duplicate(let existingTitle) = error {
-                        skippedTitles.append(existingTitle)
-                    } else {
-                        failedLines.append("\(url.lastPathComponent)：\(error.localizedDescription)")
-                    }
+                    failedLines.append("\(url.lastPathComponent)：\(error.localizedDescription)")
                 }
             }
             isReading = false
             var parts: [String] = []
             if !importedTitles.isEmpty {
                 parts.append("已导入 \(importedTitles.count) 个源：\(importedTitles.joined(separator: "、"))")
-            }
-            if !skippedTitles.isEmpty {
-                parts.append("已跳过 \(skippedTitles.count) 个重复源：\(skippedTitles.joined(separator: "、"))")
             }
             if !failedLines.isEmpty {
                 parts.append("失败 \(failedLines.count) 个：\n\(failedLines.joined(separator: "\n"))")
