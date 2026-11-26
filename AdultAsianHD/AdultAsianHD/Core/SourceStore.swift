@@ -35,6 +35,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     /// 码云仓库与坏模块分支：上传只动 broken 分支，绝不动 js 分支。
     private let giteeRepo = "individual-freedom/ziyong-ziliao-beifang"
     private let brokenBranch = "broken"
+    private let reportsBranch = "reports"
 
     // MARK: - 自检后台任务（让路 + 断点续跑）
 
@@ -1130,7 +1131,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         guard !failed.isEmpty else {
             return .failure(.network("没有自检失败的源，不用上传"))
         }
-        if case .failure(let error) = await ensureBrokenBranch(token: effectiveToken) {
+        if case .failure(let error) = await ensureBranch(brokenBranch, token: effectiveToken) {
             return .failure(error)
         }
         var uploaded = 0
@@ -1167,6 +1168,41 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         return .success(uploaded)
     }
 
+    // MARK: - 上传播放账本（reports 分支）
+
+    /// 播放账本快照传到码云 reports 分支（一天一个文件：ledger-YYYY-MM-DD.json，就地更新）。
+    /// 和自检报告放同一个分支，Muse 每天读报告时一起读到——真机上没开节点失败的站，
+    /// 账本里 network=direct、stage/verdict 写明死在哪步，不用靠录屏猜。
+    /// token 为空时用 Keychain 里存过的；两个都没有就失败。成功返回文件名。
+    func uploadLedger(token: String) async -> Result<String, ImportError> {
+        let effectiveToken = token.isEmpty ? (KeychainHelper.load(forKey: giteeTokenKey) ?? "") : token
+        guard !effectiveToken.isEmpty else {
+            return .failure(.network("请先在源页面填写 Gitee Token，才能上传"))
+        }
+        let snapshot = await MainActor.run { PlaybackLedger.shared.snapshotJSON() }
+        guard snapshot != "{}" else {
+            return .failure(.network("账本是空的，不用上传"))
+        }
+        if case .failure(let error) = await ensureBranch(reportsBranch, token: effectiveToken) {
+            return .failure(error)
+        }
+        let day = String(Self.reportDateString(Date()).prefix(10))
+        let fileName = "ledger-\(day).json"
+        let result = await uploadFileToGitee(
+            token: effectiveToken,
+            path: fileName,
+            content: snapshot,
+            message: "播放账本快照 \(day)",
+            branch: reportsBranch
+        )
+        switch result {
+        case .success:
+            return .success(fileName)
+        case .failure(let error):
+            return .failure(error)
+        }
+    }
+
     /// 失败报告文本：源 id、哪条线失败、错误信息、时间戳。
     private static func brokenReport(for source: SourceRecord, result: SourceCheckResult?) -> String {
         var lines: [String] = [
@@ -1193,9 +1229,9 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         return formatter.string(from: date)
     }
 
-    /// broken 分支不存在就建一个（从仓库默认分支拉出来）；已存在直接成功。
-    private func ensureBrokenBranch(token: String) async -> Result<Void, ImportError> {
-        guard let branchURL = URL(string: "https://gitee.com/api/v5/repos/\(giteeRepo)/branches/\(brokenBranch)") else {
+    /// 指定分支不存在就建一个（从仓库默认分支拉出来）；已存在直接成功。
+    private func ensureBranch(_ branch: String, token: String) async -> Result<Void, ImportError> {
+        guard let branchURL = URL(string: "https://gitee.com/api/v5/repos/\(giteeRepo)/branches/\(branch)") else {
             return .failure(.network("上传地址不对"))
         }
         var getRequest = URLRequest(url: branchURL)
@@ -1212,7 +1248,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
                     return .failure(.network("Token 不对或没权限（HTTP \(http.statusCode)），检查一下 Token"))
                 }
                 if http.statusCode != 404 {
-                    return .failure(.network("查 broken 分支失败（HTTP \(http.statusCode)），稍后再试"))
+                    return .failure(.network("查 \(branch) 分支失败（HTTP \(http.statusCode)），稍后再试"))
                 }
                 // 404：分支不存在，往下建
             }
@@ -1234,7 +1270,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let branch = json["default_branch"] as? String, !branch.isEmpty else {
-                return .failure(.network("查不到仓库默认分支，没法建 broken 分支"))
+                return .failure(.network("查不到仓库默认分支，没法建 \(branch) 分支"))
             }
             defaultBranch = branch
         } catch {
@@ -1250,7 +1286,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         createRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
         createRequest.setValue("application/json;charset=UTF-8", forHTTPHeaderField: "Content-Type")
         createRequest.timeoutInterval = 30
-        let body: [String: Any] = ["branch_name": brokenBranch, "refs": defaultBranch]
+        let body: [String: Any] = ["branch_name": branch, "refs": defaultBranch]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
             return .failure(.network("建分支失败（请求拼不出来）"))
         }
@@ -1264,18 +1300,18 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             if let http = response as? HTTPURLResponse, http.statusCode == 422 {
                 return .success(())
             }
-            return .failure(.network("建 broken 分支失败（HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)）"))
+            return .failure(.network("建 \(branch) 分支失败（HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)）"))
         } catch {
             return .failure(.network("连不上码云：\(friendlyNetworkError(error))"))
         }
     }
 
-    /// 用 Gitee contents API 写一个文件到 broken 分支：
+    /// 用 Gitee contents API 写一个文件到指定分支（默认 broken）：
     /// 先 GET 看文件在不在（在就拿 sha 走更新，不在直接新建），内容 base64。
-    /// 路径如 broken/<源id>.js，分支固定 broken。
-    private func uploadFileToGitee(token: String, path: String, content: String, message: String) async -> Result<Void, ImportError> {
+    /// 路径如 broken/<源id>.js；账本快照走 reports 分支，路径如 ledger-2026-11-26.json。
+    private func uploadFileToGitee(token: String, path: String, content: String, message: String, branch: String = "broken") async -> Result<Void, ImportError> {
         guard let encodedPath = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
-              let fileURL = URL(string: "https://gitee.com/api/v5/repos/\(giteeRepo)/contents/\(encodedPath)?ref=\(brokenBranch)") else {
+              let fileURL = URL(string: "https://gitee.com/api/v5/repos/\(giteeRepo)/contents/\(encodedPath)?ref=\(branch)") else {
             return .failure(.network("上传地址不对"))
         }
         var existingSHA: String?
@@ -1305,7 +1341,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         var body: [String: Any] = [
             "content": Data(content.utf8).base64EncodedString(),
             "message": message,
-            "branch": brokenBranch
+            "branch": branch
         ]
         if let sha = existingSHA { body["sha"] = sha }
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {

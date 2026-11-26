@@ -52,6 +52,9 @@ struct MyView: View {
 
 struct LedgerHomeView: View {
     @StateObject private var ledger = PlaybackLedger.shared
+    @EnvironmentObject private var store: SourceStore
+    @State private var isUploading = false
+    @State private var uploadStatus: String?
 
     var body: some View {
         WideContent {
@@ -82,12 +85,50 @@ struct LedgerHomeView: View {
                     Text("\(ledger.routeMemoryCount) 条")
                         .foregroundColor(.secondary)
                 }
+                Section {
+                    Button {
+                        uploadLedger()
+                    } label: {
+                        HStack {
+                            Text(isUploading ? "正在上传…" : "上传账本到码云")
+                            Spacer()
+                            Image(systemName: "square.and.arrow.up")
+                        }
+                    }
+                    .disabled(isUploading)
+                    if let uploadStatus {
+                        Text(uploadStatus)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    Text("传到码云 reports 分支（一天一个文件），Muse 每天读自检报告时一起读到；没开节点失败的站，账本里会标 direct。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } footer: {
+                    Text("只传 host + 路径模板哈希，不传 token、Cookie、完整链接。")
+                }
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
         }
         .navigationTitle("播放账本")
         .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func uploadLedger() {
+        isUploading = true
+        uploadStatus = nil
+        Task {
+            // 传空串：store 里先用 Keychain 存过的 Token，没有才报错。
+            let result = await store.uploadLedger(token: "")
+            isUploading = false
+            switch result {
+            case .success(let file):
+                uploadStatus = "已上传（\(file)）"
+            case .failure(let error):
+                uploadStatus = error.localizedDescription
+            }
+        }
     }
 }
 

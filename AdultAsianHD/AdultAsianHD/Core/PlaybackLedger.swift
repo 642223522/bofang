@@ -1,4 +1,5 @@
 import CryptoKit
+import CFNetwork
 import Foundation
 
 // MARK: - 请求账本（Playback Ledger）+ 路由不匹配记录 + 路线记忆
@@ -109,6 +110,9 @@ struct LedgerAttempt: Identifiable {
     let lineHost: String
     let lineTemplateHash: String
     let hint: String
+    /// 本次尝试时的网络类：direct（直连，没开节点）/ proxy（系统代理或 VPN 隧道开着）。
+    /// 账本传上码云后，靠它区分“没开节点所以失败”和“站真坏了”。
+    let networkClass: String
     /// 播放时刻现铸过（账本 stage 用；现铸过的失败至少走到 mint）。
     let recastAtPlay: Bool
     /// 试过的引擎（按顺序，连续重复去重）。
@@ -185,6 +189,38 @@ struct RouteMemoryEntry {
     var consecutiveFailures: Int
 }
 
+/// 节点状态检测（只做标签，不影响播放与路由）：
+/// Shadowrocket 开节点有两种形态——代理模式改系统 HTTP 代理，VPN 模式建 utun 虚拟网卡；
+/// 两个都查，任一命中即判为代理。查不到/出错时按直连记（宁可漏标，不可误标）。
+enum NetworkState {
+    static func currentNetworkClass() -> String {
+        if hasSystemProxy() || hasTunnelInterface() { return "proxy" }
+        return "direct"
+    }
+
+    static func hasSystemProxy() -> Bool {
+        guard let proxies = CFNetworkCopySystemProxySettings() as? [String: Any] else { return false }
+        let httpOn = proxies[kCFNetworkProxiesHTTPEnable as String] as? Int == 1
+        let httpsOn = proxies[kCFNetworkProxiesHTTPSEnable as String] as? Int == 1
+        return httpOn || httpsOn
+    }
+
+    static func hasTunnelInterface() -> Bool {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let first = head else { return false }
+        defer { freeifaddrs(first) }
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let node = cursor {
+            let name = String(cString: node.pointee.ifa_name)
+            if name.hasPrefix("utun") || name.hasPrefix("ppp") || name.hasPrefix("ipsec") {
+                return true
+            }
+            cursor = node.pointee.ifa_next
+        }
+        return false
+    }
+}
+
 @MainActor
 final class PlaybackLedger: ObservableObject {
 
@@ -200,9 +236,10 @@ final class PlaybackLedger: ObservableObject {
     @Published private(set) var mismatches: [RouteMismatch] = []
     private var routeMemory: [RouteMemoryKey: RouteMemoryEntry] = [:]
 
-    /// 当前网络类（路线记忆的键的一部分；目前只有直连一种，以后按代理/直连分）。
-    /// 纯常量，nonisolated：代理（非 MainActor）也要读它。
-    nonisolated static let networkClass = "direct"
+    /// 当前网络类（路线记忆的键的一部分）：直连 / 代理，按本次播放时的实际网络定。
+    /// 代理 = 系统配了 HTTP(S) 代理，或存在 utun/ppp/ipsec 虚拟网卡（如 Shadowrocket 节点开着）。
+    /// 每次读都现测（节点开关会变）；nonisolated：代理（非 MainActor）也要读它。
+    nonisolated static var networkClass: String { NetworkState.currentNetworkClass() }
 
     private init() {}
 
@@ -236,6 +273,7 @@ final class PlaybackLedger: ObservableObject {
             lineHost: URL(string: lineURL)?.host ?? "",
             lineTemplateHash: Self.templateHash(for: lineURL),
             hint: hint,
+            networkClass: Self.networkClass,
             recastAtPlay: recastAtPlay
         )
         attempts.insert(attempt, at: 0)
@@ -389,5 +427,94 @@ final class PlaybackLedger: ObservableObject {
         } else {
             routeMemory[key] = entry
         }
+    }
+
+    // MARK: - 账本快照（上传码云 reports 分支用）
+
+    /// 账本快照 JSON：播放尝试 + 路由不匹配 + 路线记忆。
+    /// 只含 host + 路径模板哈希，不含 token、Cookie、完整 URL。
+    /// 每条尝试只取前 20 条期望/实际账本（播单、密钥等诊断关键项在前，分片再多也不撑大文件）。
+    /// 空账本返回 "{}"，调用方按“不用上传”处理。
+    func snapshotJSON() -> String {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        func bookJSON(_ e: LedgerBookEntry) -> [String: Any] {
+            var d: [String: Any] = [
+                "kind": e.kind.rawValue,
+                "host": e.host,
+                "hash": e.pathTemplateHash,
+                "cached": e.servedFromCache
+            ]
+            if let s = e.upstreamStatus { d["status"] = s }
+            if let b = e.bytes { d["bytes"] = b }
+            return d
+        }
+        let attemptsJSON: [[String: Any]] = attempts.map { a in
+            var d: [String: Any] = [
+                "startedAt": iso.string(from: a.startedAt),
+                "module": a.moduleId,
+                "item": a.itemId,
+                "host": a.lineHost,
+                "templateHash": a.lineTemplateHash,
+                "hint": a.hint,
+                "network": a.networkClass,
+                "ladder": a.ladder.map { String(describing: $0) },
+                "stage": a.stageReached.rawValue,
+                "verdict": a.verdict.rawValue,
+                "outcome": a.outcome,
+                "recastAtPlay": a.recastAtPlay,
+                "finalized": a.finalized,
+                "expected": a.expected.prefix(20).map(bookJSON),
+                "actual": a.actual.prefix(20).map(bookJSON)
+            ]
+            if let h = a.errorURIHost { d["errorHost"] = h }
+            if let h = a.errorURIHash { d["errorHash"] = h }
+            if let s = a.serverAddress { d["serverAddress"] = s }
+            if a.addressChanges > 0 { d["addressChanges"] = a.addressChanges }
+            if a.rewriteGaps > 0 { d["rewriteGaps"] = a.rewriteGaps }
+            return d
+        }
+        let mismatchesJSON: [[String: Any]] = mismatches.map { m in
+            let d: [String: Any] = [
+                "at": iso.string(from: m.at),
+                "module": m.moduleId,
+                "item": m.itemId,
+                "hint": m.hintDeclared,
+                "urlForm": m.urlForm,
+                "sniff": m.sniff,
+                "evidence": m.evidenceUsed,
+                "decision": m.decision,
+                "mismatch": m.mismatch.rawValue,
+                "ladder": m.ladderSteps,
+                "outcome": m.outcome
+            ]
+            return d
+        }
+        let routesJSON: [[String: Any]] = routeMemory.map { (key, entry) in
+            let d: [String: Any] = [
+                "module": key.moduleId,
+                "host": key.host,
+                "templateHash": key.urlTemplateHash,
+                "hint": key.hint,
+                "network": key.networkClass,
+                "firstRoute": String(describing: entry.firstRoute),
+                "confidence": entry.confidence,
+                "lastVerified": iso.string(from: entry.lastVerified),
+                "consecutiveFailures": entry.consecutiveFailures
+            ]
+            return d
+        }
+        let root: [String: Any] = [
+            "exportedAt": iso.string(from: Date()),
+            "attempts": attemptsJSON,
+            "mismatches": mismatchesJSON,
+            "routeMemory": routesJSON
+        ]
+        guard attemptsJSON.count + mismatchesJSON.count > 0,
+              let data = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys]),
+              let text = String(data: data, encoding: .utf8), !text.isEmpty else {
+            return "{}"
+        }
+        return text
     }
 }

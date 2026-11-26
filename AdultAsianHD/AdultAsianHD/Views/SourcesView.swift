@@ -227,13 +227,23 @@ struct SourcesView: View {
         Task {
             // 传空串：store 里先用 Keychain 存过的 Token，没有才报错。
             let result = await store.uploadBrokenSources(token: giteeToken)
+            // 账本一起传（reports 分支，Muse 每天读报告时一起读到）；账本传失败不影响坏模块的结果。
+            let ledgerResult = await store.uploadLedger(token: giteeToken)
             isReading = false
+            var parts: [String] = []
             switch result {
             case .success(let count):
-                showResultAlert("已上传 \(count) 个坏的模块到码云 broken 分支")
+                parts.append("已上传 \(count) 个坏的模块到码云 broken 分支")
             case .failure(let error):
-                showResultAlert(error.localizedDescription)
+                parts.append(error.localizedDescription)
             }
+            switch ledgerResult {
+            case .success(let file):
+                parts.append("账本已传到 reports 分支（\(file)）")
+            case .failure(let error):
+                parts.append("账本没传上去：\(error.localizedDescription)")
+            }
+            showResultAlert(parts.joined(separator: "；"))
         }
     }
 
