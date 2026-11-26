@@ -3,8 +3,13 @@ import Network
 import Security
 
 /// 无节点 DNS 污染兜底客户端（如 huangguoai.com 系统 DNS 污染到 66.220.147.11）：
-/// 1) 阿里 DoH（223.5.5.5 / 223.6.6.6，直连 IP 字面量 + SNI=dns.alidns.com，
-///    证书按 dns.alidns.com 校验，不走 URLSession）解析真实 A 记录并按 TTL 缓存；
+/// 1) DoH 解析商链（`resolvers` 表，顺序可配）：Google 8.8.8.8/8.8.4.4 →
+///    Cloudflare 1.1.1.1/1.0.0.1 → Ali 223.5.5.5/223.6.6.6 → DNSPod 119.29.29.29，
+///    逐家问、每家 4 秒预算、第一家给有效答案即停；每家直连 IP 字面量 + SNI +
+///    证书按端点域名校验，不走 URLSession、不走系统 DNS；
+///    每家答案先过污染过滤：命中 Meta（Facebook）段即拒掉、记进诊断、问下一家
+///    （DoH 只加密“手机→解析商”一段，解析商上游被污染时 DoH 照样返回假 IP）；
+///    干净 IP 按 TTL 缓存；
 /// 2) NWConnection 直连解析出的 IP，显式设置 TLS SNI = 原域名 + SecPolicyCreateSSL 真验证证书；
 /// 3) 发送 HTTP/1.1（Host: 原域名, Accept-Encoding: identity, Connection: close），支持 chunked 解码与 3xx 跟随；
 /// 4) 一旦某 host 走 DoH 成功即记入偏好表（切网自动清空），后续请求 0 等待直连 DoH IP。
@@ -19,6 +24,73 @@ final class DoHFallbackClient: @unchecked Sendable {
     private let lock = NSLock()
     private var ipCache: [String: CachedIPs] = [:]
     private var preferredHosts: Set<String> = []
+
+    /// DoH 解析商表（顺序 = 询问顺序）：每家一个 JSON API 端点 + 直连 IP 字面量。
+    /// endpointHost 同时是 TLS SNI 与 HTTP Host；path 是 JSON API 路径。
+    /// 顺序说明：Google 放第一——沙箱实测它对 huangguoai.com 返回干净的
+    /// CloudFront IP；Cloudflare 第二（作对照）；Ali 第三（国内可达、但上游
+    /// 可能被污染，污染答案会被拒掉）；DNSPod 第四。
+    /// 解析商主机名↔IP 的映射写死在表里，绝不走系统 DNS 解析（会被污染）。
+    private struct DoHResolver {
+        let name: String
+        let endpointHost: String
+        let path: String
+        let ips: [String]
+    }
+    private static let resolvers: [DoHResolver] = [
+        DoHResolver(name: "Google", endpointHost: "dns.google", path: "/resolve", ips: ["8.8.8.8", "8.8.4.4"]),
+        DoHResolver(name: "Cloudflare", endpointHost: "cloudflare-dns.com", path: "/dns-query", ips: ["1.1.1.1", "1.0.0.1"]),
+        DoHResolver(name: "Ali", endpointHost: "dns.alidns.com", path: "/resolve", ips: ["223.5.5.5", "223.6.6.6"]),
+        DoHResolver(name: "DNSPod", endpointHost: "doh.pub", path: "/dns-query", ips: ["119.29.29.29"]),
+    ]
+    /// 每家 4 秒预算：同一家里的多个 IP 共用这 4 秒（先问的 IP 超时就把
+    /// 剩余时间让给下一个 IP），整条链最坏 16 秒。超过预算即换下一家。
+    private static let resolverTimeoutSeconds: TimeInterval = 4
+
+    /// 污染 IP 段（Meta/Facebook）：系统 DNS 与 AliDoH 在手机网络上都返回过
+    /// 这些段的假 IP（192.133.77.191、157.240.17.35、66.220.147.11），
+    /// TCP 连过去直接黑洞。DoH 答案命中即拒。
+    private static func isPoisonedIP(_ ip: String) -> Bool {
+        let lower = ip.lowercased()
+        if lower.contains(":") {
+            // IPv6：2a03:2880::/32（Facebook 段）。
+            return lower.hasPrefix("2a03:2880:")
+        }
+        let parts = lower.split(separator: ".")
+        guard parts.count == 4,
+              let a = Int(parts[0]), let b = Int(parts[1]), let c = Int(parts[2]) else { return false }
+        if a == 31 && b == 13 { return true }   // 31.13.0.0/16
+        if a == 66 && b == 220 { return true }  // 66.220.0.0/16
+        if a == 157 && b == 240 { return true } // 157.240.0.0/16
+        if a == 192 && b == 133 && c == 77 { return true } // 192.133.77.0/24
+        return false
+    }
+
+    /// 被拒的污染答案记录（诊断用：哪家解析商对哪个 host 给了污染 IP）。
+    struct PoisonRejection: Sendable {
+        let resolver: String
+        let host: String
+        let ip: String
+        let date: Date
+    }
+    private var poisonRejections: [PoisonRejection] = []
+
+    /// 被拒污染答案的快照（诊断/检测 Tab 用；最多保留最近 50 条）。
+    func poisonRejectionsSnapshot() -> [PoisonRejection] {
+        lock.lock()
+        defer { lock.unlock() }
+        return poisonRejections
+    }
+
+    private func recordPoisonRejection(resolver: String, host: String, ip: String) {
+        lock.lock()
+        poisonRejections.append(PoisonRejection(resolver: resolver, host: host, ip: ip, date: Date()))
+        if poisonRejections.count > 50 { poisonRejections.removeFirst(poisonRejections.count - 50) }
+        lock.unlock()
+        #if DEBUG
+        print("[DoH] poisoned IP rejected: \(ip) for \(host) from \(resolver)")
+        #endif
+    }
 
     private init() {}
 
@@ -42,7 +114,7 @@ final class DoHFallbackClient: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// 走阿里 DoH 解析并直连 IP 发 HTTPS 请求（最多跟随 5 次重定向）。
+    /// 走 DoH 解析商链解析并直连 IP 发 HTTPS 请求（最多跟随 5 次重定向）。
     func perform(
         request rawRequest: URLRequest,
         preservedHeaders: [String: String],
@@ -107,8 +179,13 @@ final class DoHFallbackClient: @unchecked Sendable {
         throw URLError(.httpTooManyRedirects)
     }
 
-    // MARK: - 阿里 DoH 解析（223.5.5.5 优先，223.6.6.6 兜底）
+    // MARK: - DoH 解析商链（Google → Cloudflare → Ali → DNSPod，逐家问，第一家给有效答案即停）
 
+    /// 解析 host 的 A 记录：先读 TTL 内的缓存；没有就按 `resolvers` 表逐家问，
+    /// 每家 4 秒预算、第一家给有效答案即停。
+    /// 每家返回的 IP 先过污染过滤：命中 Meta 段的答案拒掉（只留干净的；
+    /// 全污染则问下一家），被拒的记进诊断（`poisonRejectionsSnapshot`）。
+    /// 干净 IP 按答案 TTL 缓存（钳制 [5, 300] 秒，与旧逻辑一致）。
     func resolveIPs(host: String) async -> [String] {
         let key = host.lowercased()
         lock.lock()
@@ -118,32 +195,61 @@ final class DoHFallbackClient: @unchecked Sendable {
         }
         lock.unlock()
 
-        for ip in ["223.5.5.5", "223.6.6.6"] {
-            if let (ips, ttl) = await queryAliDoH(ip: ip, host: host), !ips.isEmpty {
-                let clampedTTL = TimeInterval(min(max(ttl, 5), 300))
-                lock.lock()
-                ipCache[key] = CachedIPs(ips: ips, expiresAt: Date().addingTimeInterval(clampedTTL))
-                lock.unlock()
-                return ips
+        for resolver in Self.resolvers {
+            let houseDeadline = Date().addingTimeInterval(Self.resolverTimeoutSeconds)
+            var houseIPs: [String] = []
+            var houseMinTTL = 180
+            for ip in resolver.ips {
+                let remaining = houseDeadline.timeIntervalSinceNow
+                guard remaining > 0 else { break }
+                let timeout = min(Self.resolverTimeoutSeconds, remaining)
+                guard let (ips, ttl) = await queryDoH(resolver: resolver, ip: ip, host: host, timeout: timeout),
+                      !ips.isEmpty else { continue }
+                houseIPs.append(contentsOf: ips)
+                houseMinTTL = min(houseMinTTL, ttl)
+                break
             }
+            guard !houseIPs.isEmpty else { continue }
+            // 污染过滤：拒掉 Meta 段，只留干净的；全污染则问下一家。
+            var cleanIPs: [String] = []
+            for ip in houseIPs {
+                if Self.isPoisonedIP(ip) {
+                    recordPoisonRejection(resolver: resolver.name, host: host, ip: ip)
+                } else if !cleanIPs.contains(ip) {
+                    cleanIPs.append(ip)
+                }
+            }
+            guard !cleanIPs.isEmpty else { continue }
+            let clampedTTL = TimeInterval(min(max(houseMinTTL, 5), 300))
+            lock.lock()
+            ipCache[key] = CachedIPs(ips: cleanIPs, expiresAt: Date().addingTimeInterval(clampedTTL))
+            lock.unlock()
+            return cleanIPs
         }
         return []
     }
 
-    /// 阿里 DoH 查询：不用 URLSession——直连 DoH 服务商的 IP 字面量
-    ///（223.5.5.5:443 / 223.6.6.6:443），SNI=dns.alidns.com，
-    /// 证书按 dns.alidns.com 校验（URLSession 对 IP 字面量 URL 的证书校验
-    /// 不可控；DoH 查询本身走系统 DNS 解析的话也会被污染）。
-    private func queryAliDoH(ip: String, host: String) async -> ([String], Int)? {
-        guard var comps = URLComponents(string: "https://dns.alidns.com/resolve") else { return nil }
+    /// 对一家解析商做一次 JSON API 查询：不用 URLSession——直连该解析商的
+    /// IP 字面量（`ip`:443），SNI = `resolver.endpointHost`，证书按端点域名校验
+    ///（URLSession 对 IP 字面量 URL 的证书校验不可控；DoH 查询本身走系统 DNS
+    /// 解析的话也会被污染）。
+    /// 注意：JSON API 的查询参数是 name/type；Cloudflare/DNSPod 的 /dns-query
+    /// 同样支持 `?name=&type=` + `Accept: application/dns-json`。
+    /// 只取 A 记录（type == 1），与旧 queryAliDoH 一致——AAAA 未开通，
+    /// 业务侧 perform() 只连 A 记录解析出的 IPv4。
+    private func queryDoH(resolver: DoHResolver, ip: String, host: String, timeout: TimeInterval) async -> ([String], Int)? {
+        var comps = URLComponents()
+        comps.scheme = "https"
+        comps.host = resolver.endpointHost
+        comps.path = resolver.path
         comps.queryItems = [
             URLQueryItem(name: "name", value: host),
             URLQueryItem(name: "type", value: "A")
         ]
         guard let url = comps.url else { return nil }
-        var req = URLRequest(url: url, timeoutInterval: 4)
+        var req = URLRequest(url: url, timeoutInterval: timeout)
         req.setValue("application/dns-json", forHTTPHeaderField: "Accept")
-        guard let (data, http) = try? await fetchSingleHop(url: url, host: "dns.alidns.com", ip: ip, request: req, timeout: 4),
+        guard let (data, http) = try? await fetchSingleHop(url: url, host: resolver.endpointHost, ip: ip, request: req, timeout: timeout),
               (200...299).contains(http.statusCode),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let answers = json["Answer"] as? [[String: Any]] else {
@@ -164,7 +270,10 @@ final class DoHFallbackClient: @unchecked Sendable {
 
     // MARK: - NWConnection + TLS SNI + 真证书校验 + HTTP/1.1
 
-    private func fetchSingleHop(
+    /// 单跳 HTTPS 请求（直连 IP 字面量 + SNI + 真实证书校验 + HTTP/1.1）。
+    /// internal（非 private）：StagedNetworkProbe 的直连 IP 探针复用同一条
+    /// HTTP 栈，探针测的就是业务侧实际走的路径。
+    func fetchSingleHop(
         url: URL,
         host: String,
         ip: String,

@@ -102,44 +102,78 @@ final class CustomPlayerController: ObservableObject {
     private var seekPhase: SeekPhase?
     /// 当前 seek 的目标时间（看门狗重试/重建时复用）。
     private var seekTarget: CMTime = .zero
-    /// 当前 seek 发起时用户是否想播（Stage 1 踢活判断用；最终播不播以 live shouldPlay 为准）。
-    private var seekShouldResume = false
+    /// 本次 seek 实际使用的容差（秒）：completeSeek 的落点校验与踢活窗口都用它。
+    private var seekAppliedToleranceSeconds: Double = 1.0
+    /// 观测到的分片时长（秒）：正常播放时 bufferedEnd 每次跳变的步长；
+    /// 供 seek 容差用（见 seekToleranceSeconds()）。
+    private var observedSegmentDurationSeconds: Double?
+    /// 上次 updateBuffered 记下的缓冲末端（算跳变步长用）。
+    private var lastBufferedEnd: Double = 0
     /// Stage 2 重建 item 后待执行的 seek 尝试次数（非 nil = 正在做 seek 卡死恢复，不是新片）。
     private var pendingSeekRecoveryAttempt: Int?
     /// 前台才计时的 seek 看门狗（DispatchWorkItem；后台暂停计时，回前台续计剩余时间）。
     private var seekWatchdogWorkItem: DispatchWorkItem?
     /// 看门狗到期时刻（ProcessInfo.systemUptime 计），后台时据此算剩余时间。
     private var seekWatchdogDeadline: TimeInterval?
-    /// 看门狗剩余秒数（后台暂停时冻结，start 时重置为 seekTimeoutSeconds）。
+    /// 看门狗剩余秒数（后台暂停时冻结，start 时重置为本次预算）。
     private var seekWatchdogRemaining: TimeInterval = 0
     /// App 是否在前台（seek 看门狗只在前台计时）。
     private var seekAppIsActive = true
     /// 前后台切换监听（seek 看门狗暂停/续计用）。
     private var seekLifecycleObservers: [NSObjectProtocol] = []
-    /// 精确 seek 的前台超时（秒）：超过仍未恢复播放即按两阶段重试（重试 → 重建 item）。
-    private static let seekTimeoutSeconds: TimeInterval = 10
+    /// 看门狗进展基线（seek 发起时采样）与上一次 2 秒采样快照、最近一次
+    /// 观测到进展的时刻（systemUptime）。延长看门狗时拿上一次快照作差分。
+    private var seekProgressBaseline: SeekProgressSnapshot?
+    private var seekPreviousProgressSnapshot: SeekProgressSnapshot?
+    private var seekLastProgressUptime: TimeInterval = 0
+    /// 看门狗已延长次数（仅计数诊断用，不设上限——每次延长都要重新采样，
+    /// 完整一个窗口零推进就不再延长）。
+    private var seekExtensionCount: Int = 0
+    /// 自适应看门狗预算（秒）：按实测 observedBitrate 估算 2 个分片下载 +
+    /// 建连余量，钳制在 [seekMinTimeoutSeconds, seekMaxTimeoutSeconds]；
+    /// 没有 observedBitrate 时默认 seekDefaultTimeoutSeconds。
+    /// 固定 10 秒一刀切已删：慢网上 10 秒必误杀正在下的分片。
+    private static let seekMinTimeoutSeconds: TimeInterval = 22
+    private static let seekDefaultTimeoutSeconds: TimeInterval = 30
+    private static let seekMaxTimeoutSeconds: TimeInterval = 45
+    /// 检测到真实进展时每次延长的秒数（延长时不递增 seekPhaseToken，
+    /// 在途 player.seek 的真实回调必须继续有效）。
+    private static let seekProgressExtensionSeconds: TimeInterval = 10
+    /// 目标已缓冲时 waitingForPlayback 的等待上限（秒）：已缓冲还卡 waiting
+    /// 说明不是下载慢，是起播卡住了，8 秒后踢活/恢复接手。
+    private static let seekBufferedWaitTimeoutSeconds: TimeInterval = 8
     /// Stage 1 playImmediately 踢活的观察窗口（秒）：给异步切到 .playing 留时间，
     /// 绝不紧接着同步重 seek 把踢活打断。
     private static let seekKickGraceSeconds: TimeInterval = 2.5
+    /// seek 回调已回 finished==true、但实际落点不在容差内时的重武间隔（秒）：
+    /// seek 本身已结束，短重武看门狗让踢活/延长/重建尽快接手，不用等满整个预算。
+    private static let seekFarLandingRearmSeconds: TimeInterval = 3.0
     /// 从后台回前台时的最小宽限秒数：避免刚回前台网络/解码器未苏醒就被 0.1 秒剩余时间误杀。
     private static let foregroundResumeMinGraceSeconds: TimeInterval = 3.0
-    /// 精确 seek 的容差（秒）：±1s 让 CoreMedia 落在最近关键帧，不做逐帧精确查找。
-    private static let seekToleranceSeconds: Double = 1.0
-    /// performExactSeek 的 5 秒兜底：seek 回调 5 秒不回就强制 completeSeek
-    ///（CoreMedia 卡住时回调可能永远不来）；completeSeek 里取消它。
-    private var seekCompleteFallbackTask: Task<Void, Never>?
 
-    /// Seek 恢复完整阶段：
-    /// initialSeek -> (finished) waitingForPlayback(1)
-    /// -> (timeout) kickingPlayback（仅已缓冲）-> retrySeek -> waitingForPlayback(2)
-    /// -> waitingForReplacement -> rebuiltSeek -> waitingForPlayback(3) -> 终端。
+    /// Seek 恢复完整阶段（attempt：1 = 首次 seek；2 = 仅 finished==false 时的
+    /// 立刻重试；3 = 重建 item 后的 seek）：
+    /// seeking(1) -> (finished) waitingForPlayback(1)
+    /// -> (看门狗到期) kickingPlayback（仅目标已缓冲）/ 延长 / 重建
+    /// -> waitingForReplacement -> seeking(3) -> waitingForPlayback(3) -> 终端。
     private enum SeekPhase: Equatable {
-        case initialSeek
-        case kickingPlayback
-        case retrySeek
+        case seeking(attempt: Int)
+        case kickingPlayback(attempt: Int)
         case waitingForReplacement
-        case rebuiltSeek
         case waitingForPlayback(attempt: Int)
+    }
+
+    /// AVPlayerItem 可观测的真实进展快照（全为公开 AVFoundation API）：
+    /// accessLog 是按分片完成刷新的累计值，必须自己做差分；
+    /// loadedTimeRanges 在单个分片下载途中纹丝不动、分片完成时才跳变，
+    /// 所以“总时长增长”只能证明“有分片落袋”，不能证明“单片下载中”——
+    /// 单片下载中的唯一保护是按实测网速算出的自适应预算，不是 2 秒采样。
+    private struct SeekProgressSnapshot {
+        let totalBytesTransferred: Int64
+        let totalMediaRequests: Int
+        let bufferedDuration: Double
+        let bufferedNearTarget: Double
+        let errorLogCount: Int
     }
 
     private var timeObserver: Any?
@@ -207,7 +241,6 @@ final class CustomPlayerController: ObservableObject {
         hideTask?.cancel()
         stallKickTask?.cancel()
         capLiftTask?.cancel()
-        seekCompleteFallbackTask?.cancel()
         seekWatchdogWorkItem?.cancel()
         for observer in seekLifecycleObservers {
             NotificationCenter.default.removeObserver(observer)
@@ -422,10 +455,9 @@ final class CustomPlayerController: ObservableObject {
                     // 不管是不是重建恢复，代际号都要 +1：重建恢复不 +1 时，
                     // 重建前那次 seek 的旧回调还能对上号、误触 completeSeek。
                     seekGeneration &+= 1
-                    performExactSeek(
+                    performSeek(
                         to: resumeAt,
-                        shouldResume: shouldPlay,
-                        phase: recoveryAttempt != nil ? .rebuiltSeek : .initialSeek
+                        phase: .seeking(attempt: recoveryAttempt ?? 1)
                     )
                 } else if shouldPlay {
                     player.play()
@@ -471,7 +503,7 @@ final class CustomPlayerController: ObservableObject {
                 switch phase {
                 case .waitingForPlayback, .kickingPlayback:
                     playbackDidBecomeActive()
-                case .initialSeek, .retrySeek, .waitingForReplacement, .rebuiltSeek:
+                case .seeking, .waitingForReplacement:
                     break
                 }
             }
@@ -587,11 +619,13 @@ final class CustomPlayerController: ObservableObject {
                     handleItemFailure(item)
                 }
             }
-            // 每 2 秒采一次 accessLog（8 次 × 0.25 秒）。
+            // 每 2 秒采一次 accessLog（8 次 × 0.25 秒），同时采 seek 进展
+            //（只在前台走，切后台冻结，与看门狗一致）。
             accessLogSampleCount += 1
             if accessLogSampleCount >= 8 {
                 accessLogSampleCount = 0
                 sampleAccessLog(item)
+                sampleSeekProgress(item)
             }
         }
     }
@@ -605,6 +639,7 @@ final class CustomPlayerController: ObservableObject {
         let ranges = item.loadedTimeRanges.map(\.timeRangeValue)
         guard !ranges.isEmpty else {
             bufferedEnd = 0
+            lastBufferedEnd = 0
             return
         }
         // 优先取包含当前播放点的区间（seek 后缓冲段会变），没有才取最后一段；
@@ -617,6 +652,16 @@ final class CustomPlayerController: ObservableObject {
             let end = CMTimeAdd(last.start, last.duration).seconds
             if end.isFinite { bufferedEnd = end }
         }
+        // 正常播放时缓冲末端的跳变步长 ≈ 一个分片时长（HLS 按完整分片提交区间）：
+        // 只在非 seek/非拖动时采，跳变在 2–12 秒内才认（一次来两片会跳 16 秒以上，
+        // 那不是单片时长，不采）。供 seek 容差用；采不到就走时长默认值。
+        if !isSeekingInFlight && !isScrubbing, lastBufferedEnd > 0 {
+            let jump = bufferedEnd - lastBufferedEnd
+            if jump >= 2.0 && jump <= 12.0 {
+                observedSegmentDurationSeconds = jump
+            }
+        }
+        lastBufferedEnd = bufferedEnd
     }
 
     /// 播失败只认一次（同一条 URL）：KVO .failed 和失败通知可能先后都到，
@@ -698,7 +743,7 @@ final class CustomPlayerController: ObservableObject {
             switch phase {
             case .waitingForPlayback, .kickingPlayback:
                 invalidateSeekOperation()
-            case .initialSeek, .retrySeek, .waitingForReplacement, .rebuiltSeek:
+            case .seeking, .waitingForReplacement:
                 break
             }
         }
@@ -741,8 +786,8 @@ final class CustomPlayerController: ObservableObject {
         currentTime = clamped
     }
 
-    /// 3. 松手：发出唯一一次精确（±1s）seek，仅在 seek 完成且用户仍想播时 play()，
-    /// 并挂前台 10 秒看门狗（Stage 1 取消并重 seek；Stage 2 重建 AVPlayerItem 刷新 CoreMedia/mediaserverd 状态）。
+    /// 3. 松手：发出唯一一次精确 seek（自适应容差），仅在 seek 完成且用户仍想播时 play()，
+    /// 并挂前台自适应预算看门狗（目标已缓冲先踢活；预算耗尽 + 完整窗口零推进才重建 item）。
     /// 若 item 仍在重建（.unknown）则更新 pendingResumeAt，等就绪后跳到最新目标，不丢用户操作；
     /// item 已 .failed 则重建 item 到目标时间。
     func endScrub(to seconds: Double) {
@@ -761,7 +806,7 @@ final class CustomPlayerController: ObservableObject {
         switch item.status {
         case .readyToPlay:
             seekGeneration &+= 1
-            performExactSeek(to: target, shouldResume: resume, phase: .initialSeek)
+            performSeek(to: target, phase: .seeking(attempt: 1))
         case .unknown:
             pendingResumeAt = target
             pendingSeekRecoveryAttempt = nil
@@ -776,37 +821,40 @@ final class CustomPlayerController: ObservableObject {
         }
     }
 
-    /// 执行单次串行精确 seek（±1s 容差 + 代际号/阶段令牌防旧回调 + 前台 10 秒两阶段看门狗）。
+    /// 执行单次串行精确 seek（自适应容差 + 代际号/阶段令牌防旧回调 +
+    /// 前台自适应预算看门狗 + 2 秒进展采样）。
     /// 单一 seek 入口：除片尾复位外，所有 AVPlayer.seek 都走这里。
-    /// 另起一个 5 秒兜底 Task：seek 回调 5 秒不回（CoreMedia 卡住）就强制 completeSeek，
-    /// 由 waitingForPlayback 的 10 秒看门狗继续接管恢复链；completeSeek 里取消它。
-    private func performExactSeek(to targetTime: CMTime, shouldResume: Bool, phase: SeekPhase) {
+    /// 没有 5 秒兜底 Task：seek 回调 5 秒不回时强制 completeSeek 是本次
+    /// 事故的根因之一——它用 player.currentTime() 发布的陈旧时间把进度条
+    /// 打回旧位置，还会把未落点的 item 强制 play() 回 0:00；
+    /// 回调不回时由看门狗 + 进展采样接管（延长/重建），不伪造完成。
+    private func performSeek(to targetTime: CMTime, phase: SeekPhase) {
         let operation = seekGeneration
         seekPhaseToken &+= 1
         let token = seekPhaseToken
         seekPhase = phase
         seekTarget = targetTime
-        seekShouldResume = shouldResume
+        seekAppliedToleranceSeconds = seekToleranceSeconds()
         isSeekingInFlight = true
         isLoading = true
 
-        player.currentItem?.cancelPendingSeeks()
-
-        startSeekWatchdog(operation: operation, token: token, timeout: Self.seekTimeoutSeconds)
-
-        seekCompleteFallbackTask?.cancel()
-        seekCompleteFallbackTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
-            guard let self, !Task.isCancelled else { return }
-            guard self.seekGeneration == operation,
-                  self.seekPhaseToken == token,
-                  self.isSeekingInFlight,
-                  self.seekPhase == phase,
-                  !self.isScrubbing else { return }
-            self.completeSeek(operation: operation, fromPhase: phase)
+        // cancelPendingSeeks 只在新用户操作（attempt 1）时调用：
+        // 重试（attempt 2）与重建后（attempt 3）路径不取消——
+        // 前者回调已回、无在途 seek；后者是全新 item、无旧 seek 可取。
+        if case .seeking(attempt: 1) = phase {
+            player.currentItem?.cancelPendingSeeks()
         }
 
-        let tolerance = CMTime(seconds: Self.seekToleranceSeconds, preferredTimescale: 600)
+        // 看门狗基线：seek 发起时采样，供进展判断作起点；
+        // 最近进展时刻初值 = 发起时刻（此后 2 秒采样发现增长才刷新）。
+        seekProgressBaseline = captureProgressSnapshot()
+        seekPreviousProgressSnapshot = seekProgressBaseline
+        seekLastProgressUptime = ProcessInfo.processInfo.systemUptime
+        seekExtensionCount = 0
+
+        startSeekWatchdog(operation: operation, token: token, timeout: adaptiveSeekTimeout())
+
+        let tolerance = CMTime(seconds: seekAppliedToleranceSeconds, preferredTimescale: 600)
         player.seek(to: targetTime, toleranceBefore: tolerance, toleranceAfter: tolerance) { [weak self] finished in
             Task { @MainActor [weak self] in
                 guard let self,
@@ -818,32 +866,48 @@ final class CustomPlayerController: ObservableObject {
                 if finished {
                     self.completeSeek(operation: operation, fromPhase: phase)
                 } else {
-                    self.advanceSeekRecovery(operation: operation, phase: phase, reason: "Seek completion returned false")
+                    self.handleSeekReturnedFalse(operation: operation, phase: phase)
                 }
             }
         }
     }
 
-    /// 一次精确 seek 成功落点：上报实际落点时间；播不播以 live shouldPlay 为准
-    ///（用户在 seek 中途点暂停/播放都以最新意图为准）。
+    /// seek 真实回调 finished==true：只在落点在自适应容差内时才发布 actual；
+    /// 落点离目标超过容差（远落点）时不切换阶段、不调 player.play()、
+    /// 不发布 actual——currentTime 保持 seekTarget，进度条锁在目标不动，
+    /// 只重武当前阶段的看门狗（3 秒），让踢活/延长/重建尽快接手。
+    /// 播不播以 live shouldPlay 为准（用户在 seek 中途点暂停/播放都以最新意图为准）。
     /// 若用户仍想播，切到 .waitingForPlayback 并保持看门狗运行直到 timeControlStatus
-    /// 真正进入 .playing（play() 后若卡在 waiting，看门狗 10 秒后按阶段升级兜底）。
+    /// 真正进入 .playing（play() 后若卡在 waiting，看门狗按阶段升级兜底）。
     private func completeSeek(operation: UInt64, fromPhase: SeekPhase) {
-        seekCompleteFallbackTask?.cancel()
-        seekCompleteFallbackTask = nil
         let actual = player.currentTime()
+        let tol = seekAppliedToleranceSeconds
+        let landedNearTarget: Bool
+        if actual.isNumeric, actual.seconds.isFinite {
+            landedNearTarget = abs(actual.seconds - seekTarget.seconds) <= tol
+        } else {
+            landedNearTarget = false
+        }
+        guard landedNearTarget else {
+            // 远落点：不发布 actual、不切换阶段、不 play()。
+            // currentTime 保持 seekTarget（进度条锁在目标），
+            // 短重武 3 秒看门狗：seek 本身已结束，尽快让踢活/延长/重建接手。
+            #if DEBUG
+            print("[Seek] far landing: actual=\(actual.seconds) target=\(seekTarget.seconds) tol=\(tol), re-arming watchdog")
+            #endif
+            stopSeekWatchdog()
+            seekWatchdogRemaining = Self.seekFarLandingRearmSeconds
+            scheduleSeekWatchdog(operation: operation, token: seekPhaseToken)
+            return
+        }
+        // 落点在容差内：发布 actual（与目标差 ≤ 容差，进度条不跳变）。
         if actual.isNumeric {
             currentTime = actual.seconds
         } else {
             currentTime = seekTarget.seconds
         }
         if shouldPlay && !isScrubbing {
-            let attempt: Int
-            switch fromPhase {
-            case .rebuiltSeek: attempt = 3
-            case .retrySeek: attempt = 2
-            default: attempt = 1
-            }
+            let attempt = attempt(of: fromPhase)
             seekPhaseToken &+= 1
             let token = seekPhaseToken
             seekPhase = .waitingForPlayback(attempt: attempt)
@@ -853,13 +917,36 @@ final class CustomPlayerController: ObservableObject {
             if player.timeControlStatus == .playing {
                 playbackDidBecomeActive()
             } else {
-                startSeekWatchdog(operation: operation, token: token, timeout: Self.seekTimeoutSeconds)
+                // 重建后 seek（attempt 3）：目标分片在重建前已确认下载过，
+                // 落点后等起播的上限是 8 秒——已缓冲还卡 waiting 说明是起播卡住，
+                // 不是下载慢，8 秒后踢活/恢复接手。
+                // 初次/重试 seek：落点后等起播用自适应预算（目标分片可能还在下）。
+                let timeout = attempt == 3 ? Self.seekBufferedWaitTimeoutSeconds : adaptiveSeekTimeout()
+                startSeekWatchdog(operation: operation, token: token, timeout: timeout)
             }
         } else {
             isSeekingInFlight = false
             seekPhase = nil
             stopSeekWatchdog()
             isLoading = false
+        }
+    }
+
+    /// seek 真实回调 finished==false：只重试一次（attempt 1 -> 2），
+    /// 不取消、不重建——finished==false 只是这次 seek 被取消/打断，
+    /// 不是卡死；卡死的恢复只走看门狗到期。
+    private func handleSeekReturnedFalse(operation: UInt64, phase: SeekPhase) {
+        guard operation == seekGeneration,
+              isSeekingInFlight,
+              seekPhase == phase else { return }
+        if case let .seeking(attempt: attempt) = phase, attempt == 1 {
+            performSeek(to: seekTarget, phase: .seeking(attempt: 2))
+        } else {
+            // attempt 2/3 回 false：不再重试，等在途看门狗到期接管
+            //（重试路径不取消，旧看门狗继续跑）。
+            #if DEBUG
+            print("[Seek] seek returned false on \(phase), watchdog continues")
+            #endif
         }
     }
 
@@ -876,78 +963,111 @@ final class CustomPlayerController: ObservableObject {
     private func invalidateSeekOperation() {
         seekGeneration &+= 1
         seekPhaseToken &+= 1
-        seekCompleteFallbackTask?.cancel()
-        seekCompleteFallbackTask = nil
         stopSeekWatchdog()
         player.currentItem?.cancelPendingSeeks()
         isSeekingInFlight = false
         seekPhase = nil
     }
 
-    /// 两阶段 seek 卡死恢复（每阶段限一次）：
-    /// Stage 1（初次 10s 超时）：目标时间已在缓冲内先 playImmediately 踢活，
-    /// 给 2.5 秒异步观察窗（绝不紧接着同步重 seek 把踢活打断），再重发一次精确 seek；
-    /// Stage 2（重试 10s 超时）：重建 AVPlayerItem（等价于切后台再回前台，清空卡死的 CoreMedia 队列与 mediaserverd 连接），就绪后定位到目标时间；
-    /// 终端（重建后 seek 仍失败，或重建 item 未就绪）：停播并报 DEBUG，不再无限循环。
+    /// 看门狗到期时的恢复（按当前事实决策，不按固定次数）：
+    /// 1) 目标已缓冲 → 踢活（窗口化判定，2.5 秒异步观察窗）；
+    ///    已在踢活阶段且踢活没起效 → 不再重复踢活，直接进重建/终结。
+    /// 2) 目标未缓冲、但最近 4 秒内有真实进展（分片刚落袋）→ 延长 10 秒，
+    ///    不递增 seekPhaseToken（在途 player.seek 的真实回调继续有效），
+    ///    延长次数不限——每次到期都重新判断，完整窗口零推进才进重建。
+    /// 3) 目标未缓冲且完整窗口零推进 → 重建 item（仅一次）或终结。
+    /// 注意：延长看的是“最近进展时刻”（2 秒采样刷新），不是“上一快照”——
+    /// loadedTimeRanges/accessLog 只在分片完成时刷新，单个分片下载途中
+    /// 纹丝不动；单片下载中的保护是自适应预算本身，不是 2 秒采样。
     private func advanceSeekRecovery(operation: UInt64, phase: SeekPhase, reason: String) {
         guard operation == seekGeneration,
               isSeekingInFlight,
               seekPhase == phase else { return }
         stopSeekWatchdog()
-        switch phase {
-        case .initialSeek, .waitingForPlayback(attempt: 1):
-            // 若目标已在缓冲内，先 playImmediately 踢活并给 2.5s 异步观察窗，
-            // 绝不紧接着同步重 seek 把踢活打断。
-            if seekShouldResume && shouldPlay && isTimeBuffered(seekTarget) {
-                seekPhaseToken &+= 1
-                let token = seekPhaseToken
-                seekPhase = .kickingPlayback
-                player.playImmediately(atRate: 1.0)
-                if player.timeControlStatus == .playing {
-                    playbackDidBecomeActive()
-                } else {
-                    startSeekWatchdog(operation: operation, token: token, timeout: Self.seekKickGraceSeconds)
-                }
-                return
-            }
-            performExactSeek(to: seekTarget, shouldResume: shouldPlay, phase: .retrySeek)
-        case .kickingPlayback:
-            performExactSeek(to: seekTarget, shouldResume: shouldPlay, phase: .retrySeek)
-        case .retrySeek, .waitingForPlayback(attempt: 2):
-            guard let url = lastURL else {
-                failSeek("Seek stalled and no URL to rebuild: \(reason)")
+
+        // 暂停态：绝不触发重 seek/重建/踢活——直接作废这次 seek（停在当前位置，
+        // 不清 shouldPlay、不暂停播放器；用户再点播放就从当前位置播，不挂死）。
+        // 正常播放态才进下面的踢活/延长/重建。
+        // 注意：pauseByUser 只在 .waitingForPlayback/.kickingPlayback 作废，
+        // .seeking 阶段用户点暂停时 seek 还在途，所以这里必须再拦一道。
+        guard shouldPlay else {
+            #if DEBUG
+            print("[Seek] watchdog expired while paused (\(reason)), abandoning seek")
+            #endif
+            invalidateSeekOperation()
+            return
+        }
+
+        // 1. 目标已缓冲 → 踢活（窗口化判定：缓冲区间与 [目标±容差] 相交即算）。
+        let attempt = attempt(of: phase)
+        if shouldPlay, isTimeBufferedNear(seekTarget) {
+            // 已在踢活阶段且踢活没起效：不再重复踢活，直接进重建/终结。
+            if case .kickingPlayback = phase {
+                rebuildOrFailSeek(operation: operation, attempt: attempt, reason: reason)
                 return
             }
             seekPhaseToken &+= 1
             let token = seekPhaseToken
-            seekPhase = .waitingForReplacement
-            pendingSeekRecoveryAttempt = 3
-            let loader = (lastEngine == .nativeIntercepted) ? (activeResourceLoader ?? viewModel.resourceLoader) : nil
-            replaceItem(
-                url,
-                headers: lastHeaders,
-                resumeAt: seekTarget,
-                resourceLoader: loader,
-                preserveSeekRecovery: true
-            )
-            // 重建 item 的就绪窗口也用前台 10 秒看门狗兜底。
-            startSeekWatchdog(operation: operation, token: token, timeout: Self.seekTimeoutSeconds)
-        case .waitingForReplacement:
-            failSeek("Replacement item did not become ready: \(reason)")
-        case .rebuiltSeek, .waitingForPlayback(attempt: 3):
-            failSeek("Seek failed after item rebuild: \(reason)")
-        case .waitingForPlayback:
-            // 防御：attempt 只会是 1/2/3（见文件头流程注释），走到这里
-            // 说明流程出了预期外的值，干净地终结这次 seek，不无限重试。
-            failSeek("Seek failed in unexpected waitingForPlayback phase: \(reason)")
+            seekPhase = .kickingPlayback(attempt: attempt)
+            player.playImmediately(atRate: 1.0)
+            if player.timeControlStatus == .playing {
+                playbackDidBecomeActive()
+            } else {
+                startSeekWatchdog(operation: operation, token: token, timeout: Self.seekKickGraceSeconds)
+            }
+            return
         }
+
+        // 2. 最近 4 秒内有真实进展（分片刚落袋）→ 延长 10 秒，不递增 token。
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - seekLastProgressUptime <= 4.0 {
+            seekExtensionCount += 1
+            #if DEBUG
+            print("[Seek] progress observed (\(reason)), extending watchdog +10s (count=\(seekExtensionCount))")
+            #endif
+            seekWatchdogRemaining = Self.seekProgressExtensionSeconds
+            scheduleSeekWatchdog(operation: operation, token: seekPhaseToken)
+            return
+        }
+
+        // 3. 目标未缓冲且完整窗口零推进 → 重建（仅一次）或终结。
+        rebuildOrFailSeek(operation: operation, attempt: attempt, reason: reason)
+    }
+
+    /// 重建 item（仅一次）或终结：attempt < 3 → 重建；
+    /// 已是 attempt 3（重建后）→ failSeek。
+    /// 重建的前提是“预算已耗尽 + 完整窗口零推进 + 踢活已失败”
+    ///（调用方 advanceSeekRecovery 已做完踢活/延长判断，这里只看 attempt）。
+    /// 重建 item 也挂进展采样看门狗（handleItemStatus 就绪后 performSeek
+    /// 会重建基线并重武自适应预算；就绪窗口内未就绪则 failSeek）。
+    private func rebuildOrFailSeek(operation: UInt64, attempt: Int, reason: String) {
+        guard attempt < 3 else {
+            failSeek("Seek failed after item rebuild: \(reason)")
+            return
+        }
+        guard let url = lastURL else {
+            failSeek("Seek stalled and no URL to rebuild: \(reason)")
+            return
+        }
+        seekPhaseToken &+= 1
+        let token = seekPhaseToken
+        seekPhase = .waitingForReplacement
+        pendingSeekRecoveryAttempt = 3
+        let loader = (lastEngine == .nativeIntercepted) ? (activeResourceLoader ?? viewModel.resourceLoader) : nil
+        replaceItem(
+            url,
+            headers: lastHeaders,
+            resumeAt: seekTarget,
+            resourceLoader: loader,
+            preserveSeekRecovery: true
+        )
+        // 重建 item 的就绪窗口也用前台自适应预算看门狗兜底。
+        startSeekWatchdog(operation: operation, token: token, timeout: adaptiveSeekTimeout())
     }
 
     /// Seek 终端失败：停看门狗、取消待处理 seek、停播、清意图，不再重试。
     /// 原因只打 DEBUG 日志（不弹用户可见报错，用户点播放可重试）。
     private func failSeek(_ reason: String) {
-        seekCompleteFallbackTask?.cancel()
-        seekCompleteFallbackTask = nil
         stopSeekWatchdog()
         player.currentItem?.cancelPendingSeeks()
         player.pause()
@@ -965,9 +1085,146 @@ final class CustomPlayerController: ObservableObject {
         #endif
     }
 
-    private func isTimeBuffered(_ time: CMTime) -> Bool {
-        guard let ranges = player.currentItem?.loadedTimeRanges else { return false }
-        return ranges.contains { $0.timeRangeValue.containsTime(time) }
+    /// 窗口化缓冲判定：任一缓冲区间与 [目标 − 容差, 目标 + 容差] 相交即算
+    /// 目标已缓冲（旧 containsTime(目标) 在容差下会误判：落点可以不在目标点上，
+    /// 只要在容差窗内就算落点有效、缓冲有效）。
+    private func isTimeBufferedNear(_ time: CMTime) -> Bool {
+        guard let ranges = player.currentItem?.loadedTimeRanges, !ranges.isEmpty else { return false }
+        let tol = seekAppliedToleranceSeconds
+        let windowStart = max(0, time.seconds - tol)
+        let windowEnd = time.seconds + tol
+        return ranges.contains { value in
+            let range = value.timeRangeValue
+            let start = range.start.seconds
+            let duration = range.duration.seconds
+            guard start.isFinite, duration.isFinite else { return false }
+            return start <= windowEnd && start + duration >= windowStart
+        }
+    }
+
+    /// [目标 − 容差, 目标 + 容差] 窗口内已缓冲的秒数（进展快照用）。
+    private func bufferedForwardSecondsNear(_ time: CMTime) -> Double {
+        guard let ranges = player.currentItem?.loadedTimeRanges else { return 0 }
+        let tol = seekAppliedToleranceSeconds
+        let windowStart = max(0, time.seconds - tol)
+        let windowEnd = time.seconds + tol
+        return ranges.reduce(0.0) { partial, value in
+            let range = value.timeRangeValue
+            let start = range.start.seconds
+            let duration = range.duration.seconds
+            guard start.isFinite, duration.isFinite else { return partial }
+            let overlapStart = max(start, windowStart)
+            let overlapEnd = min(start + duration, windowEnd)
+            return partial + max(0, overlapEnd - overlapStart)
+        }
+    }
+
+    /// 取 SeekPhase 的 attempt（1 = 首次 seek；2 = finished==false 的立刻重试；
+    /// 3 = 重建 item 后的 seek；.waitingForReplacement 正在等重建，算 3）。
+    private func attempt(of phase: SeekPhase) -> Int {
+        switch phase {
+        case .seeking(let attempt), .kickingPlayback(let attempt), .waitingForPlayback(let attempt):
+            return attempt
+        case .waitingForReplacement:
+            return 3
+        }
+    }
+
+    /// seek 容差与预算共用的分片时长（秒），来源链：
+    /// 1) 拦截器解析到的播单 #EXT-X-TARGETDURATION（最准）；
+    /// 2) 正常播放时观测到的 loadedTimeRanges 跳变步长；
+    /// 3) 时长 > 60 秒的长视频默认 8.34 秒（memojav 实测）、短视频默认 2 秒。
+    private func seekSegmentDurationSeconds() -> Double {
+        if let targetDuration = viewModel.resourceLoader?.targetDurationSeconds, targetDuration > 0 {
+            return targetDuration
+        }
+        if let observed = observedSegmentDurationSeconds, observed > 0 {
+            return observed
+        }
+        return duration > 60 ? 8.34 : 2.0
+    }
+
+    /// 自适应 seek 容差：长视频（> 60 秒）= 分片时长/2 + 0.5 秒
+    ///（8.34 秒分片 → 4.5 秒，覆盖“落点在段首、目标在段内”的情况）；
+    /// 短视频 = 1.0 秒。容差太小（±1 秒）等于零容差：
+    /// 8.34 秒分片里只有约 24% 的目标落在段首 ±1 秒内（2/8.34）。
+    private func seekToleranceSeconds() -> Double {
+        guard duration > 60 else { return 1.0 }
+        return seekSegmentDurationSeconds() / 2.0 + 0.5
+    }
+
+    /// 自适应看门狗预算：2 个分片的下载时间 + 建连余量 8 秒，钳制 [22, 45]。
+    /// 单分片下载时间 = 分片时长 × (媒体码率 / 实测网速)：实测网速是 accessLog
+    /// 最近一次事件的 observedBitrate（网络侧实测吞吐），媒体码率是同一事件的
+    /// indicatedBitrate。网速 ≥ 媒体码率时 1 个分片 ≤ 1 个分片时长；
+    /// 网速只有媒体码率一半时 1 个分片要 2 个分片时长——预算跟着实测走。
+    /// 没有 observedBitrate（还没播过、accessLog 为空）或 ≤ 50_000 bps 时默认 30 秒。
+    /// 依据：memojav 沙箱实测——远 seek 只需 1 个 2.2 MB 分片（~4 秒纯网络），
+    /// 慢手机上 10–20 秒是正常慢、不是卡死；固定 10 秒必误杀。
+    private func adaptiveSeekTimeout() -> TimeInterval {
+        guard let event = player.currentItem?.accessLog()?.events.last,
+              event.observedBitrate.isFinite, event.observedBitrate > 50_000,
+              event.indicatedBitrate.isFinite, event.indicatedBitrate > 0 else {
+            return Self.seekDefaultTimeoutSeconds
+        }
+        let segment = seekSegmentDurationSeconds()
+        let ratio = event.indicatedBitrate / event.observedBitrate
+        let budget = 2.0 * segment * ratio + 8.0
+        return min(max(budget, Self.seekMinTimeoutSeconds), Self.seekMaxTimeoutSeconds)
+    }
+
+    /// 采样当前可观测进展（公开 AVFoundation API；resourceLoader 字节
+    /// 对 native/.nativeIntercepted 不可见，不作判据）：
+    /// - accessLog 累计字节/事件数（分片完成时刷新，须做差分）；
+    /// - loadedTimeRanges 总缓冲时长（分片完成时跳变）；
+    /// - 目标附近缓冲时长（踢活“目标分片已落地、缓冲末端逼近目标”的信号）；
+    /// - errorLog 条数（真故障信号：条数增加说明 item 在报错，不是下载慢）。
+    private func captureProgressSnapshot() -> SeekProgressSnapshot {
+        let item = player.currentItem
+        let log = item?.accessLog()
+        let totalBytes = log?.events.reduce(into: Int64(0)) { partial, event in
+            partial += event.numberOfBytesTransferred
+        } ?? 0
+        let bufferedTotal = item?.loadedTimeRanges.reduce(0.0) { partial, value in
+            let range = value.timeRangeValue
+            let duration = range.duration.seconds
+            return partial + (duration.isFinite ? duration : 0)
+        } ?? 0
+        let errorCount = item?.errorLog()?.events.count ?? 0
+        return SeekProgressSnapshot(
+            totalBytesTransferred: totalBytes,
+            totalMediaRequests: log?.events.count ?? 0,
+            bufferedDuration: bufferedTotal,
+            bufferedNearTarget: bufferedForwardSecondsNear(seekTarget),
+            errorLogCount: errorCount
+        )
+    }
+
+    /// 两次快照之间是否有真实进展（任一信号增长即算）：
+    /// loadedTimeRanges 总时长、accessLog 累计字节/事件数、目标附近缓冲。
+    /// errorLog 条数增加不算进展——那是真故障信号（调用方据此可直接进恢复，
+    /// 这里只返回“无进展”，让恢复链接手）。
+    private func hasSeekProgress(since previous: SeekProgressSnapshot, current: SeekProgressSnapshot) -> Bool {
+        current.bufferedDuration > previous.bufferedDuration
+            || current.totalBytesTransferred > previous.totalBytesTransferred
+            || current.totalMediaRequests > previous.totalMediaRequests
+            || current.bufferedNearTarget > previous.bufferedNearTarget
+    }
+
+    /// 2 秒进展采样（handlePeriodicTime 每 2 秒调一次，仅前台）：
+    /// 任一信号增长就刷新“最近进展时刻”；快照每次都更新作下轮差分基线。
+    /// 注意：loadedTimeRanges/accessLog 只在分片完成时刷新，单个分片下载途中
+    /// 纹丝不动——所以采样只能证明“有分片落袋”，不能证明“单片下载中”；
+    /// 单片下载中的唯一保护是按实测网速算出的自适应预算，不是 2 秒采样。
+    private func sampleSeekProgress(_ item: AVPlayerItem) {
+        guard isSeekingInFlight, seekPhase != nil else { return }
+        guard seekAppIsActive else { return }
+        guard let previous = seekPreviousProgressSnapshot ?? seekProgressBaseline else { return }
+        let current = captureProgressSnapshot()
+        if hasSeekProgress(since: previous, current: current) {
+            seekLastProgressUptime = ProcessInfo.processInfo.systemUptime
+        }
+        seekPreviousProgressSnapshot = current
     }
 
     // MARK: - Seek 看门狗（只在前台计时）

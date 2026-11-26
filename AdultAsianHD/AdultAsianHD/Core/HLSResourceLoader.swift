@@ -121,6 +121,10 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     /// 最近一次失败的分层与状态码（供 markFailed 组分层错误上报，Fix C 的自检复用）。
     private(set) var lastFailureStage: PlaybackFailureStage?
     private(set) var lastFailureStatusCode: Int?
+    /// 播单里见过的 #EXT-X-TARGETDURATION（秒）：seek 容差/看门狗预算的
+    /// 分片时长来源 1（最准）。rewritePlaylist 逐行改写时顺带记录；
+    /// 变体播单与媒体播单都可能带它，取最后一次见到的值。
+    private(set) var targetDurationSeconds: Double?
 
     /// headers：已合并好的子请求头（iPhone UA + Referer + 模块自定义头 + Cookie）。
     init(headers: [String: String], cookie: String?) {
@@ -347,6 +351,14 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
         var out: [String] = []
         out.reserveCapacity(lines.count)
         for line in lines {
+            // 分片时长：seek 容差/看门狗预算用（见 CustomPlayerView.seekSegmentDurationSeconds）。
+            if line.hasPrefix("#EXT-X-TARGETDURATION:") {
+                let value = line.dropFirst("#EXT-X-TARGETDURATION:".count)
+                    .trimmingCharacters(in: .whitespaces)
+                if let seconds = Double(value), seconds > 0 {
+                    targetDurationSeconds = seconds
+                }
+            }
             if line.hasPrefix("#EXT-X-KEY"), let uri = extractURIValue(from: line) {
                 let absolute = absoluteURL(uri, base: baseURL)
                 if absolute.scheme == "skd" || absolute.scheme == "skds" {

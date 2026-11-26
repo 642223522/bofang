@@ -4,8 +4,9 @@ import Security
 import WebKit
 
 /// 真机网络探针（Gemini v2 staged probe，改写成回结构化结果供 检测 Tab 展示）：
-/// 对给定 host 跑：系统 DNS / 两家 DoH（A/AAAA/HTTPS）→ NWConnection 分段建连
+/// 对给定 host 跑：系统 DNS / 六家 DoH（A/AAAA/HTTPS）→ NWConnection 分段建连
 /// （hostname / IPv4 字面量 / IPv6 字面量，带 EstablishmentReport）→
+/// 直连 IP 探针（目标站的沙箱验证 CloudFront IP + SNI + 真实证书校验 + HTTP GET /）→
 /// URLSession 三档对照（默认 H3 / 禁 H3 / 裸头）→ 干净 WKWebView 同 URL 探针。
 /// 不强制 IPv4（NAT64 安全），不改 UA、不注脚本、不碰挑战流程，只观测。
 /// 每个子探针都有超时；整轮跑在后台 Task 里，取消即停、结果分段回填 UI。
@@ -37,12 +38,58 @@ final class StagedNetworkProbe: NSObject {
         let name: String
         let apiURL: URL
         let embedURL: URL?
+        /// 额外要探的 host（onlybokep 的嵌页域名：playmogo/doodstream，
+        /// 定位白屏是嵌页域不通还是预热/Cookie 未同步）。
+        let extraHosts: [String]
+        /// 直连 IP 探针：IP 字面量（对应 apiURL host），NWConnection 直连 IP +
+        /// SNI=host + 真实证书校验，再 HTTP GET /，记总耗时 + 状态码。
+        /// IP 失败就如实上报，绝不悄悄换 IP。
+        let directIPs: [String]
+
+        init(name: String, apiURL: URL, embedURL: URL? = nil, extraHosts: [String] = [], directIPs: [String] = []) {
+            self.name = name
+            self.apiURL = apiURL
+            self.embedURL = embedURL
+            self.extraHosts = extraHosts
+            self.directIPs = directIPs
+        }
     }
 
     /// 默认跑的两个站（无节点时列表/播放都失败的站；pornjav 直连能播，不用探）。
     static let defaultTargets: [ProbeTarget] = [
-        ProbeTarget(name: "黄果", apiURL: URL(string: "https://huangguoai.com")!, embedURL: nil),
-        ProbeTarget(name: "onlybokep", apiURL: URL(string: "https://onlybokep.cam")!, embedURL: nil),
+        ProbeTarget(
+            name: "黄果",
+            apiURL: URL(string: "https://huangguoai.com")!,
+            embedURL: nil,
+            // 沙箱验证过的 CloudFront IP 快照（2026-11-26）：13.35.130.20 与
+            // 99.86.101.99 当时都能直连并返回真实首页；CloudFront IP 轮换快
+            //（TTL 仅 10–30 秒），探针失败只说明“该快照 IP 已轮换/不通”，
+            // 不是业务故障——以 DoH 行给出的当前 IP 为准。
+            directIPs: ["13.35.130.20", "99.86.101.99"]
+        ),
+        ProbeTarget(
+            name: "onlybokep",
+            apiURL: URL(string: "https://onlybokep.cam")!,
+            embedURL: nil,
+            extraHosts: ["playmogo.com", "doodstream.com"]
+        ),
+    ]
+
+    /// DoH 解析商（JSON API，IP 字面量端点，不走系统 DNS；每家 4 秒超时）：
+    /// Google 与 Ali 用 /resolve（JSON API）；Cloudflare/DNSPod/360/114DNS 用
+    /// /dns-query + Accept: application/dns-json。
+    /// 注意：规范里 Google 写的是 8.8.8.8/dns-query，那是 DNS 线路格式端点
+    ///（RFC 8484，需自组 DNS 报文）；本探针的 resolveDoH 只讲 JSON，
+    /// 所以 Google 走 /resolve（Google 的 JSON API），查的是同一家解析商。
+    /// 360（101.226.4.6）与 114DNS（114.114.114.114）只确认了 DoH 服务存在，
+    /// 沙箱里 TLS 建连超时、未证实可用——探针行会如实报出错误码。
+    private static let dohResolvers: [(name: String, endpoint: String)] = [
+        ("Google", "https://8.8.8.8/resolve"),
+        ("CFDoH", "https://1.1.1.1/dns-query"),
+        ("AliDoH", "https://223.5.5.5/resolve"),
+        ("DNSPod", "https://119.29.29.29/dns-query"),
+        ("360", "https://101.226.4.6/dns-query"),
+        ("114DNS", "https://114.114.114.114/dns-query"),
     ]
 
     /// 每出一行探针结果就调一次（调用方在里面跳回 MainActor 写 UI）。
@@ -58,6 +105,7 @@ final class StagedNetworkProbe: NSObject {
         emit(ProbeLine(stage: .info, label: target.name, detail: "开始探针 \(target.apiURL.host ?? "")", ok: nil))
         var hosts = [target.apiURL.host].compactMap { $0 }
         if let eHost = target.embedURL?.host, !hosts.contains(eHost) { hosts.append(eHost) }
+        for extra in target.extraHosts where !hosts.contains(extra) { hosts.append(extra) }
         hosts.append("challenges.cloudflare.com")
 
         for host in hosts {
@@ -73,8 +121,8 @@ final class StagedNetworkProbe: NSObject {
                 ok: !sys.v4.isEmpty || !sys.v6.isEmpty
             ))
 
-            // 1b. 两家 DoH（IP 字面量，不走系统 DNS）× A / AAAA / HTTPS(65)。
-            for (name, base) in [("AliDoH", "https://223.5.5.5/resolve"), ("CFDoH", "https://1.1.1.1/dns-query")] {
+            // 1b. 六家 DoH（IP 字面量，不走系统 DNS）× A / AAAA / HTTPS(65)。
+            for (name, base) in Self.dohResolvers {
                 for qtype in ["A", "AAAA", "HTTPS"] {
                     if Task.isCancelled { return }
                     let rec = await resolveDoH(resolver: name, endpoint: base, host: host, qtype: qtype)
@@ -98,6 +146,18 @@ final class StagedNetworkProbe: NSObject {
             if let v6 = sys.v6.first {
                 if Task.isCancelled { return }
                 emit(await probeNWStaged(connectHost: v6, sni: host, port: 443, label: "IPv6Literal(\(v6))"))
+            }
+        }
+
+        // 2b. 直连 IP 探针（只对带 directIPs 的目标，如黄果）：
+        // NWConnection 直连沙箱验证过的 CloudFront IP + SNI=host + 真实证书校验，
+        // 再 HTTP GET /，记总耗时 + 状态码；IP 失败就如实上报，绝不悄悄换 IP。
+        if !target.directIPs.isEmpty, let apiHost = target.apiURL.host {
+            if Task.isCancelled { return }
+            emit(ProbeLine(stage: .info, label: target.name, detail: "直连 IP 探针（SNI=\(apiHost) + 真实证书校验 + HTTP GET /）", ok: nil))
+            for ip in target.directIPs {
+                if Task.isCancelled { return }
+                emit(await probeDirectIP(host: apiHost, ip: ip))
             }
         }
 
@@ -325,6 +385,28 @@ final class StagedNetworkProbe: NSObject {
             return ProbeLine(stage: .tls, label: "NW[\(label)]", detail: summary, ok: false)
         }
         return ProbeLine(stage: .tcp, label: "NW[\(label)]", detail: summary, ok: false)
+    }
+
+    // MARK: - 2b. 直连 IP + HTTP GET（复用 DoHFallbackClient 的单跳栈）
+    /// 直连 `ip` 字面量 + SNI=`host` + 真实证书校验，HTTP GET /，记总耗时 + 状态码。
+    /// 复用 DoHFallbackClient.fetchSingleHop（与业务侧 DoH 直连同一条 HTTP 栈），
+    /// 8 秒超时。total 是整次 GET 的耗时（首页体小，≈ TTFB）。
+    private func probeDirectIP(host: String, ip: String) async -> ProbeLine {
+        let start = CFAbsoluteTimeGetCurrent()
+        guard let url = URL(string: "https://\(host)/") else {
+            return ProbeLine(stage: .http, label: "DirectIP(\(ip))", detail: "bad_url", ok: false)
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        do {
+            let (data, http) = try await DoHFallbackClient.shared.fetchSingleHop(url: url, host: host, ip: ip, request: req, timeout: 8)
+            let ms = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            let ok = (200...299).contains(http.statusCode)
+            return ProbeLine(stage: .http, label: "DirectIP(\(ip))", detail: "total=\(ms)ms status=\(http.statusCode) bytes=\(data.count)", ok: ok)
+        } catch {
+            let ms = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            return ProbeLine(stage: .http, label: "DirectIP(\(ip))", detail: "total=\(ms)ms err=\((error as NSError).code) \(error.localizedDescription)", ok: false)
+        }
     }
 
     // MARK: - 3. Staged URLSession Probe (Default vs H3 Disabled)
