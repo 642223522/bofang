@@ -11,6 +11,14 @@
 # 一次构建约 2–5 分钟 runner 时间 ≈ 20–50 分钟额度；每月构建几次完全在免费额度内。
 # 触发只限 main 分支且只当源码/工作流变化时（paths 过滤），避免无关推送浪费额度。
 # 产物保留 7 天（免费存储 500MB，IPA 约 1.8MB）。
+#
+# 构建机（2026-11-26 Duo 黑边根因）：原来 runs-on: macos-latest，镜像里只有
+# Xcode 26.0–26.6，run #8 实测用 Xcode 26.6（iOS 26.5 SDK）编出来，Duo 内外屏
+# 都被装进黑边盒子；老版 Codemagic 钉死 Xcode 27.2 才是满屏。苹果分档：iOS 26 SDK
+# 内屏居中留空，iOS 27 SDK 占大半屏，只有 iOS 27.1+ 才满屏到边。所以改用官方
+# xcode-27 标签（macOS 27 + Xcode 27，Apple Silicon，标准尺寸，计费与 macos-latest
+# 一样；不要用 xcode-27-xlarge），工具链钉死 Xcode 27.2（/Applications/Xcode_27.2.app），
+# 找不到就直接失败，绝不悄悄回落到旧版或 beta；构建前后都断言 SDK 是 27.x。
 
 name: iOS unsigned IPA (sideload)
 
@@ -34,7 +42,7 @@ env:
 jobs:
   build:
     name: Build unsigned IPA
-    runs-on: macos-latest
+    runs-on: xcode-27
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -55,17 +63,27 @@ jobs:
           fi
           echo "OK：没有 .js 文件。"
 
-      - name: Show toolchain（选最新的 Xcode）
+      - name: Show toolchain（钉死 Xcode 27.2，Duo 内屏要 iOS 27.1+ SDK）
         run: |
           set -eo pipefail
           echo "--- 可用的 Xcode ---"
           ls -d /Applications/Xcode*.app 2>/dev/null || true
-          NEWEST_XCODE="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)"
-          if [ -n "$NEWEST_XCODE" ]; then
-            echo "选用最新的 Xcode：$NEWEST_XCODE"
-            sudo xcode-select -s "$NEWEST_XCODE/Contents/Developer"
+          XCODE_27_2="/Applications/Xcode_27.2.app"
+          if [ ! -d "$XCODE_27_2" ]; then
+            echo "❌ 找不到 Xcode 27.2：$XCODE_27_2，停止构建（绝不悄悄回落到旧版或 beta）。"
+            exit 1
           fi
+          echo "选用 Xcode 27.2：$XCODE_27_2"
+          sudo xcode-select -s "$XCODE_27_2/Contents/Developer"
           xcodebuild -version
+          echo "--- SDK 版本（应为 iphoneos27.x） ---"
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --show-sdk-path
+          SDK_VER="$(xcrun --sdk iphoneos --show-sdk-version)"
+          case "$SDK_VER" in
+            27.*) echo "OK：SDK $SDK_VER";;
+            *) echo "❌ SDK 不是 27.x（当前：$SDK_VER），停止构建。"; exit 1;;
+          esac
           echo "--- repo layout ---"
           ls -la
 
@@ -182,12 +200,20 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations:0 string UIInterfaceOrientationPortrait" "$PLIST" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations:1 string UIInterfaceOrientationLandscapeLeft" "$PLIST" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations:2 string UIInterfaceOrientationLandscapeRight" "$PLIST" 2>/dev/null || true
+          # iPad 方向（Duo 内屏按 iPad 形态走）：四个方向全给，和 project.yml 里的一致，
+          # 同样在已编好的 .app 上直接补，防管线弄丢。
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations~ipad array" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations~ipad:0 string UIInterfaceOrientationPortrait" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations~ipad:1 string UIInterfaceOrientationLandscapeLeft" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations~ipad:2 string UIInterfaceOrientationLandscapeRight" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :UISupportedInterfaceOrientations~ipad:3 string UIInterfaceOrientationPortraitUpsideDown" "$PLIST" 2>/dev/null || true
           echo "--- 修复后的 Info.plist ---"
           /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$PLIST"
           /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST"
           /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$PLIST"
           /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST"
           /usr/libexec/PlistBuddy -c "Print :UISupportedInterfaceOrientations" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :UISupportedInterfaceOrientations~ipad" "$PLIST"
 
       - name: Package IPA
         run: |
@@ -222,6 +248,13 @@ jobs:
             exit 1
           fi
           echo "OK：包里版本与源码一致。"
+          echo "--- SDK 版本门禁（Duo 内屏要 iOS 27.1+ SDK，否则黑边；不是 27.x 就停止打包） ---"
+          DT_PLATFORM="$(/usr/libexec/PlistBuddy -c "Print :DTPlatformVersion" "$APP_PATH/Info.plist" 2>/dev/null || echo MISSING)"
+          echo "DTPlatformVersion：$DT_PLATFORM"
+          case "$DT_PLATFORM" in
+            27.*) echo "OK：SDK $DT_PLATFORM";;
+            *) echo "❌ DTPlatformVersion 不是 27.x（当前：$DT_PLATFORM），停止打包。"; exit 1;;
+          esac
           echo "--- 二进制里的版本串（仅供参考，不作门禁） ---"
           grep -a -oE '1\.[0-9]*\.[0-9]*' "$APP_PATH/$APP_NAME" | sort | uniq | tr '\n' ' ' || true
           echo "--- codesign check (expect: not signed) ---"
