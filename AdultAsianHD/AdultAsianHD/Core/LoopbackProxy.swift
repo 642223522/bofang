@@ -124,8 +124,9 @@ final class LoopbackProxyServer: NSObject {
     private var cacheBytes: Int = 0
     /// taskIdentifier → 拉取上下文。
     private var activeTasks: [Int: ProxyFetchContext] = [:]
-    /// 正在服务的连接（stop 时一并断掉）。
-    private var connections: Set<NWConnection> = []
+    /// 正在服务的连接（stop 时一并断掉）。数组 + 身份比对：
+    /// NWConnection 不是 Hashable，不能放 Set；去重与删除都按对象身份（===）。
+    private var connections: [NWConnection] = []
     /// 改写后残留的非回环绝对 URL 个数（lint：改写漏了的口子，账本里只记个数）。
     private var rewriteGapCountValue: Int = 0
     /// skd://（FairPlay）：播单里见到了，ViewModel 据此报明确错误（同拦截器）。
@@ -382,13 +383,15 @@ final class LoopbackProxyServer: NSObject {
     private func trackConnection(_ connection: NWConnection) {
         stateLock.lock()
         defer { stateLock.unlock() }
-        connections.insert(connection)
+        if !connections.contains(where: { $0 === connection }) {
+            connections.append(connection)
+        }
     }
 
     private func untrackConnection(_ connection: NWConnection) {
         stateLock.lock()
         defer { stateLock.unlock() }
-        connections.remove(connection)
+        connections.removeAll { $0 === connection }
     }
 
     private func closeConnection(_ connection: NWConnection) {
