@@ -936,6 +936,10 @@ final class CustomPlayerController: ObservableObject {
             failSeek("Replacement item did not become ready: \(reason)")
         case .rebuiltSeek, .waitingForPlayback(attempt: 3):
             failSeek("Seek failed after item rebuild: \(reason)")
+        case .waitingForPlayback:
+            // 防御：attempt 只会是 1/2/3（见文件头流程注释），走到这里
+            // 说明流程出了预期外的值，干净地终结这次 seek，不无限重试。
+            failSeek("Seek failed in unexpected waitingForPlayback phase: \(reason)")
         }
     }
 

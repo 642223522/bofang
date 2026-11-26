@@ -128,13 +128,13 @@ final class StagedNetworkProbe: NSObject {
         let start = CFAbsoluteTimeGetCurrent()
         final class DNSBox: @unchecked Sendable {
             private let lock = NSLock()
-            private var cont: CheckedContinuation<(Int, [String], [String]), Never>?
+            private var cont: CheckedContinuation<(latencyMs: Int, v4: [String], v6: [String]), Never>?
             private var done = false
-            func set(_ c: CheckedContinuation<(Int, [String], [String]), Never>) {
+            func set(_ c: CheckedContinuation<(latencyMs: Int, v4: [String], v6: [String]), Never>) {
                 lock.lock(); defer { lock.unlock() }
                 if done { c.resume(returning: (0, [], [])) } else { cont = c }
             }
-            func finish(_ val: (Int, [String], [String])) {
+            func finish(_ val: (latencyMs: Int, v4: [String], v6: [String])) {
                 lock.lock()
                 guard !done else { lock.unlock(); return }
                 done = true
