@@ -50,10 +50,45 @@ enum CategoryDetectionRules {
             countsMissingCover: true,
             threshold: 2
         ),
+        /// javpub：分类瓦片带封面图（cat/N.jpg），链接是 /videos/<slug>/ 而不是 /category/，
+        /// 所以默认规则只能打 2 分（id 的 "-cat-" + _cat 的"分类"）；阈值降到 2，
+        /// 视频项（纯数字 id、_cat 为空）仍是 0 分，不会误判。
+        "user.javpub": CategoryDetectionRule(
+            idMarker: "cat-",
+            categoryMarker: "分类",
+            linkPathMarker: "/category/",
+            countsMissingCover: true,
+            threshold: 2
+        ),
+        /// javtiful：瓦片打 3 分（id "-cat-" + _cat"分类" + 链接 "/category/"），默认阈值 3 已够；
+        /// 登记阈值 2 是保险（链接格式万一变了仍能识别），视频项仍是 0 分。
+        "user.javtiful": CategoryDetectionRule(
+            idMarker: "cat-",
+            categoryMarker: "分类",
+            linkPathMarker: "/category/",
+            countsMissingCover: true,
+            threshold: 2
+        ),
     ]
 
     static func rule(forModuleId moduleId: String) -> CategoryDetectionRule {
         perModule[moduleId] ?? .default
+    }
+}
+
+/// 需开节点（VPN/代理）才能用的模块 id 清单（用户定：源名字后面加（V））。
+/// 已确诊：黄果（DNS 毒化 + DoH 全灭 + TCP 超时，2026-11-26 用户定开节点用）、
+/// javtiful（关节点检测页死在 DNS 层，2026-11-27 确诊）。
+/// javhd、jav-pub 待关节点测试确诊后再加；pornjav / pornjav-clean / onlybokep
+/// 关节点可用，不加。只改这里一行即可增减，不用改模块 JS（朋友模块改不了 JS）。
+/// 生效方式：导入/同步建 SourceRecord 时标题加后缀，下次同步后显示。
+enum NodeRequiredModules {
+    static let ids: Set<String> = ["user.huangguo", "user.javtiful"]
+
+    /// 源显示名：需节点的加 "（V）" 后缀；已带后缀的不重复加。
+    static func displayTitle(for meta: WidgetMeta) -> String {
+        guard ids.contains(meta.id) else { return meta.title }
+        return meta.title.hasSuffix("（V）") ? meta.title : meta.title + "（V）"
     }
 }
 

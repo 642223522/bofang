@@ -90,7 +90,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         }
         let record = SourceRecord(
             id: meta.id,
-            title: meta.title,
+            title: NodeRequiredModules.displayTitle(for: meta),
             fileName: finalName,
             origin: origin,
             country: existing?.country ?? countryGuess(for: meta),
@@ -307,7 +307,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
                 }
                 let record = SourceRecord(
                     id: meta.id,
-                    title: meta.title,
+                    title: NodeRequiredModules.displayTitle(for: meta),
                     fileName: finalName,
                     origin: "gitee",
                     country: existing?.country ?? countryGuess(for: meta),
