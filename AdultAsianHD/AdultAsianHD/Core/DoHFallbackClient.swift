@@ -190,41 +190,52 @@ final class DoHFallbackClient: @unchecked Sendable {
     ) async throws -> (data: Data, response: HTTPURLResponse, remoteIP: String) {
         var currentReq = rawRequest
         let originURL = rawRequest.url
+        // 请求内 cookie jar：跳转时把上跳的 Set-Cookie 带到下跳（Cloudflare
+        // 的 cf_clearance 就靠这个不断挑战循环；jar 只活在这一次请求里，
+        // 不进共享存储，跨请求不持久化）。
+        var cookieJar: [HTTPCookie] = []
+        // 绝对 deadline：data() 传进来的是剩余预算，perform 内部各阶段
+        //（解析商链、每跳、每个 IP）共用这一本账，不再每层重起预算。
+        if timeout <= 0 { throw URLError(.timedOut) }
+        let absoluteDeadline = Date().addingTimeInterval(timeout)
+        let remaining: () -> TimeInterval = { max(0, absoluteDeadline.timeIntervalSinceNow) }
         for _ in 0..<6 {
             guard let url = currentReq.url,
                   url.scheme?.lowercased() == "https",
                   let host = url.host, !host.isEmpty else {
                 throw URLError(.badURL)
             }
-            let perHopTimeout = min(max(timeout / 2, 4), 10)
-            let hop: (data: Data, response: HTTPURLResponse, remoteIP: String)
+            guard remaining() > 0 else { throw URLError(.timedOut) }
+            let perHopTimeout = min(min(max(timeout / 2, 4), 10), remaining())
+            let hop: (data: Data, response: HTTPURLResponse, remoteIP: String, setCookieValues: [String])
             if let proxy = viaProxy, proxy.isExplicitProxy {
                 // 经系统代理：不解析 DoH、不记偏好；代理做 DNS + TCP。
-                let res = try await fetchSingleHopViaProxy(
+                let res = try await fetchSingleHopViaProxyCore(
                     url: url,
                     host: host,
                     proxy: proxy,
                     request: currentReq,
-                    timeout: perHopTimeout
+                    timeout: min(perHopTimeout, remaining())
                 )
-                hop = (res.0, res.1, proxy.label)
+                hop = (res.0, res.1, proxy.label, res.2)
             } else {
-                let ips = await resolveIPs(host: host)
+                let ips = try await resolveIPs(host: host, deadline: absoluteDeadline)
                 guard !ips.isEmpty else { throw URLError(.cannotFindHost) }
 
                 var lastError: Error = URLError(.cannotConnectToHost)
-                var succeeded: (Data, HTTPURLResponse, String)?
+                var succeeded: (Data, HTTPURLResponse, String, [String])?
                 for ip in ips.prefix(4) {
                     if Task.isCancelled { throw CancellationError() }
+                    guard remaining() > 0 else { throw URLError(.timedOut) }
                     do {
-                        let res = try await fetchSingleHop(
+                        let res = try await fetchSingleHopCore(
                             url: url,
                             host: host,
                             ip: ip,
                             request: currentReq,
-                            timeout: perHopTimeout
+                            timeout: min(perHopTimeout, remaining())
                         )
-                        succeeded = (res.0, res.1, ip)
+                        succeeded = (res.0, res.1, ip, res.2)
                         markDoHPreferred(host: host)
                         break
                     } catch {
@@ -236,17 +247,35 @@ final class DoHFallbackClient: @unchecked Sendable {
                 hop = s
             }
 
+            // 本跳的 Set-Cookie 收进 jar（每条原始头行单独解析——
+            // parseHTTP11Response 的 [String: String] 会丢多值）。
+            for rawValue in hop.setCookieValues {
+                let parsed = HTTPCookie.cookies(
+                    withResponseHeaderFields: ["Set-Cookie": rawValue],
+                    for: hop.response.url ?? url
+                )
+                for cookie in parsed {
+                    cookieJar.removeAll {
+                        $0.name == cookie.name && $0.domain == cookie.domain && $0.path == cookie.path
+                    }
+                    if cookie.expiresDate == nil || cookie.expiresDate! > Date() {
+                        cookieJar.append(cookie)
+                    }
+                }
+            }
+
             // 处理 301/302/303/307/308 重定向
             if let nextReq = Self.redirectRequest(
                 after: hop.response,
                 from: currentReq,
                 originURL: originURL,
-                preservedHeaders: preservedHeaders
+                preservedHeaders: preservedHeaders,
+                cookies: cookieJar
             ) {
                 currentReq = nextReq
                 continue
             }
-            return hop
+            return (hop.data, hop.response, hop.remoteIP)
         }
         throw URLError(.httpTooManyRedirects)
     }
@@ -255,11 +284,14 @@ final class DoHFallbackClient: @unchecked Sendable {
     /// 只有 303 强制转 GET；301/302 保持原方法（RFC 7231：301/302 的方法保留是
     /// 允许的，POST 301/302 转 GET 是历史遗留行为，对签名 POST（如黄果现铸）
     /// 转 GET 会丢 body 导致失败）。跨域时凭据头不跟过去；Host/Content-Length 永不复制。
+    /// cookies：perform 的请求内 jar——按目标 URL 匹配后带上（Cloudflare
+    /// 的 cf_clearance 就靠这个不断挑战循环）。
     private static func redirectRequest(
         after http: HTTPURLResponse,
         from currentReq: URLRequest,
         originURL: URL?,
-        preservedHeaders: [String: String]
+        preservedHeaders: [String: String],
+        cookies: [HTTPCookie] = []
     ) -> URLRequest? {
         guard [301, 302, 303, 307, 308].contains(http.statusCode),
               let location = http.value(forHTTPHeaderField: "Location"),
@@ -271,13 +303,63 @@ final class DoHFallbackClient: @unchecked Sendable {
         nextReq.httpMethod = (http.statusCode == 303) ? "GET" : (currentReq.httpMethod ?? "GET")
         if nextReq.httpMethod != "GET" { nextReq.httpBody = currentReq.httpBody }
         let sameOrigin = NetConstants.isSameOrigin(originURL, nextURL)
+        // 跳步头（Connection/Transfer-Encoding/Keep-Alive/Proxy-Connection/
+        // Upgrade）上 H2/H3 会违反 RFC 9113/9114，直接 RST_STREAM，永不复制。
+        let hopByHop: Set<String> = ["host", "content-length", "connection",
+                                     "transfer-encoding", "keep-alive",
+                                     "proxy-connection", "upgrade"]
+        // 先抄上跳实际发出的全部请求头（UA/Accept/Referer 等——旧代码只抄
+        // preservedHeaders，这些全丢了）；跨域时凭据头不跟过去。
+        if let sent = currentReq.allHTTPHeaderFields {
+            for (k, v) in sent {
+                let lower = k.lowercased()
+                if hopByHop.contains(lower) { continue }
+                if !sameOrigin && NetConstants.isSensitiveHeader(k) { continue }
+                nextReq.setValue(v, forHTTPHeaderField: k)
+            }
+        }
+        // 模块声明头后抄（同名时覆盖上跳的值）。
         for (k, v) in preservedHeaders {
             let lower = k.lowercased()
             if !sameOrigin && NetConstants.isSensitiveHeader(k) { continue }
-            if lower == "host" || lower == "content-length" { continue }
+            if hopByHop.contains(lower) { continue }
             nextReq.setValue(v, forHTTPHeaderField: k)
         }
+        // jar 里的 Cookie 按目标 URL 匹配（域名/路径/secure/过期）后带上；
+        // 有匹配时覆盖上面抄来的 Cookie（服务端最新状态优先）；没匹配时
+        // 上面抄来的 Cookie 原样保留（同源、模块自带 Cookie 的情况）。
+        let matching = cookies.filter { Self.cookieMatches($0, url: nextURL) }
+        if !matching.isEmpty {
+            for (k, v) in HTTPCookie.requestHeaderFields(with: matching) {
+                nextReq.setValue(v, forHTTPHeaderField: k)
+            }
+        }
         return nextReq
+    }
+
+    /// Cookie 是否适用于目标 URL（域名后缀/路径前缀/secure/过期，RFC 6265
+    /// 的够用子集）。HTTPCookie 不区分有没有 Domain 属性，这里按带 Domain
+    /// 的规则放宽到子域——只影响同站跳转，不会把 Cookie 送去别的站。
+    private static func cookieMatches(_ cookie: HTTPCookie, url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        if cookie.isSecure && url.scheme?.lowercased() != "https" { return false }
+        if let exp = cookie.expiresDate, exp <= Date() { return false }
+        let domain = cookie.domain.lowercased()
+        let hostOK: Bool = {
+            if domain.hasPrefix(".") {
+                let bare = String(domain.dropFirst())
+                return host == bare || host.hasSuffix("." + bare)
+            }
+            return host == domain || host.hasSuffix("." + domain)
+        }()
+        guard hostOK else { return false }
+        let path = url.path.isEmpty ? "/" : url.path
+        let cookiePath = cookie.path
+        if path == cookiePath { return true }
+        guard path.hasPrefix(cookiePath) else { return false }
+        if cookiePath.hasSuffix("/") { return true }
+        let nextIndex = path.index(path.startIndex, offsetBy: cookiePath.count)
+        return path[nextIndex] == "/"
     }
 
     // MARK: - DoH 解析商链（Google → Cloudflare → Ali → DNSPod，逐家问，第一家给有效答案即停）
@@ -287,7 +369,9 @@ final class DoHFallbackClient: @unchecked Sendable {
     /// 每家返回的 IP 先过污染过滤：命中 Meta 段的答案拒掉（只留干净的；
     /// 全污染则问下一家），被拒的记进诊断（`poisonRejectionsSnapshot`）。
     /// 干净 IP 按答案 TTL 缓存（钳制 [5, 300] 秒，与旧逻辑一致）。
-    func resolveIPs(host: String) async -> [String] {
+    /// 会 throw——只抛 CancellationError（父任务取消时立即停，不要把取消
+    /// 翻译成 cannotFindHost）；别的失败一律回 []（换下一家/报查无此 host）。
+    func resolveIPs(host: String, deadline: Date) async throws -> [String] {
         let key = host.lowercased()
         lock.lock()
         if let cached = ipCache[key], cached.expiresAt > Date() {
@@ -297,14 +381,18 @@ final class DoHFallbackClient: @unchecked Sendable {
         lock.unlock()
 
         for resolver in Self.resolvers {
-            let houseDeadline = Date().addingTimeInterval(Self.resolverTimeoutSeconds)
+            // 取消传播：换解析商前查一次，取消了就停，不要继续烧 4 秒预算。
+            if Task.isCancelled { throw CancellationError() }
+            // 绝对 deadline：预算到了就停，不要把整条解析商链问完（最坏 16 秒）。
+            guard Date() < deadline else { return [] }
+            let houseDeadline = Date().addingTimeInterval(min(Self.resolverTimeoutSeconds, max(0, deadline.timeIntervalSinceNow)))
             var houseIPs: [String] = []
             var houseMinTTL = 180
             for ip in resolver.ips {
                 let remaining = houseDeadline.timeIntervalSinceNow
                 guard remaining > 0 else { break }
                 let timeout = min(Self.resolverTimeoutSeconds, remaining)
-                guard let (ips, ttl) = await queryDoH(resolver: resolver, ip: ip, host: host, timeout: timeout),
+                guard let (ips, ttl) = try await queryDoH(resolver: resolver, ip: ip, host: host, timeout: timeout),
                       !ips.isEmpty else { continue }
                 houseIPs.append(contentsOf: ips)
                 houseMinTTL = min(houseMinTTL, ttl)
@@ -338,7 +426,9 @@ final class DoHFallbackClient: @unchecked Sendable {
     /// 同样支持 `?name=&type=` + `Accept: application/dns-json`。
     /// 只取 A 记录（type == 1），与旧 queryAliDoH 一致——AAAA 未开通，
     /// 业务侧 perform() 只连 A 记录解析出的 IPv4。
-    private func queryDoH(resolver: DoHResolver, ip: String, host: String, timeout: TimeInterval) async -> ([String], Int)? {
+    /// 会 throw——只抛 CancellationError（旧代码用 try? 把取消也吞了，
+    /// 取消会一路变成 cannotFindHost）；别的失败一律回 nil（换下一个 IP/解析商）。
+    private func queryDoH(resolver: DoHResolver, ip: String, host: String, timeout: TimeInterval) async throws -> ([String], Int)? {
         var comps = URLComponents()
         comps.scheme = "https"
         comps.host = resolver.endpointHost
@@ -350,8 +440,16 @@ final class DoHFallbackClient: @unchecked Sendable {
         guard let url = comps.url else { return nil }
         var req = URLRequest(url: url, timeoutInterval: timeout)
         req.setValue("application/dns-json", forHTTPHeaderField: "Accept")
-        guard let (data, http) = try? await fetchSingleHop(url: url, host: resolver.endpointHost, ip: ip, request: req, timeout: timeout),
-              (200...299).contains(http.statusCode),
+        let fetched: (Data, HTTPURLResponse)
+        do {
+            fetched = try await fetchSingleHop(url: url, host: resolver.endpointHost, ip: ip, request: req, timeout: timeout)
+        } catch let e as CancellationError {
+            throw e
+        } catch {
+            return nil
+        }
+        let (data, http) = fetched
+        guard (200...299).contains(http.statusCode),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let answers = json["Answer"] as? [[String: Any]] else {
             return nil
@@ -424,6 +522,20 @@ final class DoHFallbackClient: @unchecked Sendable {
         request: URLRequest,
         timeout: TimeInterval
     ) async throws -> (Data, HTTPURLResponse) {
+        let (data, response, _) = try await fetchSingleHopCore(url: url, host: host, ip: ip, request: request, timeout: timeout)
+        return (data, response)
+    }
+
+    /// fetchSingleHop 的内核：多返回原始 Set-Cookie 头行（供 perform 的
+    /// cookie jar 用——[String: String] 存头会丢多值）。2 元组签名不动
+    ///（StagedNetworkProbe 靠它），perform 内部直接调内核。
+    private func fetchSingleHopCore(
+        url: URL,
+        host: String,
+        ip: String,
+        request: URLRequest,
+        timeout: TimeInterval
+    ) async throws -> (Data, HTTPURLResponse, [String]) {
         let portNum = UInt16(url.port ?? 443)
         guard let nwPort = NWEndpoint.Port(rawValue: portNum) else {
             throw URLError(.badURL)
@@ -435,7 +547,8 @@ final class DoHFallbackClient: @unchecked Sendable {
             endpoint: .hostPort(host: .init(ip), port: nwPort),
             params: params,
             wireData: wireData,
-            timeout: timeout
+            timeout: timeout,
+            method: request.httpMethod ?? "GET"
         )
         return try parseHTTP11Response(rawResponse, url: url)
     }
@@ -450,6 +563,19 @@ final class DoHFallbackClient: @unchecked Sendable {
         request: URLRequest,
         timeout: TimeInterval
     ) async throws -> (Data, HTTPURLResponse) {
+        let (data, response, _) = try await fetchSingleHopViaProxyCore(url: url, host: host, proxy: proxy, request: request, timeout: timeout)
+        return (data, response)
+    }
+
+    /// fetchSingleHopViaProxy 的内核：同 fetchSingleHopCore（多返回原始
+    /// Set-Cookie 头行），perform 内部直接调内核。
+    private func fetchSingleHopViaProxyCore(
+        url: URL,
+        host: String,
+        proxy: ActiveSystemProxy,
+        request: URLRequest,
+        timeout: TimeInterval
+    ) async throws -> (Data, HTTPURLResponse, [String]) {
         let portNum = UInt16(url.port ?? 443)
         guard let nwPort = NWEndpoint.Port(rawValue: portNum) else {
             throw URLError(.badURL)
@@ -465,19 +591,23 @@ final class DoHFallbackClient: @unchecked Sendable {
             endpoint: .hostPort(host: .init(host), port: nwPort),
             params: params,
             wireData: wireData,
-            timeout: timeout
+            timeout: timeout,
+            method: request.httpMethod ?? "GET"
         )
         return try parseHTTP11Response(rawResponse, url: url)
     }
 
-    /// 驱动一条 NWConnection：发 wireData、收完整个响应体、超时取消。
-    /// fetchSingleHop（直连 IP）与 fetchSingleHopViaProxy（经系统代理）共用，
-    /// 逻辑与旧 fetchSingleHop 内联版逐行一致，只抽出来复用。
+    /// 驱动一条 NWConnection：发 wireData、按 HTTP 帧收完响应、超时取消。
+    /// fetchSingleHop（直连 IP）与 fetchSingleHopViaProxy（经系统代理）共用。
+    /// 帧规则（收到即停，不等 TCP 关）：HEAD/204/304 只有头；Content-Length
+    /// 精确字节数；chunked 到终结 0 块；既无长度又非 chunked 才等 EOF。
+    /// 任何错误 + 半截 body 都是失败——截断的响应绝不当成功返回。
     private func driveConnection(
         endpoint: NWEndpoint,
         params: NWParameters,
         wireData: Data,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        method: String
     ) async throws -> Data {
         let queue = DispatchQueue(label: "com.liudehen.xiaoshipin.doh.conn.\(UUID().uuidString)")
         let conn = NWConnection(to: endpoint, using: params)
@@ -488,6 +618,7 @@ final class DoHFallbackClient: @unchecked Sendable {
             private var done = false
             var connection: NWConnection?
             var buffer = Data()
+            var waitingTimer: DispatchWorkItem?
 
             func set(_ c: CheckedContinuation<Data, Error>) {
                 lock.lock(); defer { lock.unlock() }
@@ -499,17 +630,30 @@ final class DoHFallbackClient: @unchecked Sendable {
                 done = true
                 let c = cont; cont = nil
                 let cn = connection; connection = nil
+                let wt = waitingTimer; waitingTimer = nil
                 lock.unlock()
+                wt?.cancel()
                 cn?.cancel()
                 switch result {
                 case .success(let d): c?.resume(returning: d)
                 case .failure(let e): c?.resume(throwing: e)
                 }
             }
+            func setWaitingTimer(_ item: DispatchWorkItem?) {
+                lock.lock()
+                let old = waitingTimer
+                waitingTimer = item
+                lock.unlock()
+                old?.cancel()
+            }
         }
 
         let box = ConnBox()
         box.connection = conn
+        // .waiting 有界宽限：死 IP/不可达路径会在 waiting 里挂住；给 1.5s
+        // 恢复机会，超时仍 waiting 就按等待错误失败，不干等到每跳超时。
+        // 注意：waiting 也可能只是瞬时路径恢复，绝不一上来就判失败。
+        let waitingGraceSeconds: TimeInterval = 1.5
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { cont in
@@ -523,16 +667,30 @@ final class DoHFallbackClient: @unchecked Sendable {
                         if let data, !data.isEmpty {
                             box.buffer.append(data)
                         }
+                        let status = DoHFallbackClient.frameStatus(of: box.buffer, method: method)
+                        switch status {
+                        case .complete(let raw):
+                            box.finish(.success(raw))
+                            return
+                        case .malformed:
+                            box.finish(.failure(URLError(.cannotParseResponse)))
+                            return
+                        case .awaitingEOF, .incomplete:
+                            break
+                        }
                         if isComplete {
-                            box.finish(.success(box.buffer))
+                            // EOF：只有 awaitingEOF 的响应到这里算成功；
+                            // Content-Length/chunked 没收齐就是截断。
+                            if case .awaitingEOF = status {
+                                box.finish(.success(box.buffer))
+                            } else {
+                                box.finish(.failure(URLError(.cannotParseResponse)))
+                            }
                             return
                         }
                         if let error {
-                            if !box.buffer.isEmpty {
-                                box.finish(.success(box.buffer))
-                            } else {
-                                box.finish(.failure(error))
-                            }
+                            // 错误 + 半截 body = 失败，不再把残 buffer 当成功。
+                            box.finish(.failure(error))
                             return
                         }
                         receiveLoop()
@@ -541,6 +699,8 @@ final class DoHFallbackClient: @unchecked Sendable {
                 conn.stateUpdateHandler = { state in
                     switch state {
                     case .ready:
+                        // 连上了：waiting 宽限计时器作废。
+                        box.setWaitingTimer(nil)
                         conn.send(content: wireData, completion: .contentProcessed { sendErr in
                             if let sendErr {
                                 box.finish(.failure(sendErr))
@@ -548,8 +708,16 @@ final class DoHFallbackClient: @unchecked Sendable {
                             }
                             receiveLoop()
                         })
+                    case .waiting(let waitError):
+                        let item = DispatchWorkItem {
+                            box.finish(.failure(waitError))
+                        }
+                        box.setWaitingTimer(item)
+                        queue.asyncAfter(deadline: .now() + waitingGraceSeconds, execute: item)
                     case .failed(let err):
                         box.finish(.failure(err))
+                    case .cancelled:
+                        box.finish(.failure(CancellationError()))
                     default:
                         break
                     }
@@ -566,6 +734,121 @@ final class DoHFallbackClient: @unchecked Sendable {
         } onCancel: {
             box.finish(.failure(CancellationError()))
         }
+    }
+
+    /// HTTP 帧状态：收到即停的判定（收到完整响应就不再等 TCP 关）。
+    private enum HTTPFrameStatus {
+        /// 已收齐：exact raw response bytes。
+        case complete(Data)
+        /// 头已齐、body 靠 EOF 界定：继续收，等连接关。
+        case awaitingEOF
+        /// 还没收齐（头不全或 body 未满）。
+        case incomplete
+        /// 头/块结构非法。
+        case malformed
+    }
+
+    /// 对已收到的原始字节做帧判定（纯函数，不动 buffer）。
+    /// 1xx 中间响应跳过；HEAD/204/304 只有头；Content-Length 精确字节数；
+    /// chunked 到终结 0 块；既无长度又非 chunked 才等 EOF。
+    /// 注意：绝不用子串搜索判状态（如 " 204 "、"0\r\n\r\n" 都会误判）——
+    /// 状态码按行解析，chunk 按尺寸逐块走。
+    private static func frameStatus(of raw: Data, method: String) -> HTTPFrameStatus {
+        let headerSep = Data("\r\n\r\n".utf8)
+        let crlf = Data("\r\n".utf8)
+        var offset = raw.startIndex
+        // 跳过 1xx 中间响应头块（与 parseHTTP11Response 同款循环）。
+        while true {
+            guard let sepRange = raw.range(of: headerSep, in: offset..<raw.endIndex) else {
+                return .incomplete
+            }
+            guard let headStr = String(data: raw[offset..<sepRange.lowerBound], encoding: .utf8) else {
+                return .malformed
+            }
+            let lines = headStr.components(separatedBy: "\r\n")
+            guard let firstLine = lines.first else { return .malformed }
+            let parts = firstLine.split(separator: " ")
+            guard parts.count >= 2, let code = Int(parts[1]) else { return .malformed }
+            if (100...199).contains(code) {
+                offset = sepRange.upperBound
+                continue
+            }
+            // 最终响应头块：解析帧规则。
+            if method.uppercased() == "HEAD" || code == 204 || code == 304 {
+                return .complete(Data(raw[..<sepRange.upperBound]))
+            }
+            var contentLength: Int?
+            var chunked = false
+            for line in lines.dropFirst() {
+                guard let colon = line.firstIndex(of: ":") else { continue }
+                let k = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+                let v = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+                if k == "transfer-encoding", v.lowercased().contains("chunked") {
+                    chunked = true
+                } else if k == "content-length" {
+                    guard let n = Int(v), n >= 0 else { return .malformed }
+                    if let prev = contentLength, prev != n { return .malformed }
+                    contentLength = n
+                }
+            }
+            let bodyStart = sepRange.upperBound
+            if chunked {
+                // chunked 优先于 Content-Length（RFC 7230 §3.3.3）。
+                return chunkedFrameStatus(body: raw, from: bodyStart, crlf: crlf)
+            }
+            if let n = contentLength {
+                let have = raw.endIndex - bodyStart
+                if have >= n {
+                    let end = raw.index(bodyStart, offsetBy: n)
+                    return .complete(Data(raw[..<end]))
+                }
+                return .incomplete
+            }
+            return .awaitingEOF
+        }
+    }
+
+    /// chunked 体增量判定：从 bodyStart 起逐块走；收齐终结 0 块 + 空行即
+    /// complete，块结构非法即 malformed，缺字节即 incomplete（不等 EOF
+    /// 判截断——EOF 时调用方按 incomplete → cannotParseResponse 处理）。
+    private static func chunkedFrameStatus(body raw: Data, from bodyStart: Data.Index, crlf: Data) -> HTTPFrameStatus {
+        var idx = bodyStart
+        while idx < raw.endIndex {
+            guard let lineEnd = raw.range(of: crlf, in: idx..<raw.endIndex) else {
+                return .incomplete
+            }
+            let sizeStr = String(decoding: raw[idx..<lineEnd.lowerBound], as: UTF8.self)
+                .split(separator: ";").first.map(String.init)?
+                .trimmingCharacters(in: .whitespaces) ?? ""
+            guard let size = Int(sizeStr, radix: 16) else {
+                return .malformed
+            }
+            if size == 0 {
+                // 终结块：随后是 0 个或多个 trailer 行，以一个空行结束。
+                var t = lineEnd.upperBound
+                while true {
+                    guard let le = raw.range(of: crlf, in: t..<raw.endIndex) else {
+                        return .incomplete
+                    }
+                    if le.lowerBound == t {
+                        return .complete(Data(raw[..<le.upperBound]))
+                    }
+                    t = le.upperBound
+                }
+            }
+            let chunkStart = lineEnd.upperBound
+            guard let chunkEnd = raw.index(chunkStart, offsetBy: size, limitedBy: raw.endIndex) else {
+                return .incomplete
+            }
+            guard let afterChunk = raw.index(chunkEnd, offsetBy: 2, limitedBy: raw.endIndex) else {
+                return .incomplete
+            }
+            guard raw[chunkEnd..<afterChunk] == crlf else {
+                return .malformed
+            }
+            idx = afterChunk
+        }
+        return .incomplete
     }
 
     private func buildHTTP11Request(url: URL, host: String, request: URLRequest) -> Data {
@@ -600,7 +883,9 @@ final class DoHFallbackClient: @unchecked Sendable {
         return out
     }
 
-    private func parseHTTP11Response(_ raw: Data, url: URL) throws -> (Data, HTTPURLResponse) {
+    /// 返回体 + 响应 + 原始 Set-Cookie 头行：多条 Set-Cookie 不能进
+    /// [String: String]（后一条盖前一条），原始头行单独留一份给 cookie jar。
+    private func parseHTTP11Response(_ raw: Data, url: URL) throws -> (Data, HTTPURLResponse, [String]) {
         let sep = Data("\r\n\r\n".utf8)
         // 1xx 中间响应（100 Continue / 103 Early Hints）会先发一组头：
         // 循环跳过它们，只解析最后一组（真正的最终响应）头。
@@ -632,12 +917,16 @@ final class DoHFallbackClient: @unchecked Sendable {
         guard headerLines.first != nil else { throw URLError(.cannotParseResponse) }
         var headerFields: [String: String] = [:]
         var isChunked = false
+        var setCookieValues: [String] = []
         for line in headerLines.dropFirst() {
             guard let colon = line.firstIndex(of: ":") else { continue }
             let k = line[..<colon].trimmingCharacters(in: .whitespaces)
             let v = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
             if k.lowercased() == "transfer-encoding" && v.lowercased().contains("chunked") {
                 isChunked = true
+            }
+            if k.lowercased() == "set-cookie" {
+                setCookieValues.append(String(v))
             }
             headerFields[k] = v
         }
@@ -646,7 +935,7 @@ final class DoHFallbackClient: @unchecked Sendable {
         guard let httpResp = HTTPURLResponse(url: url, statusCode: statusCode, httpVersion: "HTTP/1.1", headerFields: headerFields) else {
             throw URLError(.cannotParseResponse)
         }
-        return (body, httpResp)
+        return (body, httpResp, setCookieValues)
     }
 
     /// chunked 解码：任何截断（缺尺寸行、尺寸不是十六进制、块体不够长、
