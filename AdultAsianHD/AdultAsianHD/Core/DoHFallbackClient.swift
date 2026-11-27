@@ -331,13 +331,21 @@ final class DoHFallbackClient: @unchecked Sendable {
         // POST 会被复制）。单跳内的 responseStarted 只覆盖本跳，
         // sawResponse 覆盖跨跳。
         var sawResponse = false
+        // R7-4：统一收口 sawResponse 包装——perform() 内所有失败出口
+        //（循环顶 .badURL/.timedOut、IP 循环 .timedOut、代理分支非传输错、
+        // 6 跳耗尽）都经它：已收到过响应（sawResponse）就包着原错抛，
+        // 不可重发；取消或尚未收到响应时原样返回。
+        func finishError(_ err: Error) -> Error {
+            if err is CancellationError || !sawResponse { return err }
+            return DoHResponseStartedFailure(underlying: err)
+        }
         for _ in 0..<6 {
             guard let url = currentReq.url,
                   url.scheme?.lowercased() == "https",
                   let host = url.host, !host.isEmpty else {
-                throw URLError(.badURL)
+                throw finishError(URLError(.badURL))
             }
-            guard remaining() > 0 else { throw URLError(.timedOut) }
+            guard remaining() > 0 else { throw finishError(URLError(.timedOut)) }
             let perHopTimeout = min(min(max(timeout / 2, 4), 10), remaining())
             let hop: (data: Data, response: HTTPURLResponse, remoteIP: String, setCookieValues: [String])
             if let proxy = viaProxy, proxy.isExplicitProxy {
@@ -363,6 +371,10 @@ final class DoHFallbackClient: @unchecked Sendable {
                     // 抛原错（R3-2：classify() 要看原错）。
                     if failure.responseStarted || sawResponse { throw DoHResponseStartedFailure(underlying: failure.underlying) }
                     throw failure.underlying
+                } catch {
+                    // R7-4：代理分支的非传输错（如非法端口的 .badURL）也经
+                    // finishError——之前某跳已响应时包着抛，不可重发。
+                    throw finishError(error)
                 }
             } else {
                 // F13：解析失败分三种信号，不再一律 .cannotFindHost。
@@ -399,7 +411,7 @@ final class DoHFallbackClient: @unchecked Sendable {
                 let candidates = Array(ips.prefix(4))
                 for (index, ip) in candidates.enumerated() {
                     if Task.isCancelled { throw CancellationError() }
-                    guard remaining() > 0 else { throw URLError(.timedOut) }
+                    guard remaining() > 0 else { throw finishError(URLError(.timedOut)) }
                     // F28：每个 IP 最多拿 remaining()/剩余 IP 数（下限 2s，上限
                     // perHopTimeout），黑洞首 IP 不能吃光预算饿死后面的 IP。
                     let ipsLeft = candidates.count - index
@@ -418,15 +430,18 @@ final class DoHFallbackClient: @unchecked Sendable {
                         // 偏好只由 performViaDoH 在整次 perform() 成功后记一次。
                         break
                     } catch let failure as DoHTransportFailure {
-                        // F4/R5-4/R6-9：该 IP 已收到最终响应头，body 失败不再换 IP；
+                        // F4/R5-4：该 IP 已收到最终响应头，body 失败不再换 IP；
                         // 用 DoHResponseStartedFailure 包着原错抛，让外层 data()
                         // 知道已收到头、不可回退重发（原错仍在 underlying 里）。
-                        // 之前某跳已响应过（sawResponse）也一样——本跳没收到头
-                        // 不代表请求没开始。
-                        if failure.responseStarted || sawResponse { throw DoHResponseStartedFailure(underlying: failure.underlying) }
+                        // R7-2：IP 循环内只认本跳该 IP 是否已收头——之前某跳
+                        // 已响应（sawResponse）不中止本跳剩余 IP 的故障转移；
+                        // sawResponse 只在全 IP 失败后的 guard（R6-9b）里判。
+                        if failure.responseStarted { throw DoHResponseStartedFailure(underlying: failure.underlying) }
                         lastError = failure.underlying
                         continue
                     } catch {
+                        // R7-2：取消立即重抛，不再试下一个 IP。
+                        if error is CancellationError { throw error }
                         lastError = error
                         continue
                     }
@@ -492,15 +507,17 @@ final class DoHFallbackClient: @unchecked Sendable {
             }
             return (hop.data, hop.response, hop.remoteIP)
         }
-        throw URLError(.httpTooManyRedirects)
+        throw finishError(URLError(.httpTooManyRedirects))
     }
 
     /// 3xx 重定向的下一跳请求（301/302/303/307/308 + Location）：无重定向返回 nil。
     /// 只有 303 强制转 GET（转 GET 时 Content-Type 随 body 一起丢掉）；301/302
     /// 保持原方法（RFC 7231：301/302 的方法保留是允许的，POST 301/302 转 GET
     /// 是历史遗留行为，对签名 POST（如黄果现铸）转 GET 会丢 body 导致失败）。
-    /// 非 http(s) 的 Location 返回 nil（停住跳转、返回 3xx 响应，与
-    /// PerRequestDelegate 的行为一致，不抛 .badURL）。
+    /// 非 https 的 Location 返回 nil（停住跳转、返回 3xx 响应，与
+    /// PerRequestDelegate 的行为一致，不抛 .badURL）。DoH 只做 https，
+    /// http:// 降级跳转也不跟（R7-4：放行 http 会让下跳在 perform()
+    /// 循环顶 https 守卫抛裸 .badURL，POST 还会被重发）。
     /// 跨域时凭据头不跟过去；Host/Content-Length/Cookie 永不复制——Cookie 每次
     /// 按目标 URL 重建：种子（原始请求的 Cookie 头，只同源继承）→ 删过期键
     ///（按 name/domain/path 划范围，R3-10）→ jar 覆盖（同名不同 Path 都保留，
@@ -521,7 +538,7 @@ final class DoHFallbackClient: @unchecked Sendable {
               let url = currentReq.url,
               let nextURL = URL(string: location, relativeTo: url)?.absoluteURL,
               let scheme = nextURL.scheme?.lowercased(),
-              scheme == "http" || scheme == "https" else {
+              scheme == "https" else {
             return nil
         }
         var nextReq = URLRequest(url: nextURL)
@@ -1327,7 +1344,7 @@ final class DoHFallbackClient: @unchecked Sendable {
         if method.uppercased() == "HEAD" || code == 204 || code == 304 {
             return .complete(Data(raw[..<sepRange.upperBound]))
         }
-        var contentLengths: [Int] = []
+        var rawContentLengths: [String] = []
         var chunked = false
         for line in lines.dropFirst() {
             guard let colon = line.firstIndex(of: ":") else { continue }
@@ -1338,8 +1355,9 @@ final class DoHFallbackClient: @unchecked Sendable {
                 guard transferEncodingIsChunked(String(v)) else { return .malformed }
                 chunked = true
             } else if k == "content-length" {
-                guard let n = Int(v), n >= 0 else { return .malformed }
-                contentLengths.append(n)
+                // R7-8：只收集原始值，不在这里校验——chunked 时完全忽略
+                // Content-Length（F29），校验留到非 chunked 路径再做。
+                rawContentLengths.append(String(v))
             }
         }
         let bodyStart = sepRange.upperBound
@@ -1347,6 +1365,19 @@ final class DoHFallbackClient: @unchecked Sendable {
             // F29：chunked 时完全忽略 Content-Length（不校验、不因它 malformed）。
             // chunked 优先于 Content-Length（RFC 7230 §3.3.3）。
             return chunkedFrameStatus(body: raw, from: bodyStart, crlf: crlf)
+        }
+        // R7-8：非 chunked 才校验 Content-Length——每条按 "," 拆分，
+        // 每段须是非负 ASCII 十进制整数，且全部相等（RFC 9110 §5.3
+        // 允许逗号折叠，如 "1024, 1024"）；任一段非法或不等即 malformed。
+        var contentLengths: [Int] = []
+        for rawValue in rawContentLengths {
+            for part in rawValue.split(separator: ",", omittingEmptySubsequences: false) {
+                let trimmed = part.trimmingCharacters(in: .whitespaces)
+                guard !trimmed.isEmpty,
+                      trimmed.unicodeScalars.allSatisfy({ $0.value >= 48 && $0.value <= 57 }),
+                      let n = Int(trimmed) else { return .malformed }
+                contentLengths.append(n)
+            }
         }
         if let first = contentLengths.first {
             guard contentLengths.allSatisfy({ $0 == first }) else { return .malformed }

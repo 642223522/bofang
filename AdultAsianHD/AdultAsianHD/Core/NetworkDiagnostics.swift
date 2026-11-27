@@ -559,17 +559,21 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         // 先清当前会话的 Cookie 再轮换（轮换不继承 Cookie）。
         session.configuration.httpCookieStorage?.removeCookies(since: .distantPast)
         rotateSessionLocked(preserveCookies: false)
-        sessionLock.unlock()
-        // 切网：DoH 解析出的 IP 与偏好表一起清空（新网络下
-        // 旧 IP 可能不可达，下一请求重新解析）。
+        // R7-1：DoH 重置移到锁内——ND 状态（epoch/清 breaker/轮换）与
+        // DoH 状态（世代/IP 缓存/偏好）必须一起落地，否则并发请求能在
+        // 新 epoch 下读到旧网 DoH 缓存（ChatGPT R8 P1-2）。锁顺序安全：
+        // DoHFallbackClient 从不调 NetworkDiagnostics、不拿 sessionLock，
+        // sessionLock -> DoH 锁是唯一顺序，无反向嵌套、无死锁。
         DoHFallbackClient.shared.resetForNetworkChange()
+        sessionLock.unlock()
     }
 
     /// 锁内解析当前 session（代理变化时轮换，与旧 currentSession() 同一套
     /// 判定）。调用方必须已持有 sessionLock；F7 的 makeDataTask 在同一把
     /// 锁内解析 session 并建任务，建任务与轮换之间插不进一次 rotate。
-    /// 返回代理是否刚变化——变化时 DoH 重置由 makeDataTask 在解锁后补调
-    ///（R5-7：resetForNetworkChange() 绝不在持有 sessionLock 时调）。
+    /// 返回代理是否刚变化——变化时 DoH 重置由 makeDataTask 在锁内补调
+    ///（R7-1：resetForNetworkChange() 在持有 sessionLock 时调，见 R7-1
+    /// 的锁顺序证明；R5-7 的“绝不在持锁时调”已废止）。
     private func resolveSessionLocked() -> (session: URLSession, proxyChanged: Bool) {
         let nowProxy = ActiveSystemProxy.current()
         var proxyChanged = false
@@ -592,8 +596,8 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
     /// 第一个请求的 tripBreaker 会被 epoch 不符静默丢弃，且 Branch 1 的
     /// isBreakerTripped 会拿旧 epoch 把 host 困在 DoH 路上、永远走不到同步。
     /// 代理变化时在锁内做 epoch+1、清 breaker、轮换（不继承 Cookie），
-    /// resetForNetworkChange() 在解锁后才调（锁内调它会与
-    /// handleNetworkTransition()/rotateSession() 的锁顺序不一致）。
+    /// resetForNetworkChange() 也在同一把锁内调（R7-1：ND 与 DoH 状态
+    /// 一起落地；R5-7 的“解锁后才调”已废止，锁顺序见 handleNetworkTransition）。
     /// 幂等：第二次调时 nowProxy == lastProxyState，什么都不做，不重复 +1。
     private func syncProxyStateAndEpoch() -> (proxy: ActiveSystemProxy, epoch: UInt64) {
         var changed = false
@@ -609,10 +613,11 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
             rotateSessionLocked(preserveCookies: false)
         }
         let epoch = networkEpoch
-        sessionLock.unlock()
+        // R7-1：DoH 重置移到锁内（见 handleNetworkTransition 的注释）。
         if changed {
             DoHFallbackClient.shared.resetForNetworkChange()
         }
+        sessionLock.unlock()
         return (nowProxy, epoch)
     }
 
@@ -636,10 +641,11 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
             lastProxyState = nowProxy
         }
         rotateSessionLocked(preserveCookies: effectivePreserveCookies)
-        sessionLock.unlock()
+        // R7-1：DoH 重置移到锁内（见 handleNetworkTransition 的注释）。
         if proxyChanged {
             DoHFallbackClient.shared.resetForNetworkChange()
         }
+        sessionLock.unlock()
     }
 
     private func rotateSessionLocked(preserveCookies: Bool) {
@@ -912,7 +918,6 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         // 只对 https（DoH 客户端只做 https；http 请求直接走 URLSession）。
         if !hasStreamBody,
            url.scheme?.lowercased() == "https",
-           deadline.timeIntervalSinceNow > 0.2,
            isForcedTransportHost(url.host) || isBreakerTripped(host: url.host) {
             if !proxy.isPACOnly {
                 // R6-6：Branch 1 一走传输就记下来（不论直连 DoH 还是代理），
@@ -940,6 +945,11 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                 } catch {
                     if error is CancellationError { throw error }
                     if isForcedTransportHost(url.host) { throw error }
+                    // R7-3：预算守卫从入口移到这里（与 Branch 2 对齐）——
+                    // 预算耗尽（<=0.2s）时直接抛 DoH 原错，不清闸、不撤销、
+                    // 不回退（回退只会起一个 0ms 的 URLSession 任务，记一条
+                    // 假超时事件，还把 DoH 原错盖掉）。
+                    if deadline.timeIntervalSinceNow <= 0.2 { throw error }
                     clearBreaker(host: url.host, ifEpoch: startEpoch)
                     if let snap = branch1PrefRevision {
                         DoHFallbackClient.shared.removeDoHPreferred(host: url.host, ifGeneration: snap.generation, ifRevision: snap.revision)
@@ -1022,24 +1032,51 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                 // 超时错也不能一律跳过等，否则 F2 拿不到指标会误回退）。
                 let remainingForMetrics = max(0, deadline.timeIntervalSinceNow)
                 let metrics = await delegate.takeMetricsSoon(for: error, maxWait: min(0.15, remainingForMetrics))
-                let event = NetworkDiagnostics.makeEvent(
-                    source: source,
-                    request: request,
-                    response: nil,
-                    bodyData: nil,
-                    error: error,
-                    metrics: metrics,
-                    fallbackDurationMs: elapsedMs,
-                    networkClass: networkClassAtStart
-                )
-                NetworkDiagnostics.record(event)
+                // R7-6：总超时时 remainingForMetrics == 0，metrics 几乎必为 nil
+                //（task.cancel() 刚发出，didFinishCollecting 还没回调），诊断
+                // 账本会丢掉 DNS/TCP/TLS/TTFB。data() 仍零等待立即返回；仅在
+                // metrics == nil 且非取消时，用脱离当前请求的 Task.detached
+                // 后台等最多 150ms 补采完再记事件（只影响诊断记账，不阻塞调用方）。
+                // F2 与兜底逻辑仍用这里的（可能为 nil 的）metrics，不等补采。
+                // 事件恰好记一次（if/else，二选一）。
+                if metrics == nil, !(error is CancellationError) {
+                    Task.detached {
+                        let lateMetrics = await delegate.takeMetricsSoon(for: error, maxWait: 0.15)
+                        let lateEvent = NetworkDiagnostics.makeEvent(
+                            source: source,
+                            request: request,
+                            response: nil,
+                            bodyData: nil,
+                            error: error,
+                            metrics: lateMetrics,
+                            fallbackDurationMs: elapsedMs,
+                            networkClass: networkClassAtStart
+                        )
+                        NetworkDiagnostics.record(lateEvent)
+                    }
+                } else {
+                    let event = NetworkDiagnostics.makeEvent(
+                        source: source,
+                        request: request,
+                        response: nil,
+                        bodyData: nil,
+                        error: error,
+                        metrics: metrics,
+                        fallbackDurationMs: elapsedMs,
+                        networkClass: networkClassAtStart
+                    )
+                    NetworkDiagnostics.record(event)
+                }
                 // F11：剩余预算守门——<= 0.2s 时直接重抛原错，不重试、不 fallback、
                 // 不写假 DoH 事件、不跳闸（-1002 救援与 TTFB 保护在它之前判，
                 // 它们不依赖预算；下面的重试/fallback 路径共用这一道门）。
                 let remainingNow = deadline.timeIntervalSinceNow
-                // R4-11：catch 里重读当前代理——入口抓的 proxy 可能已过期（中途
-                // 开了/关了代理）；救援与兜底都用最新的代理（仍受 !isPACOnly 守卫）。
-                let currentProxy = ActiveSystemProxy.current()
+                // R4-11/R7-5：catch 里重读当前代理——入口抓的 proxy 可能已过期
+                //（中途开了/关了代理）；救援与兜底都用最新的代理（仍受 !isPACOnly
+                // 守卫）。R7-5：改调 syncProxyStateAndEpoch() 而不是裸读——
+                // 中途切代理时它会涨 networkEpoch（让 tripBreaker 的 startEpoch
+                // 围栏失效）、清旧会话 Cookie、重置 DoH；未变时只是锁内相等比较。
+                let (currentProxy, _) = syncProxyStateAndEpoch()
                 // R6-6：本请求已试过传输（Branch 1/2）时，-1002 救援与传输
                 // 兜底都不再试——否则同一条路会被反复试，还会把熔断器钉到
                 // 刚失败的路上。这里算一次，后面两处共用。
@@ -1169,11 +1206,11 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
             }
         }
         task.delegate = delegate
-        sessionLock.unlock()
-        // R5-7：代理变化的 DoH 重置在解锁后做（见 resolveSessionLocked）。
+        // R7-1：DoH 重置移到锁内（见 handleNetworkTransition 的注释）。
         if proxyChanged {
             DoHFallbackClient.shared.resetForNetworkChange()
         }
+        sessionLock.unlock()
         return task
     }
 
@@ -1526,6 +1563,11 @@ final class WordPressHTTP: @unchecked Sendable {
         /// 在途等待者 id 集合（waiter 取消时按 id 幂等释放，保证每个 waiter
         /// 只减一次；计数归零时才取消底层 Task）。
         var waiterIDs: Set<UUID>
+        /// 每 waiter 的 continuation（R7-7）：等待者不再裸 await task.value
+        ///（不响应等待者取消），而是挂自己的 continuation；底层 Task 完成
+        /// 时批量恢复，等待者取消时立即以 CancellationError 恢复自己的。
+        /// 与 waiterIDs 同步增减；恢复前必先从字典摘掉（恰好恢复一次）。
+        var continuations: [UUID: CheckedContinuation<(Data, HTTPURLResponse), Error>]
         /// 条目 id（R3-15）：底层 Task 完成时按 id 摘条目，绝不摘掉复用
         /// 同一 key 的新条目。
         let id: UUID
@@ -1566,40 +1608,56 @@ final class WordPressHTTP: @unchecked Sendable {
     /// 返回原始 body 与 HTTP 响应；挑战/断路器抛 WordPressHTTPError。
     /// 请求合并 key = method + URL + 影响响应的请求头 + timeout（F27/G2：
     /// 不同头、不同方法、不同 timeout 的请求不合并）。
-    /// 等待者取消：裸 `await task.value` 不会因等待者被取消而抛错（Grok 最小
-    /// 复现钉死），所以包进 withTaskCancellationHandler，onCancel 里按 waiter
-    /// id 幂等 release；onCancel 只做 release、不直接 cancel 底层（可能还有
-    /// 别的 waiter 在等），只有最后一个 waiter 离开时才 cancel 底层。
+    /// 等待者取消（R7-7）：每 waiter 挂自己的 CheckedContinuation（不再裸
+    /// `await task.value`——它不响应等待者取消，Grok 最小复现钉死），
+    /// onCancel 里把该 waiter 的 continuation 摘掉并立即以 CancellationError
+    /// 恢复；只有最后一个 waiter 离开时才 cancel 底层（可能还有别的 waiter
+    /// 在等）。底层 Task 完成时批量恢复剩余 waiter 的 continuation。
     func fetch(_ request: URLRequest, source: String, timeout: TimeInterval = 12) async throws -> (Data, HTTPURLResponse) {
         // R4-14：已取消的调用方直接出——不加锁、不建 Task、不进 inFlight。
         try Task.checkCancellation()
         guard let url = request.url else { throw URLError(.badURL) }
         let key = Self.dedupKey(for: request, timeout: timeout)
         let waiterID = UUID()
-        let task: Task<(Data, HTTPURLResponse), Error>
-        lock.lock()
-        if var entry = inFlight[key] {
-            entry.waiterIDs.insert(waiterID)
-            inFlight[key] = entry
-            task = entry.task
-            lock.unlock()
-        } else {
-            // R3-15：条目带 id，底层 Task 完成时（defer）在恢复等待者之前
-            // 就把条目摘掉——新调用方不再挂到已完成的 Task 上拿陈旧结果。
-            let entryID = UUID()
-            let created = Task<(Data, HTTPURLResponse), Error> {
-                defer { self.completeInFlight(key: key, id: entryID) }
-                return try await self.perform(request, source: source, timeout: timeout)
-            }
-            inFlight[key] = InFlight(task: created, waiterIDs: [waiterID], id: entryID)
-            task = created
-            lock.unlock()
-        }
+        // R7-7：加入与挂 continuation 在同一把锁内一次完成（continuation
+        // 闭包里做）——条目在加入与挂之间不可能被摘（completeInFlight/
+        // cancelWaiter 都要同一把锁），也就没有“任务已完成但 continuation
+        // 还没挂上”的窗口。
         do {
             let result = try await withTaskCancellationHandler {
-                try await task.value
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Data, HTTPURLResponse), Error>) in
+                    lock.lock()
+                    // 挂之前先看是否已取消——取消发生在挂之前时直接恢复，
+                    // 不进字典（否则 onCancel 已跑过，continuation 永无恢复者）。
+                    if Task.isCancelled {
+                        lock.unlock()
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+                    if var entry = inFlight[key] {
+                        entry.waiterIDs.insert(waiterID)
+                        entry.continuations[waiterID] = continuation
+                        inFlight[key] = entry
+                    } else {
+                        // R3-15：条目带 id，底层 Task 完成时按 id 摘条目，
+                        // 绝不摘掉复用同一 key 的新条目。
+                        let entryID = UUID()
+                        let created = Task<(Data, HTTPURLResponse), Error> {
+                            do {
+                                let result = try await self.perform(request, source: source, timeout: timeout)
+                                self.completeInFlight(key: key, id: entryID, result: .success(result))
+                                return result
+                            } catch {
+                                self.completeInFlight(key: key, id: entryID, result: .failure(error))
+                                throw error
+                            }
+                        }
+                        inFlight[key] = InFlight(task: created, waiterIDs: [waiterID], continuations: [waiterID: continuation], id: entryID)
+                    }
+                    lock.unlock()
+                }
             } onCancel: {
-                self.release(key: key, waiterID: waiterID)
+                self.cancelWaiter(key: key, waiterID: waiterID)
             }
             release(key: key, waiterID: waiterID)
             return result
@@ -1643,14 +1701,47 @@ final class WordPressHTTP: @unchecked Sendable {
         }
     }
 
+    /// R7-7：等待者取消——把它的 continuation 从字典摘掉（若在），并把
+    /// waiter id 从 waiterIDs 摘掉；摘到空时取消底层 Task、摘条目。
+    /// 摘掉的 continuation 在锁外以 CancellationError 恢复（恰好一次；
+    /// completeInFlight 抢先摘走时这里拿不到，就不恢复——结果已先到）。
+    private func cancelWaiter(key: String, waiterID: UUID) {
+        var continuation: CheckedContinuation<(Data, HTTPURLResponse), Error>?
+        lock.lock()
+        if var entry = inFlight[key] {
+            continuation = entry.continuations.removeValue(forKey: waiterID)
+            if entry.waiterIDs.remove(waiterID) != nil, entry.waiterIDs.isEmpty {
+                inFlight.removeValue(forKey: key)
+                entry.task.cancel()
+            } else {
+                inFlight[key] = entry
+            }
+        }
+        lock.unlock()
+        continuation?.resume(throwing: CancellationError())
+    }
+
     /// 底层 Task 完成时摘条目（id 匹配才摘，绝不摘掉复用同一 key 的新条目）：
     /// 新调用方不再挂到已完成的 Task 上拿陈旧结果（R3-15）。幂等，与
     /// release() 的空集摘除互不冲突（release 在条目已摘时直接 no-op）。
-    private func completeInFlight(key: String, id: UUID) {
+    /// R7-7：摘条目时把全部剩余 continuation 一并带走，锁外按结果逐个恢复
+    ///（恰好一次；cancelWaiter 已摘走的不在其中）。
+    private func completeInFlight(key: String, id: UUID, result: Result<(Data, HTTPURLResponse), Error>) {
+        var continuations: [CheckedContinuation<(Data, HTTPURLResponse), Error>] = []
         lock.lock()
-        defer { lock.unlock() }
-        guard let entry = inFlight[key], entry.id == id else { return }
-        inFlight.removeValue(forKey: key)
+        if let entry = inFlight[key], entry.id == id {
+            inFlight.removeValue(forKey: key)
+            continuations = Array(entry.continuations.values)
+        }
+        lock.unlock()
+        for continuation in continuations {
+            switch result {
+            case .success(let value):
+                continuation.resume(returning: value)
+            case .failure(let error):
+                continuation.resume(throwing: error)
+            }
+        }
     }
 
     /// 真正发请求（含单次可控重试）。断路器打开时直接报，不发请求。
