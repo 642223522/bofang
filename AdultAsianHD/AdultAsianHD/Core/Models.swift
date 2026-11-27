@@ -193,10 +193,15 @@ struct WidgetMeta {
     /// 声明处给了 `= CheckTimeouts()` 又在 init 里赋值，Swift 会报
     /// "immutable value may only be initialized once"（构建 #41 就是这么死的）。
     let checkTimeouts: CheckTimeouts
+    /// 强制走 TCP/HTTP/1.1 的 host（模块在 WidgetMetadata.forceTransportHosts
+    /// 里声明，如 ["thaiporntv.com", "web.techvids.top"]）；没声明为空，
+    /// 宿主不强制任何 host。宿主只提供传输能力与智能切换，要不要强制由模块说了算。
+    /// 声明处同样不给默认值，默认值只放下方显式 init 的参数里。
+    let forceTransportHosts: [String]
 
     /// 显式 init（不依赖编译器合成的 memberwise init，Xcode 27.2 上合成行为不可靠，
     /// ModuleDescriptor/PlayLine 同款原因）。
-    init(id: String, title: String, description: String, version: String, searchFunctionName: String?, author: String?, site: String?, checkTimeouts: CheckTimeouts = CheckTimeouts()) {
+    init(id: String, title: String, description: String, version: String, searchFunctionName: String?, author: String?, site: String?, checkTimeouts: CheckTimeouts = CheckTimeouts(), forceTransportHosts: [String] = []) {
         self.id = id
         self.title = title
         self.description = description
@@ -205,6 +210,7 @@ struct WidgetMeta {
         self.author = author
         self.site = site
         self.checkTimeouts = checkTimeouts
+        self.forceTransportHosts = forceTransportHosts
     }
 }
 

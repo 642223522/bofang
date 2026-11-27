@@ -459,6 +459,11 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
     private var networkEpoch: UInt64 = 0
     /// 传输熔断器：host → （跳闸世代，强制走 NWConnection 到期时间）。
     private var breaker: [String: (epoch: UInt64, until: Date)] = [:]
+    /// 模块声明的强制传输 host（由各模块的 WidgetMetadata.forceTransportHosts
+    /// 登记，宿主代码里不硬编码任何 host）。注册是累加的、去重的；应用重启
+    /// 后清空，各源首次使用时重新登记。删源/改声明后的旧条目无害（强制 TCP
+    /// 本来就是合法传输，只是少走 URLSession）。
+    private var moduleForcedHosts: Set<String> = []
     /// 网络切换监听：接口变了（Wi-Fi↔蜂窝、VPN 开关）就清 Cookie，
     /// 直连时沾上的 WAF 坏 Cookie 不许带到 VPN 后。
     private let pathMonitor = NWPathMonitor()
@@ -565,13 +570,23 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         return result
     }
 
-    /// 强制走 TCP/HTTP/1.1 的 host（已知 URLSession 在其上不可靠）：后缀匹配 +
-    /// 精确边界。泰国链跨两个 host：主站（页 + sign.bin）与 CDN（播单 + 分片）。
-    private static let forcedTransportHosts: Set<String> = ["thaiporntv.com", "web.techvids.top"]
+    /// 登记模块声明的强制传输 host（WidgetHost 建好时调，幂等）。
+    func registerForcedTransportHosts(_ hosts: [String]) {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        for h in hosts {
+            let clean = h.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !clean.isEmpty else { continue }
+            moduleForcedHosts.insert(clean)
+        }
+    }
 
-    private static func isForcedTransportHost(_ host: String?) -> Bool {
+    /// 是否强制走 TCP/HTTP/1.1（模块声明的 host）：后缀匹配 + 精确边界。
+    private func isForcedTransportHost(_ host: String?) -> Bool {
         guard let host = host?.lowercased(), !host.isEmpty else { return false }
-        return forcedTransportHosts.contains { host == $0 || host.hasSuffix("." + $0) }
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        return moduleForcedHosts.contains { host == $0 || host.hasSuffix("." + $0) }
     }
 
     /// 熔断器是否跳闸（同世代 + 未过期）。
@@ -709,8 +724,8 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         // PAC-only 时 NWConnection 执行不了 JS PAC，回落系统 URLSession。
         // 只对 https（DoH 客户端只做 https；http 请求直接走 URLSession）。
         if url.scheme?.lowercased() == "https",
-           Self.isForcedTransportHost(url.host) || isBreakerTripped(host: url.host) {
-            if proxy != .pacOnly {
+           isForcedTransportHost(url.host) || isBreakerTripped(host: url.host) {
+            if !proxy.isPACOnly {
                 return try await performViaProxyAwareTransport(
                     request: request,
                     source: source,
@@ -789,7 +804,7 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                     if shouldTripBreaker(error: error, metrics: metrics) {
                         tripBreaker(host: host)
                     }
-                    if proxy != .pacOnly {
+                    if !proxy.isPACOnly {
                         return try await performViaProxyAwareTransport(
                             request: request,
                             source: source,
@@ -801,7 +816,7 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                     throw error
                 }
                 // -1002 守卫救援：通过严格校验的 URL 仍报 -1002，救一次，不跳闸。
-                if isStrict1002Rescue(error: error, request: request), proxy != .pacOnly {
+                if isStrict1002Rescue(error: error, request: request), !proxy.isPACOnly {
                     return try await performViaProxyAwareTransport(
                         request: request,
                         source: source,

@@ -48,6 +48,22 @@ enum ActiveSystemProxy: Equatable {
         case .pacOnly: return "pac"
         }
     }
+
+    /// 是否为显式代理（HTTP/SOCKS5），即 NWConnection 必须经代理协议连接。
+    /// 注意：不能写 `proxy != .pacOnly` 这种裸比较——带关联值的 case 不能
+    /// 直接比较（run #30 构建就是这么死的），一律用这里的计算属性或 switch。
+    var isExplicitProxy: Bool {
+        switch self {
+        case .http, .socks5: return true
+        case .none, .pacOnly: return false
+        }
+    }
+
+    /// 是否为 PAC-only（NWConnection 执行不了 JS PAC，只能走 URLSession）。
+    var isPACOnly: Bool {
+        if case .pacOnly = self { return true }
+        return false
+    }
 }
 
 /// 无节点 DNS 污染兜底客户端（如 huangguoai.com 系统 DNS 污染到 66.220.147.11）：
@@ -182,7 +198,7 @@ final class DoHFallbackClient: @unchecked Sendable {
             }
             let perHopTimeout = min(max(timeout / 2, 4), 10)
             let hop: (data: Data, response: HTTPURLResponse, remoteIP: String)
-            if let proxy = viaProxy, proxy != .none, proxy != .pacOnly {
+            if let proxy = viaProxy, proxy.isExplicitProxy {
                 // 经系统代理：不解析 DoH、不记偏好；代理做 DNS + TCP。
                 let res = try await fetchSingleHopViaProxy(
                     url: url,

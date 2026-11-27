@@ -107,6 +107,10 @@ final class WidgetHost: @unchecked Sendable {
         self.requestInterceptor = built.requestInterceptor
         self.httpRegistry = built.httpRegistry
         self.sourceGeneration = sourceGeneration
+        // 模块声明的强制传输 host 交给网络层登记（宿主不硬编码任何 host）。
+        if !built.meta.forceTransportHosts.isEmpty {
+            DiagnosticHTTPClient.shared.registerForcedTransportHosts(built.meta.forceTransportHosts)
+        }
     }
 
     deinit {
@@ -182,6 +186,14 @@ final class WidgetHost: @unchecked Sendable {
             playlistMs: checkDict?["playlistMs"] as? Int,
             firstFrameMs: checkDict?["firstFrameMs"] as? Int
         )
+        // 强制传输 host：模块在 WidgetMetadata.forceTransportHosts 里声明
+        //（字符串数组）；宿主只提供能力，要不要强制由模块说了算。
+        let forceTransportHosts: [String] = {
+            guard let arr = metaDict["forceTransportHosts"] as? [Any] else { return [] }
+            return arr.compactMap { ($0 as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .map { $0.hasPrefix(".") ? String($0.dropFirst()) : $0 }
+                .filter { !$0.isEmpty }
+        }()
         let meta = WidgetMeta(
             id: metaId,
             title: metaTitle,
@@ -190,7 +202,8 @@ final class WidgetHost: @unchecked Sendable {
             searchFunctionName: searchDict?["functionName"] as? String,
             author: (metaDict["author"] as? String)?.nilIfEmpty,
             site: siteString(from: metaDict),
-            checkTimeouts: checkTimeouts
+            checkTimeouts: checkTimeouts,
+            forceTransportHosts: forceTransportHosts
         )
 
         // 取模块清单（超集，三路，比 Rex 更宽松）：
