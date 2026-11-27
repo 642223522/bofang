@@ -144,8 +144,13 @@ struct SourceDetailView: View {
                         HStack {
                             Text(step.name)
                             Spacer()
-                            Text(step.passed ? "通过" : "失败")
-                                .foregroundColor(step.passed ? .green : .red)
+                            if step.skipped {
+                                Text("跳过")
+                                    .foregroundColor(.secondary)
+                            } else {
+                                Text(step.passed ? "通过" : "失败")
+                                    .foregroundColor(step.passed ? .green : .red)
+                            }
                             Text("\(step.milliseconds)ms")
                                 .foregroundColor(.secondary)
                         }
@@ -184,8 +189,13 @@ struct SourceDetailView: View {
                         HStack {
                             Text(step.name)
                             Spacer()
-                            Text(step.passed ? "通过" : "失败")
-                                .foregroundColor(step.passed ? .green : .red)
+                            if step.skipped {
+                                Text("跳过")
+                                    .foregroundColor(.secondary)
+                            } else {
+                                Text(step.passed ? "通过" : "失败")
+                                    .foregroundColor(step.passed ? .green : .red)
+                            }
                             Text("\(step.milliseconds)ms")
                                 .foregroundColor(.secondary)
                         }
@@ -202,6 +212,44 @@ struct SourceDetailView: View {
                     Text("深探针：坏了（\(probe.failedStep ?? "首片")：\(probe.reason ?? "")）· \(dateText(probe.checkedAt))")
                         .font(.footnote)
                         .foregroundColor(.orange)
+                }
+            case .transient:
+                Label("没测成", systemImage: "exclamationmark.circle.fill")
+                    .foregroundColor(.orange)
+                // 未完成在哪步 + 原因（超时/疑需节点等，本次没法判定）
+                if let step = result.failedStep {
+                    Text("未完成：\(step)步：\(result.failedReason ?? "")")
+                        .font(.footnote)
+                        .foregroundColor(.orange)
+                }
+                ForEach(result.failedLines.sorted(by: { $0.key < $1.key }), id: \.key) { sample, reason in
+                    Text("\(sample)：\(reason)")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+                // 五步验真明细（每步 + 耗时）
+                if let steps = result.steps, !steps.isEmpty {
+                    ForEach(steps, id: \.name) { step in
+                        HStack {
+                            Text(step.name)
+                            Spacer()
+                            if step.skipped {
+                                Text("跳过")
+                                    .foregroundColor(.secondary)
+                            } else {
+                                Text(step.passed ? "通过" : "失败")
+                                    .foregroundColor(step.passed ? .green : .red)
+                            }
+                            Text("\(step.milliseconds)ms")
+                                .foregroundColor(.secondary)
+                        }
+                        .font(.footnote)
+                    }
+                }
+                if let at = result.checkedAt {
+                    Text("检查时间：\(dateText(at))")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
                 }
             case .skipped:
                 Label("跳过", systemImage: "minus.circle.fill")

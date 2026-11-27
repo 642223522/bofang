@@ -213,9 +213,10 @@ struct SourcesView: View {
         isReading = true
         readingLabel = "正在自检全部源…"
         Task {
-            let (ok, failed, skipped) = await store.runCheckAll()
+            let (ok, failed, transient, skipped) = await store.runCheckAll()
             isReading = false
             var text = "自检完成：\(ok) 个正常，\(failed) 个失败"
+            if transient > 0 { text += "，\(transient) 个未完成验证" }
             if skipped > 0 { text += "，\(skipped) 个重复跳过" }
             showResultAlert(text)
         }
@@ -281,6 +282,14 @@ struct SourcesView: View {
                             .foregroundColor(.orange)
                     }
                 }
+            case .transient:
+                let step = result.failedStep.map { "未完成：\($0)步" } ?? "未完成验证"
+                let reason = result.failedReason ?? ""
+                let checked = result.checkedAt.map { " · \($0.formatted(date: .numeric, time: .shortened))" } ?? ""
+                Text("\(step)：\(reason)\(checked)")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .lineLimit(1)
             case .skipped:
                 Text("与 \(duplicateTitle(for: result.duplicateOf)) 重复，跳过")
                     .font(.caption)

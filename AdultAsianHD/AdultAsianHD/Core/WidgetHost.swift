@@ -77,6 +77,9 @@ final class WidgetHost: @unchecked Sendable {
         case functionMissing(String)
         case callFailed(String)
         case unexpectedResult(String)
+        /// 传输层错误（Widget.http 桥还原出来的底层 URLError 码，见 mapJSRejection）：
+        /// 自检靠它区分“疑需节点”与真失败，不能压扁成普通 JS 异常。
+        case transport(urlErrorCode: Int, message: String)
 
         var errorDescription: String? {
             switch self {
@@ -85,6 +88,7 @@ final class WidgetHost: @unchecked Sendable {
             case .functionMissing(let message): return message
             case .callFailed(let message): return "调用模块失败：\(message)"
             case .unexpectedResult(let message): return message
+            case .transport(let code, let message): return "网络请求失败（\(code)）：\(message)"
             }
         }
     }
@@ -602,7 +606,16 @@ final class WidgetHost: @unchecked Sendable {
                         box.resolve.call(withArguments: [result])
                     }
                 } catch {
-                    let message = error.localizedDescription
+                    // 传输层错误码要透传给 Swift 侧（自检靠它区分"疑需节点"与真失败）：
+                    // localizedDescription 里没有码，JS Error 的 message 只能带字符串，
+                    // 所以用结构化前缀挂在 message 前面，callFunction 侧再还原。
+                    let nsError = error as NSError
+                    let message: String
+                    if nsError.domain == NSURLErrorDomain {
+                        message = "__NATIVE_URLERROR__:\(nsError.code)|\(nsError.localizedDescription)"
+                    } else {
+                        message = error.localizedDescription
+                    }
                     await MainActor.run {
                         guard let ctx = box.reject.context else { return }
                         if let jsError = ctx.objectForKeyedSubscript("Error")?.construct(withArguments: [message]) {
@@ -658,7 +671,16 @@ final class WidgetHost: @unchecked Sendable {
                         box.resolve.call(withArguments: [result])
                     }
                 } catch {
-                    let message = error.localizedDescription
+                    // 传输层错误码要透传给 Swift 侧（自检靠它区分"疑需节点"与真失败）：
+                    // localizedDescription 里没有码，JS Error 的 message 只能带字符串，
+                    // 所以用结构化前缀挂在 message 前面，callFunction 侧再还原。
+                    let nsError = error as NSError
+                    let message: String
+                    if nsError.domain == NSURLErrorDomain {
+                        message = "__NATIVE_URLERROR__:\(nsError.code)|\(nsError.localizedDescription)"
+                    } else {
+                        message = error.localizedDescription
+                    }
                     await MainActor.run {
                         guard let ctx = box.reject.context else { return }
                         if let jsError = ctx.objectForKeyedSubscript("Error")?.construct(withArguments: [message]) {
@@ -1020,46 +1042,55 @@ final class WidgetHost: @unchecked Sendable {
     /// 竞速核心：给定样本，并发调 loadResource 解线计时；每样本第一条能播的线
     /// 定种类，最快的那种线获胜。取样前先让路：用户可见请求（列表/分类/搜索/详情）
     /// 在跑时等一等（每 0.3 秒看一次，最多让 60 秒），不跟首屏抢网。
+    /// 解线有解析步超时兜底（与自检同一套 CheckTimeouts.effectiveMs 解析），
+    /// 挂住的样本不等它，返回空线。
     private func raceSamples(_ samples: [VideoItem]) async -> LineRaceOutcome {
         guard !samples.isEmpty else {
             return LineRaceOutcome(winner: nil, timings: [], note: "没有样本")
         }
         let gateDeadline = Date().addingTimeInterval(60)
+        let parseMs = CheckTimeouts.effectiveMs(for: .parse, declared: self.meta.checkTimeouts.parseMs)
         var best: (kind: PreferredLine, elapsed: TimeInterval)?
         var fastestByKind: [PreferredLine: TimeInterval] = [:]
-        await withTaskGroup(of: (PreferredLine, TimeInterval)?.self) { group in
+        var firstNonRacePlayable: (kind: PlaybackEngine.PlayableLineKind, elapsed: TimeInterval)?
+        typealias RaceSampleResult = (preferred: (PreferredLine, TimeInterval)?, nonRace: (PlaybackEngine.PlayableLineKind, TimeInterval)?)
+        await withTaskGroup(of: RaceSampleResult.self) { group in
             for sample in samples {
                 group.addTask {
                     while self.isUserRequestActive && Date() < gateDeadline {
                         try? await Task.sleep(nanoseconds: 300_000_000)
-                        if Task.isCancelled { return nil }
+                        if Task.isCancelled { return (nil, nil) }
                     }
-                    if Task.isCancelled { return nil }
+                    if Task.isCancelled { return (nil, nil) }
                     let start = Date()
-                    let lines = (try? await self.loadResource(link: sample.link, title: sample.title)) ?? []
+                    let lines = await self.loadResourceWithTimeout(link: sample.link, title: sample.title, milliseconds: parseMs)
                     let elapsed = Date().timeIntervalSince(start)
                     // 该样本第一条能播的线定种类；种类认不出则这个样本不算
                     for line in lines {
-                        let lower = line.url.lowercased()
                         guard !line.url.isEmpty,
-                              lower.contains(".m3u8") || lower.contains(".mp4") else { continue }
-                        if let kind = PlaybackEngine.preferredLineKind(of: line) {
-                            return (kind, elapsed)
+                              let kind = PlaybackEngine.classifyPlayableLine(line) else { continue }
+                        if let preferred = PlaybackEngine.preferredLineKind(of: line) {
+                            return ((preferred, elapsed), nil)
                         }
-                        break
+                        // 有可播线但无竞速种类：记下来（显示“无需竞速”用），不参与竞速
+                        return (nil, (kind, elapsed))
                     }
-                    return nil
+                    return (nil, nil)
                 }
             }
             for await result in group {
-                guard let result else { continue }
-                if let prev = fastestByKind[result.0] {
-                    fastestByKind[result.0] = min(prev, result.1)
-                } else {
-                    fastestByKind[result.0] = result.1
+                if let preferred = result.preferred {
+                    if let prev = fastestByKind[preferred.0] {
+                        fastestByKind[preferred.0] = min(prev, preferred.1)
+                    } else {
+                        fastestByKind[preferred.0] = preferred.1
+                    }
+                    if best == nil || preferred.1 < best!.elapsed {
+                        best = preferred
+                    }
                 }
-                if best == nil || result.1 < best!.elapsed {
-                    best = result
+                if firstNonRacePlayable == nil, let nonRace = result.nonRace {
+                    firstNonRacePlayable = nonRace
                 }
             }
         }
@@ -1067,9 +1098,36 @@ final class WidgetHost: @unchecked Sendable {
             .map { LineTiming(kind: $0.key.displayLabel, milliseconds: Int($0.value * 1000)) }
             .sorted { $0.milliseconds < $1.milliseconds }
         guard let winner = best?.kind else {
+            if let playable = firstNonRacePlayable {
+                let kindText: String
+                switch playable.kind {
+                case .hls: kindText = "HLS"
+                case .directFile: kindText = "直链"
+                case .embed: kindText = "嵌页"
+                }
+                return LineRaceOutcome(winner: nil, timings: timings, note: "无需竞速（\(kindText) · \(Int(playable.elapsed * 1000))ms）")
+            }
             return LineRaceOutcome(winner: nil, timings: timings, note: "样本都解不出可播线路")
         }
         return LineRaceOutcome(winner: winner, timings: timings, note: nil)
+    }
+
+    /// 带超时的 loadResource（竞速用；超时返回空数组，不抛错）。
+    /// 超时值与自检解析步共用同一套 CheckTimeouts.effectiveMs 解析。
+    private func loadResourceWithTimeout(link: String, title: String, milliseconds: Int) async -> [PlayLine] {
+        let result = try? await withThrowingTaskGroup(of: [PlayLine].self) { group in
+            group.addTask { try await self.loadResource(link: link, title: title) }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000)
+                throw CheckStepError.timeout(milliseconds)
+            }
+            guard let lines = try await group.next() else {
+                throw CheckStepError.timeout(milliseconds)
+            }
+            group.cancelAll()
+            return lines
+        }
+        return result ?? []
     }
 
     /// 调指定模块的列表函数，返回视频列表。
@@ -1483,6 +1541,24 @@ final class WidgetHost: @unchecked Sendable {
         }
     }
 
+    /// 把 JS reject 的 message 还原成类型化错误：Widget.http 桥在传输层错误前挂了
+    /// "__NATIVE_URLERROR__:<code>|<message>" 前缀（见 makeHttpGetPromise /
+    /// makeHttpPostPromise），这里还原成 .transport(code:message)，自检靠它区分
+    /// “疑需节点”与真失败；没有前缀的按原样走 .callFailed。
+    private static func mapJSRejection(_ rawMessage: String) -> WidgetHostError {
+        let prefix = "__NATIVE_URLERROR__:"
+        guard rawMessage.hasPrefix(prefix) else {
+            return .callFailed(rawMessage)
+        }
+        let payload = String(rawMessage.dropFirst(prefix.count))
+        let parts = payload.split(separator: "|", maxSplits: 1)
+        if let codeString = parts.first, let code = Int(codeString) {
+            let message = parts.count > 1 ? String(parts[1]) : rawMessage
+            return .transport(urlErrorCode: code, message: message)
+        }
+        return .callFailed(rawMessage)
+    }
+
     /// Promise 桥接的核心：
     /// - 不是 Promise（没有 then）就直接当结果用——有的模块同步返回数组，不包 Promise；
     /// - 是 Promise 就调它的 then(onFulfilled, onRejected)，用 continuation 转成 Swift async。
@@ -1533,7 +1609,8 @@ final class WidgetHost: @unchecked Sendable {
                         } else {
                             message = reason.toString()
                         }
-                        continuation.resume(throwing: WidgetHostError.callFailed(message.isEmpty ? "模块执行失败" : message))
+                        let rawMessage = message.isEmpty ? "模块执行失败" : message
+                        continuation.resume(throwing: Self.mapJSRejection(rawMessage))
                     }
                 )
                 DispatchQueue.main.async {

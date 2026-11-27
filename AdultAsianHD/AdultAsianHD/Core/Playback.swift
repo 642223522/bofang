@@ -101,6 +101,51 @@ enum PlaybackEngine {
         return !isDirectMediaURL(urlString)
     }
 
+    /// 一条可播线路的种类（自检 + 竞速共用；播放路由仍用 route(for:) 的完整判定）。
+    enum PlayableLineKind {
+        case hls
+        case directFile
+        case embed
+    }
+
+    /// 统一分类器：自检、竞速共用这一个入口，不再手写 .m3u8/.mp4 子串判断。
+    /// 顺序：
+    ///  1. URL 含 .m3u8 → .hls；含 .mp4/.mov → .directFile（沿用 isDirectMediaURL）。
+    ///  2. playerHint：exact "mp4"/"direct"/"avplayer" → .directFile；"hls"/"m3u8" → .hls；
+    ///     含 "embed"/"webview"/"hlsjs" → .embed（"hlsjs" 不当直链，它明确走 WebView）。
+    ///     这一步兜底无扩展名签发直链（如 javtiful 的 /media/video/<id>/720p，
+    ///     URL 里没有 .mp4，模块须给 playerHint "mp4"，否则会被下面误判成嵌页。
+    ///  3. URL 形态：path 含 /e/、/embed/、/player/ → .embed。
+    ///  4. 其余 http(s) URL → .directFile（按内容校验兜底；Step 5 遇 HTML 时回退按嵌页重验）。
+    ///  5. 非 http(s) / 空 URL → nil。
+    static func classifyPlayableLine(_ line: PlayLine) -> PlayableLineKind? {
+        let trimmed = line.url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let url = URL(string: trimmed),
+              url.scheme == "http" || url.scheme == "https" else { return nil }
+        if isDirectMediaURL(trimmed) {
+            return trimmed.lowercased().contains(".m3u8") ? .hls : .directFile
+        }
+        if let hint = line.playerHint?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           !hint.isEmpty {
+            if hint == "mp4" || hint == "direct" || hint == "avplayer" { return .directFile }
+            if hint == "hls" || hint == "m3u8" { return .hls }
+            if hint.contains("embed") || hint.contains("webview") || hint.contains("hlsjs") { return .embed }
+        }
+        let path = url.path.lowercased()
+        if path.contains("/e/") || path.contains("/embed/") || path.contains("/player/") { return .embed }
+        return .directFile
+    }
+
+    /// 按播放真实顺序排序候选线：模块返回顺序；preferredKind 有值时把该种线提到最前
+    /// （其余保持原顺序）。播放试线就是这个顺序（失败换下一条未试过的线）。
+    static func orderPlayableLines(_ lines: [PlayLine], preferredKind: PreferredLine?) -> [PlayLine] {
+        guard let preferred = preferredKind else { return lines }
+        let preferredLines = lines.filter { preferredLineKind(of: $0) == preferred }
+        let rest = lines.filter { preferredLineKind(of: $0) != preferred }
+        return preferredLines + rest
+    }
+
     /// URL 里是否含签名/token 参数（现铸签名、一次性 token 类）。
     /// 查 query 参数名，不只查子串，避免把路径里偶然出现的词误判。
     static func isSignedURL(_ urlString: String) -> Bool {

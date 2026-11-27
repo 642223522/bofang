@@ -64,6 +64,7 @@ struct DiagnosticsView: View {
                             infoRow("上次同步", lastSyncText)
                             infoRow("源数量", "\(store.sources.count)")
                             infoRow("自检失败", "\(failedCheckCount) 个")
+                            infoRow("自检未完成", "\(transientCheckCount) 个")
                             infoRow("竞速已测", "\(store.raceResults.count) 个")
                             infoRow("后台自检", store.autoCheckCycleDescription)
                         }
@@ -176,6 +177,13 @@ struct DiagnosticsView: View {
                         .font(.caption)
                         .foregroundColor(.red)
                         .lineLimit(1)
+                case .transient:
+                    let step = result.failedStep.map { "未完成：\($0)步" } ?? "未完成验证"
+                    let reason = result.failedReason ?? ""
+                    Text(step + "：" + reason + (result.checkedAt.map { " · \($0.formatted(date: .numeric, time: .shortened))" } ?? ""))
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                        .lineLimit(1)
                 case .skipped:
                     Text("与 \(duplicateTitle(for: result.duplicateOf)) 重复，跳过" + (result.checkedAt.map { " · \($0.formatted(date: .numeric, time: .shortened))" } ?? ""))
                         .font(.caption)
@@ -249,6 +257,11 @@ struct DiagnosticsView: View {
         store.checkResults.values.filter { $0.status == .failed }.count
     }
 
+    /// 没测成（超时/传输失败/疑需节点）的源数：不计失败，只提示本次没法判定。
+    private var transientCheckCount: Int {
+        store.checkResults.values.filter { $0.status == .transient }.count
+    }
+
     /// 重复的那个源的标题（duplicateOf 是源 id；找不到显示 id）。
     private func duplicateTitle(for duplicateOf: String?) -> String {
         guard let id = duplicateOf else { return "其他源" }
@@ -260,9 +273,10 @@ struct DiagnosticsView: View {
     private func checkAll() {
         isCheckingAll = true
         Task {
-            let (ok, failed, skipped) = await store.runCheckAll()
+            let (ok, failed, transient, skipped) = await store.runCheckAll()
             isCheckingAll = false
             var text = "自检完成：\(ok) 个正常，\(failed) 个失败"
+            if transient > 0 { text += "，\(transient) 个未完成验证" }
             if skipped > 0 { text += "，\(skipped) 个重复跳过" }
             resultMessage = text
             showResultAlert = true

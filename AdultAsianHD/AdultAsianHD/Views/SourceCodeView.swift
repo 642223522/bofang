@@ -148,6 +148,10 @@ struct SourceCodeView: View {
                 let step = result.failedStep.map { "死在\($0)步" } ?? "自检失败"
                 Label(step + "：" + (result.failedReason ?? ""), systemImage: "xmark.circle.fill")
                     .foregroundColor(.red)
+            case .transient:
+                let step = result.failedStep.map { "未完成：\($0)步" } ?? "未完成验证"
+                Label(step + "：" + (result.failedReason ?? ""), systemImage: "exclamationmark.circle.fill")
+                    .foregroundColor(.orange)
             case .skipped:
                 Label("跳过（与 \(duplicateTitle(for: result.duplicateOf)) 重复）", systemImage: "minus.circle.fill")
                     .foregroundColor(.secondary)
