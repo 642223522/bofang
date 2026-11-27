@@ -1013,13 +1013,16 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                     timeout: remaining
                 )
                 let elapsedMs = Int(Date().timeIntervalSince(started) * 1000)
+                // R8-1：成功路径的 metrics 等待也要按剩余预算给上限（与错
+                // 误分支同形）——否则只剩 10ms 时仍等满 150ms，data() 会在
+                // deadline 之后 ~140ms 才返回，违反单一绝对 deadline。
                 let event = NetworkDiagnostics.makeEvent(
                     source: source,
                     request: request,
                     response: response,
                     bodyData: data,
                     error: nil,
-                    metrics: await delegate.takeMetricsSoon(),
+                    metrics: await delegate.takeMetricsSoon(maxWait: min(0.15, max(0, deadline.timeIntervalSinceNow))),
                     fallbackDurationMs: elapsedMs,
                     networkClass: networkClassAtStart
                 )
@@ -1035,13 +1038,18 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                 // R7-6：总超时时 remainingForMetrics == 0，metrics 几乎必为 nil
                 //（task.cancel() 刚发出，didFinishCollecting 还没回调），诊断
                 // 账本会丢掉 DNS/TCP/TLS/TTFB。data() 仍零等待立即返回；仅在
-                // metrics == nil 且非取消时，用脱离当前请求的 Task.detached
-                // 后台等最多 150ms 补采完再记事件（只影响诊断记账，不阻塞调用方）。
-                // F2 与兜底逻辑仍用这里的（可能为 nil 的）metrics，不等补采。
+                // metrics == nil、非取消、且内联等待未满 150ms（remainingForMetrics
+                // < 0.15）时，用脱离当前请求的 Task.detached 后台补采再记事件
+                //（只影响诊断记账，不阻塞调用方）。内联已等满 150ms 时不再补采
+                //（R8-3：否则内联 + 补采共 300ms，且主流程的事件会先记、诊断
+                // 时间线乱序）。补采预算 = 150ms - 内联已等，下限 25ms（一轮
+                // 轮询）。F2 与兜底逻辑仍用这里的（可能为 nil 的）metrics，不等补采。
                 // 事件恰好记一次（if/else，二选一）。
-                if metrics == nil, !(error is CancellationError) {
-                    Task.detached {
-                        let lateMetrics = await delegate.takeMetricsSoon(for: error, maxWait: 0.15)
+                if metrics == nil, !(error is CancellationError), remainingForMetrics < 0.15 {
+                    // R8-2：[request] 按值快照——request 是 var，@Sendable 闭包
+                    // 不能直接捕获可变局部变量（Swift 6 编译错）。
+                    Task.detached { [request] in
+                        let lateMetrics = await delegate.takeMetricsSoon(for: error, maxWait: max(0.025, 0.15 - remainingForMetrics))
                         let lateEvent = NetworkDiagnostics.makeEvent(
                             source: source,
                             request: request,
