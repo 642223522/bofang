@@ -1,8 +1,7 @@
 // SourceCodeView.swift — 源代码页（v2 重建）
 // 源 Tab 点源行进这里：显示该源 .js 文件的全部代码（等宽字体、可滚动、
-// 可选中，工具栏一键复制），顶部是源的基本信息；自检 / 上传坏模块 /
-// 导出 / 删除都能在这里用；完整的五步自检明细走「源详情」进
-// SourceDetailView。
+// 可选中，工具栏一键复制），顶部是源的基本信息；导出 / 删除
+// 都能在这里用。
 
 import SwiftUI
 import UIKit
@@ -15,8 +14,6 @@ struct SourceCodeView: View {
 
     @State private var codeText: String?
     @State private var loadFailed = false
-    @State private var isChecking = false
-    @State private var isUploading = false
     @State private var showDeleteConfirm = false
     @State private var resultMessage = ""
     @State private var showResultAlert = false
@@ -90,24 +87,6 @@ struct SourceCodeView: View {
                 infoRow("导入方式", originText)
             }
 
-            Section("自检状态") {
-                checkStatusLine
-                Button {
-                    Task { await runCheck() }
-                } label: {
-                    Label(isChecking ? "正在自检…" : "立即自检", systemImage: "stethoscope")
-                }
-                .disabled(isChecking)
-                if store.checkResults[source.id]?.status == .failed {
-                    Button {
-                        Task { await uploadBroken() }
-                    } label: {
-                        Label(isUploading ? "正在上传…" : "上传坏的模块到码云", systemImage: "arrow.up.doc")
-                    }
-                    .disabled(isUploading)
-                }
-            }
-
             Section("操作") {
                 if let url = store.exportURL(for: source) {
                     ShareLink(item: url) {
@@ -135,38 +114,7 @@ struct SourceCodeView: View {
         .listStyle(.insetGrouped)
     }
 
-    // MARK: - 自检状态（一行简况；完整五步明细走「源详情」）
-
-    @ViewBuilder
-    private var checkStatusLine: some View {
-        if let result = store.checkResults[source.id] {
-            switch result.status {
-            case .ok:
-                Label("正常", systemImage: "checkmark.circle.fill")
-                    .foregroundColor(.green)
-            case .failed:
-                let step = result.failedStep.map { "死在\($0)步" } ?? "自检失败"
-                Label(step + "：" + (result.failedReason ?? ""), systemImage: "xmark.circle.fill")
-                    .foregroundColor(.red)
-            case .transient:
-                let step = result.failedStep.map { "未完成：\($0)步" } ?? "未完成验证"
-                Label(step + "：" + (result.failedReason ?? ""), systemImage: "exclamationmark.circle.fill")
-                    .foregroundColor(.orange)
-            case .skipped:
-                Label("跳过（与 \(duplicateTitle(for: result.duplicateOf)) 重复）", systemImage: "minus.circle.fill")
-                    .foregroundColor(.secondary)
-            }
-        } else {
-            Text("未自检")
-                .foregroundColor(.secondary)
-        }
-    }
-
-    /// 重复的那个源的标题（duplicateOf 是源 id；找不到显示 id）。
-    private func duplicateTitle(for duplicateOf: String?) -> String {
-        guard let id = duplicateOf else { return "其他源" }
-        return store.sources.first(where: { $0.id == id })?.title ?? id
-    }
+    // MARK: - 信息行
 
     private func infoRow(_ label: String, _ value: String) -> some View {
         HStack(alignment: .top) {
@@ -195,24 +143,4 @@ struct SourceCodeView: View {
         return formatter.string(from: date)
     }
 
-    private func runCheck() async {
-        isChecking = true
-        _ = await store.runCheck(for: source)
-        isChecking = false
-    }
-
-    private func uploadBroken() async {
-        isUploading = true
-        // 传空串：store 里先用 Keychain 存过的 Token，没有才报错；
-        // 传的是全部自检失败的源，不只这一个。
-        let result = await store.uploadBrokenSources(token: "")
-        isUploading = false
-        switch result {
-        case .success(let count):
-            resultMessage = "已上传 \(count) 个坏的模块到码云 broken 分支"
-        case .failure(let error):
-            resultMessage = error.localizedDescription
-        }
-        showResultAlert = true
-    }
 }

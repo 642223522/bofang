@@ -141,7 +141,7 @@ struct WidgetMeta {
     let author: String?
     /// 站点地址（WidgetMetadata.site / siteUrl / homepage，哪个有取哪个），没有为 nil
     let site: String?
-    /// 自检每步超时（毫秒），模块在 WidgetMetadata.checkTimeouts 里声明；
+    /// 竞速解析超时（毫秒），模块在 WidgetMetadata.checkTimeouts 里声明；
     /// 没声明的步用分步默认值（见 CheckTimeouts.effectiveMs）。
     /// 注意：声明处不给默认值（默认值在下方显式 init 的参数里）——
     /// 声明处给了 `= CheckTimeouts()` 又在 init 里赋值，Swift 会报
@@ -162,10 +162,10 @@ struct WidgetMeta {
     }
 }
 
-/// 自检每步超时（毫秒），由模块在 WidgetMetadata.checkTimeouts 里声明。
-/// 没声明的步为 nil，宿主用分步默认值（list 10000 / detail 10000 / parse 18000 /
-/// playlist 10000 / firstFrame 12000）；朋友的模块不声明，行为与原来完全一致。
-/// 例子（javpub，竞速模块冷启动要 6–11 秒）：{ parseMs: 15000 }，其余默认。
+/// 竞速解析超时（毫秒），由模块在 WidgetMetadata.checkTimeouts 里声明。
+/// 没声明的步为 nil，竞速解析步用默认值 18000ms；其余步的默认值保留在
+/// effectiveMs 里暂不用。朋友的模块不声明，行为与原来完全一致。
+/// 例子（javpub，竞速模块冷启动要 6–11 秒）：{ parseMs: 22000 }，其余默认。
 struct CheckTimeouts {
     let listMs: Int?
     let detailMs: Int?
@@ -184,7 +184,7 @@ struct CheckTimeouts {
     }
 
     /// 分步默认值解析：模块声明值优先，钳制到 1000...60000ms，防止模块写错数字
-    /// （1ms 或 10 分钟）把自检卡住或拖垮。SourceStore 与 WidgetHost（竞速）共用。
+    /// （1ms 或 10 分钟）把竞速卡住或拖垮。竞速（WidgetHost）用。
     static func effectiveMs(for kind: CheckStepKind, declared: Int?) -> Int {
         let fallback: Int
         switch kind {
@@ -199,7 +199,7 @@ struct CheckTimeouts {
     }
 }
 
-/// 自检步骤种类（与 CheckTimeouts 的分步默认值对应）。
+/// 超时步骤种类（与 CheckTimeouts 的分步默认值对应；目前竞速只用 .parse）。
 enum CheckStepKind {
     case list
     case detail

@@ -50,7 +50,7 @@ func isWalledEmbedHost(_ host: String?) -> Bool {
     return wallEmbedHostFamilies.contains { host == $0 || host.hasSuffix("." + $0) }
 }
 
-/// 失败分层（供自检做分层错误记录，Fix C 用；失败上报不要只报“失败”）。
+/// 失败分层（供账本做分层错误记录；失败上报不要只报“失败”）。
 /// 分层铁证：VPN 不改头、不改 cookie——VPN 下可播，则缺头/缺 cookie 不可能是首要根因；
 /// VPN 下仍不可播，才是头/cookie/解析问题；明文流（pornjav）在 B 上也要代理，
 /// 几乎一定在网络层，与 playerHint 无关。

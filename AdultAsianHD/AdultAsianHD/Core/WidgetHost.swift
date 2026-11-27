@@ -78,7 +78,7 @@ final class WidgetHost: @unchecked Sendable {
         case callFailed(String)
         case unexpectedResult(String)
         /// 传输层错误（Widget.http 桥还原出来的底层 URLError 码，见 mapJSRejection）：
-        /// 自检靠它区分“疑需节点”与真失败，不能压扁成普通 JS 异常。
+        /// 账本/诊断靠它区分“疑需节点”与真失败，不能压扁成普通 JS 异常。
         case transport(urlErrorCode: Int, message: String)
 
         var errorDescription: String? {
@@ -172,8 +172,8 @@ final class WidgetHost: @unchecked Sendable {
             return metaId
         }()
         let searchDict = metaDict["search"] as? [String: Any]
-        // 自检每步超时（毫秒）：模块在 WidgetMetadata.checkTimeouts 里声明，
-        // 没声明的步为 nil，宿主用默认 6000ms（见 SourceStore.stepTimeout）。
+        // 竞速解析超时（毫秒）：模块在 WidgetMetadata.checkTimeouts 里声明，
+        // 没声明的步为 nil，竞速用分步默认值（见 CheckTimeouts.effectiveMs）。
         let checkDict = metaDict["checkTimeouts"] as? [String: Any]
         let checkTimeouts = CheckTimeouts(
             listMs: checkDict?["listMs"] as? Int,
@@ -606,7 +606,7 @@ final class WidgetHost: @unchecked Sendable {
                         box.resolve.call(withArguments: [result])
                     }
                 } catch {
-                    // 传输层错误码要透传给 Swift 侧（自检靠它区分"疑需节点"与真失败）：
+                    // 传输层错误码要透传给 Swift 侧（账本/诊断靠它区分"疑需节点"与真失败）：
                     // localizedDescription 里没有码，JS Error 的 message 只能带字符串，
                     // 所以用结构化前缀挂在 message 前面，callFunction 侧再还原。
                     let nsError = error as NSError
@@ -671,7 +671,7 @@ final class WidgetHost: @unchecked Sendable {
                         box.resolve.call(withArguments: [result])
                     }
                 } catch {
-                    // 传输层错误码要透传给 Swift 侧（自检靠它区分"疑需节点"与真失败）：
+                    // 传输层错误码要透传给 Swift 侧（账本/诊断靠它区分"疑需节点"与真失败）：
                     // localizedDescription 里没有码，JS Error 的 message 只能带字符串，
                     // 所以用结构化前缀挂在 message 前面，callFunction 侧再还原。
                     let nsError = error as NSError
@@ -880,7 +880,7 @@ final class WidgetHost: @unchecked Sendable {
     /// 兜底：id 或标题含 "fixed" / "固定验线"。
     /// pornjav.js 里就是 id "pornjav-fixed"、kind 常量 "fixed"，
     /// 返回两个固定样本 JUQ-984（nmcorp 线）＋ ATID-686（memojav 线）。
-    /// 自检（SourceStore）也用这个找探针入口。
+    /// 竞速也用这个找固定验线样本。
     func fixedProbeModule() -> ModuleDescriptor? {
         modules.first { module in
             module.params.contains { param in
@@ -1042,7 +1042,7 @@ final class WidgetHost: @unchecked Sendable {
     /// 竞速核心：给定样本，并发调 loadResource 解线计时；每样本第一条能播的线
     /// 定种类，最快的那种线获胜。取样前先让路：用户可见请求（列表/分类/搜索/详情）
     /// 在跑时等一等（每 0.3 秒看一次，最多让 60 秒），不跟首屏抢网。
-    /// 解线有解析步超时兜底（与自检同一套 CheckTimeouts.effectiveMs 解析），
+    /// 解线有解析步超时兜底（CheckTimeouts.effectiveMs 解析，模块声明的 parseMs 优先），
     /// 挂住的样本不等它，返回空线。
     private func raceSamples(_ samples: [VideoItem]) async -> LineRaceOutcome {
         guard !samples.isEmpty else {
@@ -1113,7 +1113,7 @@ final class WidgetHost: @unchecked Sendable {
     }
 
     /// 带超时的 loadResource（竞速用；超时返回空数组，不抛错）。
-    /// 超时值与自检解析步共用同一套 CheckTimeouts.effectiveMs 解析。
+    /// 超时值由 raceSamples 按 CheckTimeouts.effectiveMs 算好传进来。
     private func loadResourceWithTimeout(link: String, title: String, milliseconds: Int) async -> [PlayLine] {
         let result = try? await withThrowingTaskGroup(of: [PlayLine].self) { group in
             group.addTask { try await self.loadResource(link: link, title: title) }
@@ -1543,7 +1543,7 @@ final class WidgetHost: @unchecked Sendable {
 
     /// 把 JS reject 的 message 还原成类型化错误：Widget.http 桥在传输层错误前挂了
     /// "__NATIVE_URLERROR__:<code>|<message>" 前缀（见 makeHttpGetPromise /
-    /// makeHttpPostPromise），这里还原成 .transport(code:message)，自检靠它区分
+    /// makeHttpPostPromise），这里还原成 .transport(code:message)，账本/诊断靠它区分
     /// “疑需节点”与真失败；没有前缀的按原样走 .callFailed。
     private static func mapJSRejection(_ rawMessage: String) -> WidgetHostError {
         let prefix = "__NATIVE_URLERROR__:"

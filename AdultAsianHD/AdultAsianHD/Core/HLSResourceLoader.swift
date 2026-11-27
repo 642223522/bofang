@@ -118,7 +118,7 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     private(set) var preflightPlaylistStatusCode: Int?
     /// 首次播单响应体是不是 M3U8。
     private(set) var preflightPlaylistIsM3U8: Bool?
-    /// 最近一次失败的分层与状态码（供 markFailed 组分层错误上报，Fix C 的自检复用）。
+    /// 最近一次失败的分层与状态码（供 markFailed 组分层错误上报，账本复用）。
     private(set) var lastFailureStage: PlaybackFailureStage?
     private(set) var lastFailureStatusCode: Int?
     /// 播单里见过的 #EXT-X-TARGETDURATION（秒）：seek 容差/看门狗预算的
@@ -531,7 +531,7 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
         encounteredFairPlay = true
     }
 
-    /// 分层失败记录（供 markFailed 组分层错误上报，Fix C 的自检复用）。
+    /// 分层失败记录（供 markFailed 组分层错误上报，账本复用）。
     private func recordFailure(stage: PlaybackFailureStage, statusCode: Int?) {
         stateLock.lock()
         defer { stateLock.unlock() }

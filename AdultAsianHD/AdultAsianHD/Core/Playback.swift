@@ -101,14 +101,14 @@ enum PlaybackEngine {
         return !isDirectMediaURL(urlString)
     }
 
-    /// 一条可播线路的种类（自检 + 竞速共用；播放路由仍用 route(for:) 的完整判定）。
+    /// 一条可播线路的种类（竞速用；播放路由仍用 route(for:) 的完整判定）。
     enum PlayableLineKind {
         case hls
         case directFile
         case embed
     }
 
-    /// 统一分类器：自检、竞速共用这一个入口，不再手写 .m3u8/.mp4 子串判断。
+    /// 统一分类器：竞速用这一个入口，不再手写 .m3u8/.mp4 子串判断。
     /// 顺序：
     ///  1. URL 含 .m3u8 → .hls；含 .mp4/.mov → .directFile（沿用 isDirectMediaURL）。
     ///  2. playerHint：exact "mp4"/"direct"/"avplayer" → .directFile；"hls"/"m3u8" → .hls；
@@ -1002,8 +1002,6 @@ final class PlayerViewModel: ObservableObject {
     ///   没 nmcorp 线才退回快路径，已解出的线留作备线，不再跑一次 loadResource。
     /// - 首选 memojav / 无胜负 / 没竞速：现有逻辑（快路径先上，后台拿备线）。
     func play(item: VideoItem, host: WidgetHost) async {
-        // 开始播放：后台自动自检立刻停（让路），下次断点续跑。
-        SourceStore.shared.cancelAutoCheck()
         // 上一场的账本尝试若还开着（同一 ViewModel 重播），先按停播终局。
         finalizeLedgerAttempt(outcome: "停播", playedOK: false)
         let generation = UUID()
@@ -1164,7 +1162,7 @@ final class PlayerViewModel: ObservableObject {
     /// 播放器报错时调（Views 层监听 AVPlayerItemFailedToPlayToEndTime 等）。
     /// stage：调用方已知的失败分层（CustomPlayerController 报 -12881 时传 .segmentFetch，
     /// 其余传 nil，由拦截器记的分层兜底）。失败上报要分层，不要只报“失败”：
-    /// 播单拉取失败 / key 失败 / 分片失败 + HTTP 状态码（Fix C 的自检复用这套分层）。
+    /// 播单拉取失败 / key 失败 / 分片失败 + HTTP 状态码（账本复用这套分层）。
     /// 分层铁证（见 PlaybackFailureStage）：VPN 不改头、不改 cookie——VPN 下可播，
     /// 则缺头/缺 cookie 不可能是首要根因；VPN 下仍不可播，才是头/cookie/解析问题；
     /// 明文流（pornjav）在 B 上也要代理，几乎一定在网络层，与 playerHint 无关。

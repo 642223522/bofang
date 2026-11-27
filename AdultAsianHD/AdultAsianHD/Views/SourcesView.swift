@@ -41,10 +41,6 @@ struct SourcesView: View {
     @State private var showSyncSheet = false
     @State private var giteeToken = ""
 
-    /// “仅 Wi-Fi 时自动自检”开关（默认关）。只影响后台自动自检；
-    /// 手动自检和下载不受影响（下载仍可走流量）。
-    @AppStorage(SourceStore.wifiOnlyAutoCheckDefaultsKey) private var wifiOnlyAutoCheck = false
-
     /// 当前源 id（同步后首个源自动设为当前）。
     @AppStorage("currentSourceId") private var currentSourceId = ""
 
@@ -61,11 +57,7 @@ struct SourcesView: View {
                         .padding(.horizontal)
                         .padding(.bottom, 8)
 
-                    checkRow
-                        .padding(.horizontal)
-                        .padding(.bottom, 8)
-
-                    wifiToggleRow
+                    uploadRow
                         .padding(.horizontal)
                         .padding(.bottom, 8)
 
@@ -161,151 +153,35 @@ struct SourcesView: View {
         return formatter.string(from: date)
     }
 
-    /// 自检失败的源个数（上传按钮角标与可用状态用）。
-    private var failedCheckCount: Int {
-        store.checkResults.values.filter { $0.status == .failed }.count
-    }
+    // MARK: - 上传账本操作行
 
-    // MARK: - 自检 / 上传坏模块操作行
-
-    private var checkRow: some View {
+    private var uploadRow: some View {
         HStack(spacing: 12) {
             Button {
-                checkAll()
+                uploadLedger()
             } label: {
-                Label("自检全部", systemImage: "stethoscope")
+                Label("上传账本", systemImage: "arrow.up.doc")
             }
             .buttonStyle(.bordered)
-            .disabled(store.sources.isEmpty)
-
-            Button {
-                uploadBroken()
-            } label: {
-                Label("上传坏的模块\(failedCheckCount > 0 ? "（\(failedCheckCount)）" : "")", systemImage: "arrow.up.doc")
-            }
-            .buttonStyle(.bordered)
-            .disabled(failedCheckCount == 0)
 
             Spacer()
         }
     }
 
-    /// “仅 Wi-Fi 时自动自检”开关行（默认关，只影响后台自动自检）。
-    /// 主文案和说明分两行：原来说明跟在主文案后面 inline，窄屏下两处一起换行、
-    /// 挤成三行；现在主文案一行、说明一行，永不乱折。
-    private var wifiToggleRow: some View {
-        Toggle(isOn: $wifiOnlyAutoCheck) {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Image(systemName: "wifi")
-                    Text("仅 Wi-Fi 时自动自检")
-                }
-                Text("后台自检，12 小时一轮")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-            .font(.footnote)
-        }
-        .toggleStyle(.switch)
-    }
-
-    private func checkAll() {
+    private func uploadLedger() {
         isReading = true
-        readingLabel = "正在自检全部源…"
-        Task {
-            let (ok, failed, transient, skipped) = await store.runCheckAll()
-            isReading = false
-            var text = "自检完成：\(ok) 个正常，\(failed) 个失败"
-            if transient > 0 { text += "，\(transient) 个未完成验证" }
-            if skipped > 0 { text += "，\(skipped) 个重复跳过" }
-            showResultAlert(text)
-        }
-    }
-
-    private func uploadBroken() {
-        isReading = true
-        readingLabel = "正在上传坏的模块…"
+        readingLabel = "正在上传账本…"
         Task {
             // 传空串：store 里先用 Keychain 存过的 Token，没有才报错。
-            let result = await store.uploadBrokenSources(token: giteeToken)
-            // 账本一起传（reports 分支，Muse 每天读报告时一起读到）；账本传失败不影响坏模块的结果。
-            let ledgerResult = await store.uploadLedger(token: giteeToken)
+            let result = await store.uploadLedger(token: giteeToken)
             isReading = false
-            var parts: [String] = []
             switch result {
-            case .success(let count):
-                parts.append("已上传 \(count) 个坏的模块到码云 broken 分支")
-            case .failure(let error):
-                parts.append(error.localizedDescription)
-            }
-            switch ledgerResult {
             case .success(let file):
-                parts.append("账本已传到 reports 分支（\(file)）")
+                showResultAlert("账本已传到 reports 分支（\(file)）")
             case .failure(let error):
-                parts.append("账本没传上去：\(error.localizedDescription)")
+                showResultAlert(error.localizedDescription)
             }
-            showResultAlert(parts.joined(separator: "；"))
         }
-    }
-
-    /// 列表行里的自检状态：正常（绿）/ 失败（红，死在哪步）/ 跳过（灰，重复）/ 未自检（灰）。
-    /// 深探针坏了在下面另起一行标出来。
-    @ViewBuilder
-    private func checkStatusLine(for source: SourceRecord) -> some View {
-        if let result = store.checkResults[source.id] {
-            switch result.status {
-            case .ok:
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("自检正常" + (result.checkedAt.map { " · \($0.formatted(date: .numeric, time: .shortened))" } ?? ""))
-                        .font(.caption)
-                        .foregroundColor(.green)
-                    if let probe = result.deepProbe, !probe.passed {
-                        Text("深探针：坏了（\(probe.failedStep ?? "首片")）· \(probe.checkedAt.formatted(date: .numeric, time: .shortened))")
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                    }
-                }
-            case .failed:
-                VStack(alignment: .leading, spacing: 2) {
-                    let step = result.failedStep.map { "死在\($0)步" } ?? "自检失败"
-                    // 拆成三段再拼：整句一次拼完类型检查超时（GitHub Actions
-                    // 首次运行报错：unable to type-check in reasonable time）。
-                    let reason = result.failedReason ?? result.failedLines.sorted(by: { $0.key < $1.key }).first.map { "\($0.key)：\($0.value)" } ?? ""
-                    let checked = result.checkedAt.map { " · \($0.formatted(date: .numeric, time: .shortened))" } ?? ""
-                    Text("\(step)：\(reason)\(checked)")
-                        .font(.caption)
-                        .foregroundColor(.red)
-                        .lineLimit(1)
-                    if let probe = result.deepProbe, !probe.passed {
-                        Text("深探针：坏了（\(probe.failedStep ?? "首片")）· \(probe.checkedAt.formatted(date: .numeric, time: .shortened))")
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                    }
-                }
-            case .transient:
-                let step = result.failedStep.map { "未完成：\($0)步" } ?? "未完成验证"
-                let reason = result.failedReason ?? ""
-                let checked = result.checkedAt.map { " · \($0.formatted(date: .numeric, time: .shortened))" } ?? ""
-                Text("\(step)：\(reason)\(checked)")
-                    .font(.caption)
-                    .foregroundColor(.orange)
-                    .lineLimit(1)
-            case .skipped:
-                Text("与 \(duplicateTitle(for: result.duplicateOf)) 重复，跳过")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-        } else {
-            Text("未自检")
-                .font(.caption)
-                .foregroundColor(.secondary)
-        }
-    }
-
-    /// 重复的那个源的标题（duplicateOf 是源 id；找不到显示 id）。
-    private func duplicateTitle(for duplicateOf: String?) -> String {
-        guard let id = duplicateOf else { return "其他源" }
-        return store.sources.first(where: { $0.id == id })?.title ?? id
     }
 
     // MARK: - 源列表
@@ -349,7 +225,6 @@ struct SourcesView: View {
                                                 .foregroundColor(.accentColor)
                                         }
                                     }
-                                    checkStatusLine(for: source)
                                 }
                             }
                             .buttonStyle(.plain)
