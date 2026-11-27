@@ -39,7 +39,18 @@ struct CategoryDetectionRule {
 /// 没登记的模块走默认规则；pornjav 目前用默认，不用登记。
 /// 以后有模块的分类信号不一样，在这里加一行即可，不用改识别逻辑。
 enum CategoryDetectionRules {
-    static let perModule: [String: CategoryDetectionRule] = [:]
+    /// javhd：分类瓦片带封面图（cat/N.jpg），链接是 /<slug>/ 而不是 /category/，
+    /// 所以默认规则只能打 2 分（id 的 "-cat-" + _cat 的"分类"）；阈值降到 2，
+    /// 视频项（纯数字 id、_cat 为空）仍是 0 分，不会误判。
+    static let perModule: [String: CategoryDetectionRule] = [
+        "user.javhd": CategoryDetectionRule(
+            idMarker: "cat-",
+            categoryMarker: "分类",
+            linkPathMarker: "/category/",
+            countsMissingCover: true,
+            threshold: 2
+        ),
+    ]
 
     static func rule(forModuleId moduleId: String) -> CategoryDetectionRule {
         perModule[moduleId] ?? .default

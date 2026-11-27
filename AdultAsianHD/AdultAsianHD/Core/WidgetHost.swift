@@ -1182,8 +1182,10 @@ final class WidgetHost: @unchecked Sendable {
         return try parseVideoItems(result)
     }
 
-    /// 取某分类下的视频。模块零改动，宿主侧只走一条路（run #20）：
-    /// 直调 WP REST：GET /wp-json/wp/v2/posts?categories=<id>&per_page=20&page=<n>
+    /// 取某分类下的视频。优先走模块分类（run #27，javhd 这类非 WP 站）：
+    /// 模块声明了 kind="category" 的列表入口时，直接调模块 loadList（slug 作 input）。
+    /// 没声明的模块（pornjav）走原有路（run #20）：直调 WP REST：
+    /// GET /wp-json/wp/v2/posts?categories=<id>&per_page=20&page=<n>
     /// + B 查询（_embed=wp:featuredmedia&_fields 瘦身），映射成 VideoItem；
     /// 点视频时把帖子链接交回现有的 loadResource 解析播放。
     /// 拦截路径只作兜底：直调抛错才走它（绝不与直调并行——两路串行 8–12 秒，
@@ -1196,6 +1198,13 @@ final class WidgetHost: @unchecked Sendable {
     func loadCategoryVideos(categoryId: String, categoryName: String, page: Int, siteHost: String? = nil, categorySlug: String? = nil) async throws -> [VideoItem] {
         beginUserRequest()
         defer { endUserRequest() }
+        // 模块分类优先：有 kind="category" 入口的模块（javhd），点分类直接调模块
+        // loadList（slug 作 input），不用走 WP REST。失败直接抛，不回退 WP
+        //（该站没有 WP REST，回退只会再撞一次 404）。
+        if let catModule = categoryListModule(), let slug = categorySlug, !slug.isEmpty {
+            let result = try await callFunction(catModule.functionName, params: buildParams(for: catModule, page: page, inputs: ["slug": slug]))
+            return try parseVideoItems(result)
+        }
         let numericId = VideoItem.numericId(from: categoryId)
         let apiHost = siteHost.map { Self.stripWWWPrefix($0) }
 
@@ -1260,6 +1269,18 @@ final class WidgetHost: @unchecked Sendable {
                 (param["name"] as? String) == "kind"
                 && (param["type"] as? String) == "constant"
                 && (param["value"] as? String) == "latest"
+            }
+        }
+    }
+
+    /// 找“分类”列表模块：params 里 kind 常量是 "category" 的那个（javhd）。
+    /// 点分类时优先调它（slug 作 input），不用走 WP REST。
+    func categoryListModule() -> ModuleDescriptor? {
+        modules.first { module in
+            module.params.contains { param in
+                (param["name"] as? String) == "kind"
+                && (param["type"] as? String) == "constant"
+                && (param["value"] as? String) == "category"
             }
         }
     }
