@@ -131,6 +131,15 @@ enum AdBlockRuleStore {
 /// ② 假 Download 按钮（老规则 1）；③ 全屏点击劫持层（老规则 2）；
 /// ④ 文本命中的广告卡片（老规则 3）；⑤ 类名/id 广告标记（老规则 4）；
 /// ⑥ src 落在广告域的 iframe（老规则 5）。
+/// run #22 XSPFloatingCardGuard v10（Gemini v6/v8/v10 + ChatGPT v7/v9 五轮收敛）：
+/// 第二个独立 IIFE，追加在 v5 后面，v5 一字不动。治 run #21 真机剩下的两张卡
+/// （飞鸟VPN 推广卡 + View More 打码推送卡）：VPN 三路（CTA+强词+关闭 / CTA+辅词≥3+关闭 /
+/// 强词+辅词≥2+宽下半区 CTA）与 View More（头像 + 模糊行≥2，或头像 + 受控稀疏视觉素材）
+/// 双独立分类器；统一 hardVeto 在分类前与 hide 时双重执行（只保真播放器控件，
+/// 不豁免 #player 容器内注入的广告）；样式表优先隐藏 + getComputedStyle 校验，
+/// 被行内 !important 压过才定向升级行内兜底；点击壳分两档解除（紧凑壳 + 全屏/大尺寸
+/// 遮罩壳，带暗色底的同步裁切）；浅层 attributes 监听抓预挂载滑入卡；几何 180×88
+/// 绝对像素下限 + visualViewport 对齐；iframe 协议带 nonce 过滤与多层中继。
 /// 另：所有 video 元素都打上 playsinline，让嵌页视频在页内播、
 /// 走我们的外层控制条，而不是一播就跳系统全屏播放器。
 enum AdStripScript {
@@ -649,6 +658,843 @@ enum AdStripScript {
       stripOnce();
       forceInline();
       setInterval(function(){ stripOnce(); forceInline(); }, 1000);
+    })();
+    // XSPFloatingCardGuard v10 (run #22) — appended after v5, separate IIFE, v5 untouched.
+    // Gemini v10: v9 synthesis + 5 fixes (two-tier click shell, getComputedStyle-verified hide,
+    // chrome-vs-container hardVeto split, shallow attributes, 180x88 geometry floor).
+    (function () {
+      if (window.__xspFloatingCardGuardV10) return;
+      window.__xspFloatingCardGuardV10 = true;
+
+      // Swift 注入时可替换为 UUID().uuidString；未替换时同页全 frame 仍保持一致可用
+      const NONCE = '__XSP_SESSION_NONCE__';
+      const CARD_ATTR = 'data-xsp-fg-v10';
+      const WRAP_ATTR = 'data-xsp-fg-wrap-v10';
+      const BACKDROP_ATTR = 'data-xsp-fg-bd-v10';
+      const STYLE_ID = '__xsp_fg_v10_css';
+
+      // ---------------- 受保护与硬否决规则 ----------------
+      const SAFE_IFRAME_RE =
+        /(challenges\\.cloudflare\\.com|hcaptcha\\.com|recaptcha\\.net|google\\.com\\/recaptcha|accounts\\.|login\\.|oauth|pay\\.|stripe\\.com|paypal\\.com)/i;
+
+      // 核心控件栏（这些节点及其祖先不可藏，其内部子孙也不参与广告判定）
+      const CONTROL_BAR_SELECTOR =
+        '.vjs-control-bar, .vjs-menu, .vjs-text-track-display, .vjs-title-bar, .vjs-error-display, ' +
+        '.plyr__controls, .plyr__menu, .plyr__captions, ' +
+        '.jw-controls, .jw-settings-menu, .jw-captions, .jw-title, ' +
+        '.dplayer-controller, .dplayer-setting-box, .dplayer-subtitle, ' +
+        '.art-bottom, .art-setting, .art-subtitle, ' +
+        '[role="slider"], input[type="range"], .cf-turnstile';
+
+      // 严格限定到播放器 UI 部件，绝不包含宽泛的 #player / .video-js / .plyr 外壳
+      const PLAYER_CHROME_RE =
+        /(^|[\\s_-])(vjs-(control|menu|text-track|title|error|loading|big-play|poster|time|progress|volume|fullscreen|subs|caption)|plyr__(controls?|menu|captions?|poster|progress|time|volume|tooltip)|jw-(controls?|settings|captions?|title|display|icon|slider|tooltip)|dplayer-(controller|setting|subtitle|bar|icons|notice|menu)|art-(bottom|controls?|setting|subtitle|notice|loading|layer-title)|control-?bar|seek-?bar|progress-?bar|top-?bar|header-?bar|nav-?bar|cf-turnstile)/i;
+
+      // 仅用于过滤 characterData 高频刷新（时间轴/缓冲/字幕跳字）
+      const PLAYER_LIVE_UI_RE =
+        /(vjs-(current-time|duration|remaining|time|progress|control|text-track)|plyr__(time|progress|captions?|tooltip)|jw-(text-elapsed|text-duration|slider|captions?|tooltip)|dplayer-(ptime|dtime|bar|subtitle)|art-(time|progress|subtitle)|time-?display|current-?time|duration|progress-?bar|seek-?bar|subtitle|caption|text-?track)/i;
+
+      // 播放器菜单文案硬否决：明确设置词 OR >=2 个分辨率/倍速选项（避免单出现 "4K" 误放 VPN 广告）
+      const MENU_EXPLICIT_RE =
+        /\\b(subtitles?|captions?|playback\\s+speed|audio\\s+track|quality|picture[\\s-]in[\\s-]picture|chromecast|airplay)\\b|(清晰度|画质|倍速|字幕|音轨|切换线路|画中画|投屏)/i;
+      const MENU_OPTION_TOKEN_RE = /\\b(2160p|1080p|720p|480p|360p|4k|0\\.5x|0\\.75x|1\\.0?x|1\\.25x|1\\.5x|2\\.?0?x|auto)\\b/gi;
+
+      // 合法「下一集」卡片硬否决
+      const NEXT_EPISODE_VETO_RE =
+        /(下一集|下集|即将播放|自动播放下|选集|第\\s*\\d+\\s*[集话期部]|合集列表|\\bup\\s+next\\b|\\bnext\\s+episode\\b|\\bnext\\s+video\\b|\\bplay\\s+next\\b|\\bauto[\\s-]?play\\b|\\bep\\.?\\s*\\d+\\b|\\bs\\d+\\s*e\\d+\\b)/i;
+
+      // 真实登录/支付/验证码 DOM 结构硬否决
+      const AUTH_PAY_CAPTCHA_SELECTOR =
+        'input[type="password"], input[type="email"], input[autocomplete*="cc-"], [data-sitekey], .cf-turnstile, .g-recaptcha, .h-captcha';
+
+      // ---------------- 分类器 1：VPN / 翻墙 / 加速器推广卡 ----------------
+      const VPN_STRONG_RE = /(vpn|翻墙|梯子|科学上网|加速神器|看片神器|翻墙看片|看片加速|回国加速|游戏加速器|加速器)/i;
+
+      const VPN_AUX_NET_CLUSTERS = [
+        /(\\d+\\s*\\+\\s*节点|全球.{0,6}节点|高速节点|专线节点|多国节点)/i,
+        /(无限流量|不限流量|不限速|零日志|不限带宽)/i,
+        /(支持订阅|一键订阅|订阅链接|多端同步)/i
+      ];
+      const VPN_AUX_OTHER_CLUSTERS = [
+        /(免费试用|免费体验|限时免费|永久免费|新人免费)/i,
+        /(独立\\s*app|原生\\s*app|客户端下载|官方\\s*app)/i,
+        /(支持.{0,12}(安卓|苹果|ios|android|pc|mac|windows))/i
+      ];
+
+      const VPN_DOWNLOAD_CTA_RE =
+        /^(立即下载体验|立即下载|下载体验|立即安装|免费下载|高速下载|极速下载|免费试用|立即体验|点击下载|马上下载|下载\\s*app|download\\s+now|install\\s+now|free\\s+download|try\\s+free)(\\s*[!！>»→])?$/i;
+
+      // ---------------- 分类器 2：匿名 / 打码推送信卡片（View More 类） ----------------
+      const ANON_PUSH_CTA_RE =
+        /^(view\\s+more|learn\\s+more|see\\s+more|read\\s+more|show\\s+more|open\\s+now|visit\\s+site|view\\s+details|see\\s+details|more\\s+info|go\\s+now|查看更多|查看详情|了解详情|立即查看)(\\s*[!！>»→])?$/i;
+
+      const CLOSE_TEXT_RE = /^([×✕✖╳xX]|关闭|close)$/i;
+      const CLOSE_ATTR_RE = /(close|dismiss|cancel-?ad|btn-?x|icon-?close)/i;
+      const ZERO_WIDTH_RE = /[\\u200B-\\u200D\\uFEFF\\u00AD]/g;
+
+      const shadowRoots = new Set();
+      const observedRoots = new WeakSet();
+      const observedShallowEls = new WeakSet();
+      const cardWatchers = new WeakMap();
+      const cardReevalTimers = new WeakMap();
+      const cardInlineFallback = new WeakSet();
+      const cardToWrappers = new WeakMap();
+      const wrapperToCards = new WeakMap();
+      const frameThrottle = new WeakMap();
+
+      let microQueued = false;
+      let rafQueued = false;
+      let lastFrameReportTs = 0;
+
+      // ---------------------------------------------------------------------------
+      // 1. 样式表优先隐藏规则（默认零 inline style 污染）
+      // ---------------------------------------------------------------------------
+      function injectStyleSheet(root) {
+        try {
+          if (root.getElementById && root.getElementById(STYLE_ID)) return true;
+          if (root.querySelector && root.querySelector('#' + STYLE_ID)) return true;
+          const s = document.createElement('style');
+          s.id = STYLE_ID;
+          s.textContent =
+            '[' + CARD_ATTR + '="1"][' + CARD_ATTR + '="1"],' +
+            '[' + BACKDROP_ATTR + '="1"][' + BACKDROP_ATTR + '="1"]{' +
+            'clip-path:inset(100%)!important;' +
+            '-webkit-clip-path:inset(100%)!important;' +
+            'filter:opacity(0)!important;' +
+            'pointer-events:none!important;' +
+            'transition:none!important;' +
+            'animation:none!important;' +
+            'user-select:none!important;' +
+            '-webkit-user-select:none!important;}' +
+            '[' + WRAP_ATTR + '="1"][' + WRAP_ATTR + '="1"]{' +
+            'pointer-events:none!important;' +
+            'transition:none!important;}';
+          const target = root === document ? (document.head || document.documentElement) : root;
+          if (!target) return false;
+          target.appendChild(s);
+          return true;
+        } catch (_) {
+          return false;
+        }
+      }
+
+      function registerShadowRoot(root) {
+        if (!root || shadowRoots.has(root)) return;
+        shadowRoots.add(root);
+        injectStyleSheet(root);
+        observeRoot(root);
+      }
+
+      const origAttachShadow = Element.prototype.attachShadow;
+      if (origAttachShadow && !origAttachShadow.__xspFgV10Hooked) {
+        try {
+          const wrapped = function attachShadow(init) {
+            const root = origAttachShadow.call(this, init);
+            try {
+              registerShadowRoot(root);
+              scheduleMicroScan();
+            } catch (_) {}
+            return root;
+          };
+          wrapped.__xspFgV10Hooked = true;
+          Element.prototype.attachShadow = wrapped;
+        } catch (_) {}
+      }
+
+      function getAllRoots() {
+        const out = [document];
+        shadowRoots.forEach(function (sr) {
+          if (sr.host && sr.host.isConnected) out.push(sr);
+          else shadowRoots.delete(sr);
+        });
+        return out;
+      }
+
+      // ---------------------------------------------------------------------------
+      // 2. 无回流文本提取 & visualViewport 坐标系工具
+      // ---------------------------------------------------------------------------
+      function normalizeText(s) {
+        return (s || '')
+          .replace(ZERO_WIDTH_RE, '')
+          .replace(/[！]/g, '!')
+          .replace(/[：]/g, ':')
+          .replace(/[＋]/g, '+')
+          .replace(/\\s+/g, ' ')
+          .trim();
+      }
+
+      function getCleanText(el, maxLen, skipClippedDescendants) {
+        let out = '';
+        const stack = [el];
+        while (stack.length && out.length <= maxLen) {
+          const n = stack.pop();
+          if (!n) continue;
+          if (n.nodeType === 3) {
+            if (n.nodeValue) out += (out ? ' ' : '') + n.nodeValue;
+          } else if (n.nodeType === 1) {
+            const tag = n.tagName;
+            if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEMPLATE') continue;
+            if (skipClippedDescendants && n !== el && n.getAttribute && n.getAttribute(CARD_ATTR) === '1') continue;
+            const kids = n.childNodes;
+            for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
+          }
+        }
+        return normalizeText(out);
+      }
+
+      function getViewportMetrics() {
+        const vv = window.visualViewport;
+        if (vv && vv.width > 0 && vv.height > 0) {
+          return { w: vv.width, h: vv.height, ox: vv.offsetLeft || 0, oy: vv.offsetTop || 0 };
+        }
+        return { w: window.innerWidth || 0, h: window.innerHeight || 0, ox: 0, oy: 0 };
+      }
+
+      function toViewportRect(rect, vp) {
+        return {
+          left: rect.left - vp.ox,
+          right: rect.right - vp.ox,
+          top: rect.top - vp.oy,
+          bottom: rect.bottom - vp.oy,
+          width: rect.width,
+          height: rect.height
+        };
+      }
+
+      // ---------------------------------------------------------------------------
+      // 3. 统一前置 hardVeto（分类前 & hideCard 内双重执行，不误豁免容器内注入广告）
+      // ---------------------------------------------------------------------------
+      function matchesChromeToken(el) {
+        if (!el || el.nodeType !== 1) return false;
+        const tag = el.tagName;
+        if (tag === 'VIDEO' || tag === 'AUDIO' || tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return true;
+        if (el.getAttribute && el.getAttribute('role') === 'slider') return true;
+        const cls = typeof el.className === 'string' ? el.className : '';
+        const id = typeof el.id === 'string' ? el.id : '';
+        return PLAYER_CHROME_RE.test(cls) || PLAYER_CHROME_RE.test(id);
+      }
+
+      function isInsidePlayerChrome(el) {
+        let cur = el;
+        for (let up = 0; up < 6 && cur && cur.nodeType === 1; up++, cur = cur.parentElement) {
+          if (matchesChromeToken(cur)) return true;
+        }
+        return false;
+      }
+
+      function isInsidePlayerLiveUI(node) {
+        let cur = node && node.nodeType === 1 ? node : (node ? node.parentElement : null);
+        for (let up = 0; up < 6 && cur && cur.nodeType === 1; up++, cur = cur.parentElement) {
+          const tag = cur.tagName;
+          if (tag === 'VIDEO' || tag === 'AUDIO') return true;
+          if (cur.getAttribute && cur.getAttribute('role') === 'slider') return true;
+          const cls = typeof cur.className === 'string' ? cur.className : '';
+          const id = typeof cur.id === 'string' ? cur.id : '';
+          if (PLAYER_LIVE_UI_RE.test(cls) || PLAYER_LIVE_UI_RE.test(id)) return true;
+        }
+        return false;
+      }
+
+      function isPlayerMenuText(txt) {
+        if (!txt) return false;
+        if (MENU_EXPLICIT_RE.test(txt)) return true;
+        const m = txt.match(MENU_OPTION_TOKEN_RE);
+        return !!(m && m.length >= 2);
+      }
+
+      function buildProtectedContext(roots) {
+        const ancestors = new Set();
+        let hasVideo = false;
+        function markUp(node) {
+          let cur = node;
+          while (cur) {
+            if (ancestors.has(cur)) break;
+            ancestors.add(cur);
+            cur = cur.parentNode || cur.host || null;
+          }
+        }
+        for (let r = 0; r < roots.length; r++) {
+          const root = roots[r];
+          if (!root.querySelectorAll) continue;
+          const vids = root.querySelectorAll('video');
+          if (vids.length > 0) hasVideo = true;
+          for (let i = 0; i < vids.length; i++) markUp(vids[i]);
+          const controls = root.querySelectorAll(CONTROL_BAR_SELECTOR);
+          for (let i = 0; i < controls.length; i++) markUp(controls[i]);
+          const iframes = root.querySelectorAll('iframe[src]');
+          for (let i = 0; i < iframes.length; i++) {
+            if (SAFE_IFRAME_RE.test(String(iframes[i].src || ''))) markUp(iframes[i]);
+          }
+        }
+        return { ancestors: ancestors, hasVideo: hasVideo };
+      }
+
+      function hardVeto(el, txt, prot) {
+        if (!el || el.nodeType !== 1) return true;
+        const tag = el.tagName;
+        if (tag === 'HTML' || tag === 'BODY' || tag === 'HEAD' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK' || tag === 'META') return true;
+        if (prot && prot.ancestors.has(el)) return true;
+        if (isInsidePlayerChrome(el)) return true;
+        if (tag === 'IFRAME' && SAFE_IFRAME_RE.test(String(el.src || ''))) return true;
+        if (el.querySelector) {
+          if (el.querySelector('video, audio, [role="slider"], input[type="range"]')) return true;
+          if (el.querySelector(AUTH_PAY_CAPTCHA_SELECTOR)) return true;
+        }
+        if (txt) {
+          if (isPlayerMenuText(txt)) return true;
+          if (NEXT_EPISODE_VETO_RE.test(txt)) return true;
+        }
+        return false;
+      }
+
+      // ---------------------------------------------------------------------------
+      // 4. 几何发现过滤（visualViewport 对齐 + 绝对像素下限，仅发现不作证明）
+      // ---------------------------------------------------------------------------
+      function isInFloatingLayer(el, root, prot) {
+        if (root !== document) return true;
+        let cur = el;
+        for (let up = 0; up < 5 && cur && cur.nodeType === 1; up++) {
+          if (cur === document.body || cur === document.documentElement || prot.ancestors.has(cur)) break;
+          const st = getComputedStyle(cur);
+          if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity) === 0) return false;
+          if (st.position === 'fixed' || st.position === 'absolute') return true;
+          cur = cur.parentElement;
+        }
+        return false;
+      }
+
+      function matchesCardGeometry(vrect, vp, isAdSubframe) {
+        if (vp.w <= 0 || vp.h <= 0) return false;
+        if (vrect.width < 180 || vrect.height < 88) return false;
+        if (isAdSubframe) {
+          return vrect.width >= vp.w * 0.52 && vrect.height >= vp.h * 0.32;
+        }
+        const isLandscape = vp.w > vp.h;
+        const wRatio = vrect.width / vp.w;
+        const hRatio = vrect.height / vp.h;
+        if (isLandscape) {
+          if (wRatio < 0.28 || wRatio > 1.02) return false;
+          if (hRatio < 0.20 || hRatio > 0.86) return false;
+        } else {
+          if (wRatio < 0.52 || wRatio > 1.02) return false;
+          if (hRatio < 0.15 || hRatio > 0.66) return false;
+        }
+        const cx = vrect.left + vrect.width / 2;
+        const centered = Math.abs(cx - vp.w / 2) <= vp.w * (isLandscape ? 0.24 : 0.22);
+        const topOk = vrect.top >= -vp.h * 0.08 && vrect.top <= vp.h * 0.44;
+        const notBottomBar = vrect.bottom <= vp.h * (isLandscape ? 0.95 : 0.90);
+        return centered && topOk && notBottomBar;
+      }
+
+      // ---------------------------------------------------------------------------
+      // 5. 按钮动作节点 / 关闭 X / 两个独立分类器（零外链加分，覆盖栅格打码图）
+      // ---------------------------------------------------------------------------
+      function isVisibleColor(c) {
+        return !!c && c !== 'rgba(0, 0, 0, 0)' && c !== 'transparent';
+      }
+
+      function isActionLikeNode(node, rect, cardRect) {
+        const tag = node.tagName;
+        if (tag === 'BUTTON' || tag === 'A') return true;
+        if (node.getAttribute('role') === 'button') return true;
+        if (node.hasAttribute('onclick') || node.hasAttribute('aria-label') || node.hasAttribute('title')) return true;
+        const st = getComputedStyle(node);
+        if (st.cursor === 'pointer') return true;
+        const hasButtonChrome =
+          isVisibleColor(st.backgroundColor) ||
+          (st.backgroundImage && st.backgroundImage !== 'none') ||
+          (parseFloat(st.borderTopWidth) > 0 && isVisibleColor(st.borderTopColor));
+        return hasButtonChrome &&
+          rect.width >= Math.max(80, cardRect.width * 0.24) &&
+          rect.height >= 24 && rect.height <= 80;
+      }
+
+      function findCtaButton(card, cardRect, regex) {
+        const nodes = card.querySelectorAll('a, button, [role="button"], [onclick], div, span');
+        const limit = Math.min(nodes.length, 80);
+        for (let i = 0; i < limit; i++) {
+          const n = nodes[i];
+          if (n.children && n.children.length > 2) continue;
+          const t = getCleanText(n, 28, false);
+          if (!t || t.length < 2 || t.length > 24) continue;
+          if (!regex.test(t)) continue;
+          const r = n.getBoundingClientRect();
+          if (r.width < 36 || r.height < 18) continue;
+          if (!isActionLikeNode(n, r, cardRect)) continue;
+          const centerYRatio = (r.top + r.height / 2 - cardRect.top) / Math.max(1, cardRect.height);
+          return { node: n, text: t, widthRatio: r.width / Math.max(1, cardRect.width), centerYRatio: centerYRatio };
+        }
+        return null;
+      }
+
+      function hasTopRightClose(card, cardRect) {
+        const nodes = card.querySelectorAll('button, a, [role="button"], [onclick], svg, img, span, div, i');
+        const limit = Math.min(nodes.length, 70);
+        for (let i = 0; i < limit; i++) {
+          const n = nodes[i];
+          if (n.children && n.children.length > 3) continue;
+          const r = n.getBoundingClientRect();
+          if (r.width < 10 || r.height < 10 || r.width > 56 || r.height > 56) continue;
+          if (r.right < cardRect.right - 64 || r.top > cardRect.top + 64) continue;
+          const t = getCleanText(n, 10, false);
+          if (CLOSE_TEXT_RE.test(t)) return true;
+          const meta = (n.getAttribute('aria-label') || '') + ' ' + (n.getAttribute('title') || '') + ' ' + (typeof n.className === 'string' ? n.className : '') + ' ' + (n.id || '');
+          if (CLOSE_ATTR_RE.test(meta)) return true;
+          if (n.tagName === 'SVG' || n.tagName === 'IMG' || n.hasAttribute('onclick') || n.querySelector('svg')) return true;
+          const st = getComputedStyle(n);
+          if (st.cursor === 'pointer' || n.tagName === 'BUTTON' || n.getAttribute('role') === 'button') return true;
+          const bc = getComputedStyle(n, '::before').content;
+          const ac = getComputedStyle(n, '::after').content;
+          if ((bc && bc !== 'none' && bc !== 'normal') || (ac && ac !== 'none' && ac !== 'normal')) return true;
+        }
+        return false;
+      }
+
+      function parseRadiusPx(radiusStr, minSide) {
+        if (!radiusStr) return 0;
+        const first = radiusStr.split(' ')[0];
+        if (first.indexOf('%') >= 0) return (parseFloat(first) / 100) * minSide;
+        return parseFloat(first) || 0;
+      }
+
+      function classifyVpnCard(card, cardRect, fullTxt, hasClose) {
+        if (fullTxt.length < 6 || fullTxt.length > 520) return null;
+        const cta = findCtaButton(card, cardRect, VPN_DOWNLOAD_CTA_RE);
+        if (!cta) return null;
+        const hasStrong = VPN_STRONG_RE.test(fullTxt);
+        let netAux = 0;
+        for (let i = 0; i < VPN_AUX_NET_CLUSTERS.length; i++) { if (VPN_AUX_NET_CLUSTERS[i].test(fullTxt)) netAux++; }
+        let otherAux = 0;
+        for (let i = 0; i < VPN_AUX_OTHER_CLUSTERS.length; i++) { if (VPN_AUX_OTHER_CLUSTERS[i].test(fullTxt)) otherAux++; }
+        const totalAux = netAux + otherAux;
+        const pathA = hasStrong && hasClose;
+        const pathB = hasClose && (totalAux >= 3 || (totalAux >= 2 && netAux >= 1));
+        const pathC = hasStrong && totalAux >= 2 && cta.widthRatio >= 0.44 && cta.centerYRatio >= 0.48;
+        return (pathA || pathB || pathC) ? { kind: 'vpn-promo', confidence: 'high' } : null;
+      }
+
+      function inspectAnonCardVisuals(card, cardRect, ctaNode) {
+        const nodes = card.querySelectorAll('img, svg, canvas, div, span, p, i');
+        const limit = Math.min(nodes.length, 85);
+        let avatarNode = null;
+        let blurredOrMaskedRows = 0;
+        let distinctBodyGraphic = false;
+        const cardSt = getComputedStyle(card);
+        if (cardSt.backgroundImage && cardSt.backgroundImage !== 'none' && cardSt.backgroundImage.indexOf('url(') >= 0) distinctBodyGraphic = true;
+        for (let i = 0; i < limit; i++) {
+          const n = nodes[i];
+          if (n === ctaNode || (ctaNode && ctaNode.contains(n))) continue;
+          const r = n.getBoundingClientRect();
+          if (r.width < 24 || r.width > 108 || r.height < 24 || r.height > 108) continue;
+          const ratio = r.width / r.height;
+          const inLeft = r.left <= cardRect.left + cardRect.width * 0.46;
+          if (!inLeft || ratio < 0.78 || ratio > 1.28) continue;
+          const st = getComputedStyle(n);
+          const minSide = Math.min(r.width, r.height);
+          const rad = parseRadiusPx(st.borderTopLeftRadius, minSide);
+          if (rad < minSide * 0.40) continue;
+          const hasFill = n.tagName === 'IMG' || n.tagName === 'SVG' || n.tagName === 'CANVAS' || (st.backgroundImage && st.backgroundImage !== 'none') || isVisibleColor(st.backgroundColor);
+          if (hasFill) { avatarNode = n; break; }
+        }
+        if (!avatarNode) return { hasAvatar: false, blurredRows: 0, hasDistinctBodyGraphic: false };
+        for (let i = 0; i < limit; i++) {
+          const n = nodes[i];
+          if (n === avatarNode || avatarNode.contains(n)) continue;
+          if (n === ctaNode || (ctaNode && ctaNode.contains(n))) continue;
+          const r = n.getBoundingClientRect();
+          if (r.width < 8 || r.height < 6) continue;
+          const st = getComputedStyle(n);
+          const tag = n.tagName;
+          const hasBlur = (st.filter && st.filter.indexOf('blur(') >= 0) || (st.color === 'rgba(0, 0, 0, 0)' && st.textShadow && st.textShadow !== 'none');
+          const lowOpacityRow = r.width >= 48 && r.height >= 8 && r.height <= 36 && parseFloat(st.opacity) > 0 && parseFloat(st.opacity) <= 0.55;
+          const skeletonBar = (tag === 'DIV' || tag === 'SPAN' || tag === 'P') && n.children.length === 0 && r.width >= 48 && r.height >= 6 && r.height <= 24 && isVisibleColor(st.backgroundColor) && getCleanText(n, 4, false).length === 0;
+          if (hasBlur || lowOpacityRow || skeletonBar) blurredOrMaskedRows++;
+          if (!distinctBodyGraphic) {
+            const isGraphic = tag === 'IMG' || tag === 'CANVAS' || (st.backgroundImage && st.backgroundImage !== 'none' && st.backgroundImage.indexOf('url(') >= 0);
+            if (isGraphic && r.width >= 60 && r.height >= 24) distinctBodyGraphic = true;
+          }
+        }
+        return { hasAvatar: true, blurredRows: blurredOrMaskedRows, hasDistinctBodyGraphic: distinctBodyGraphic };
+      }
+
+      function classifyAnonPushCard(card, cardRect, fullTxt, hasClose) {
+        if (!hasClose) return null;
+        const cta = findCtaButton(card, cardRect, ANON_PUSH_CTA_RE);
+        if (!cta) return null;
+        const vis = inspectAnonCardVisuals(card, cardRect, cta.node);
+        if (!vis.hasAvatar) return null;
+        const residualTextLen = Math.max(0, fullTxt.length - cta.text.length - 2);
+        const hasDomBlurEvidence = vis.blurredRows >= 2;
+        const hasGatedRasterEvidence = vis.hasDistinctBodyGraphic && residualTextLen <= 18 && cta.centerYRatio >= 0.46;
+        if (!hasDomBlurEvidence && !hasGatedRasterEvidence) return null;
+        return { kind: 'anon-push', confidence: 'high' };
+      }
+
+      function classifyElement(el, root, prot, vp, isAdSubframe) {
+        const txt = getCleanText(el, 600, false);
+        if (hardVeto(el, txt, prot)) return null;
+        if (!isInFloatingLayer(el, root, prot)) return null;
+        const rect = el.getBoundingClientRect();
+        const vrect = toViewportRect(rect, vp);
+        if (!matchesCardGeometry(vrect, vp, isAdSubframe)) return null;
+        const hasClose = hasTopRightClose(el, rect);
+        return classifyVpnCard(el, rect, txt, hasClose) || classifyAnonPushCard(el, rect, txt, hasClose);
+      }
+
+      // 6. 样式表优先隐藏 + 内联 !important / CSP 自动升级 + 内容变更复检解藏
+      const INLINE_FALLBACK_PROPS = [
+        ['clip-path', 'inset(100%)'],
+        ['-webkit-clip-path', 'inset(100%)'],
+        ['filter', 'opacity(0)'],
+        ['pointer-events', 'none'],
+        ['transition', 'none'],
+        ['animation', 'none']
+      ];
+      function applyInlineFallback(el) {
+        cardInlineFallback.add(el);
+        for (let i = 0; i < INLINE_FALLBACK_PROPS.length; i++) {
+          const prop = INLINE_FALLBACK_PROPS[i][0];
+          const val = INLINE_FALLBACK_PROPS[i][1];
+          if (el.style.getPropertyValue(prop) !== val || el.style.getPropertyPriority(prop) !== 'important') el.style.setProperty(prop, val, 'important');
+        }
+      }
+      function clearInlineFallback(el) {
+        if (!cardInlineFallback.has(el)) return;
+        cardInlineFallback.delete(el);
+        for (let i = 0; i < INLINE_FALLBACK_PROPS.length; i++) el.style.removeProperty(INLINE_FALLBACK_PROPS[i][0]);
+      }
+      function enforceHideEffect(el, attrName) {
+        if (el.getAttribute(attrName) !== '1') el.setAttribute(attrName, '1');
+        if (el.getAttribute('aria-hidden') !== 'true') el.setAttribute('aria-hidden', 'true');
+        const st = getComputedStyle(el);
+        const clip = st.clipPath || st.webkitClipPath || '';
+        const clippedOk = clip.indexOf('inset(100%)') >= 0;
+        const pointerOk = st.pointerEvents === 'none';
+        if (!clippedOk || !pointerOk) applyInlineFallback(el);
+      }
+      function releaseWrappersForCard(card) {
+        const wraps = cardToWrappers.get(card);
+        if (!wraps) return;
+        wraps.forEach(function (w) {
+          const set = wrapperToCards.get(w);
+          if (set) {
+            set.delete(card);
+            if (set.size === 0) {
+              w.removeAttribute(WRAP_ATTR);
+              w.removeAttribute(BACKDROP_ATTR);
+              clearInlineFallback(w);
+              wrapperToCards.delete(w);
+            }
+          }
+        });
+        cardToWrappers.delete(card);
+      }
+      function unhideCard(card) {
+        const obs = cardWatchers.get(card);
+        if (obs) { try { obs.disconnect(); } catch (_) {} cardWatchers.delete(card); }
+        const tid = cardReevalTimers.get(card);
+        if (tid) { clearTimeout(tid); cardReevalTimers.delete(card); }
+        card.removeAttribute(CARD_ATTR);
+        if (card.getAttribute('aria-hidden') === 'true') card.removeAttribute('aria-hidden');
+        clearInlineFallback(card);
+        releaseWrappersForCard(card);
+      }
+      function scheduleCardReeval(card, root) {
+        if (cardReevalTimers.has(card)) return;
+        const tid = setTimeout(function () {
+          cardReevalTimers.delete(card);
+          if (!card.isConnected) { unhideCard(card); return; }
+          const roots = getAllRoots();
+          const prot = buildProtectedContext(roots);
+          const vp = getViewportMetrics();
+          const isAdSubframe = window !== window.top && !prot.hasVideo;
+          const stillAd = classifyElement(card, root, prot, vp, isAdSubframe);
+          if (!stillAd) unhideCard(card);
+          else enforceHideEffect(card, CARD_ATTR);
+        }, 180);
+        cardReevalTimers.set(card, tid);
+      }
+      function disarmClickShells(card, root, prot, vp) {
+        const cardRect = card.getBoundingClientRect();
+        const cardArea = Math.max(1, cardRect.width * cardRect.height);
+        let cur = card.parentElement;
+        for (let up = 0; up < 4 && cur; up++, cur = cur.parentElement) {
+          if (hardVeto(cur, '', prot)) break;
+          const st = getComputedStyle(cur);
+          if (st.position !== 'fixed' && st.position !== 'absolute') continue;
+          const leftoverText = getCleanText(cur, 12, true);
+          if (leftoverText.length > 4) break;
+          const others = cur.querySelectorAll('video, iframe, button, a, input, select, textarea, img, canvas');
+          let hasIndependentContent = false;
+          for (let i = 0; i < others.length; i++) {
+            const o = others[i];
+            if (!card.contains(o) && !o.closest('[' + CARD_ATTR + '="1"]')) { hasIndependentContent = true; break; }
+          }
+          if (hasIndependentContent) break;
+          const r = cur.getBoundingClientRect();
+          const area = Math.max(1, r.width * r.height);
+          const ix = Math.max(0, Math.min(r.right, cardRect.right) - Math.max(r.left, cardRect.left));
+          const iy = Math.max(0, Math.min(r.bottom, cardRect.bottom) - Math.max(r.top, cardRect.top));
+          const overlap = (ix * iy) / cardArea;
+          const isTightShell = overlap >= 0.78 && area <= cardArea * 1.45;
+          const z = parseInt(st.zIndex, 10);
+          const isFullBackdrop = vp.w > 0 && vp.h > 0 && r.width >= vp.w * 0.60 && r.height >= vp.h * 0.60 && (st.position === 'fixed' || (Number.isFinite(z) && z >= 10));
+          if (!isTightShell && !isFullBackdrop) continue;
+          const hasDimmingVisual = isVisibleColor(st.backgroundColor) || (st.backdropFilter && st.backdropFilter !== 'none') || (st.webkitBackdropFilter && st.webkitBackdropFilter !== 'none');
+          if (hasDimmingVisual) enforceHideEffect(cur, BACKDROP_ATTR);
+          else {
+            if (cur.getAttribute(WRAP_ATTR) !== '1') cur.setAttribute(WRAP_ATTR, '1');
+            if (getComputedStyle(cur).pointerEvents !== 'none') { cur.style.setProperty('pointer-events', 'none', 'important'); cardInlineFallback.add(cur); }
+          }
+          if (!cardToWrappers.has(card)) cardToWrappers.set(card, new Set());
+          cardToWrappers.get(card).add(cur);
+          if (!wrapperToCards.has(cur)) wrapperToCards.set(cur, new Set());
+          wrapperToCards.get(cur).add(card);
+        }
+        if (root !== document && root.host && !hardVeto(root.host, '', prot)) {
+          if (root.host.getAttribute(WRAP_ATTR) !== '1') root.host.setAttribute(WRAP_ATTR, '1');
+          if (!cardToWrappers.has(card)) cardToWrappers.set(card, new Set());
+          cardToWrappers.get(card).add(root.host);
+          if (!wrapperToCards.has(root.host)) wrapperToCards.set(root.host, new Set());
+          wrapperToCards.get(root.host).add(card);
+        }
+      }
+      function hideCard(card, root, prot, vp) {
+        const txt = getCleanText(card, 600, false);
+        if (hardVeto(card, txt, prot)) return false;
+        injectStyleSheet(root);
+        enforceHideEffect(card, CARD_ATTR);
+        disarmClickShells(card, root, prot, vp);
+        if (!cardWatchers.has(card) && typeof MutationObserver !== 'undefined') {
+          try {
+            const obs = new MutationObserver(function (mutations) {
+              let attrChanged = false;
+              let contentChanged = false;
+              for (let i = 0; i < mutations.length; i++) { const t = mutations[i].type; if (t === 'attributes') attrChanged = true; else contentChanged = true; }
+              if (attrChanged) enforceHideEffect(card, CARD_ATTR);
+              if (contentChanged) scheduleCardReeval(card, root);
+            });
+            obs.observe(card, { attributes: true, attributeFilter: ['style', 'class', 'hidden', 'aria-hidden', CARD_ATTR], childList: true, characterData: true, subtree: true });
+            cardWatchers.set(card, obs);
+          } catch (_) {}
+        }
+        return true;
+      }
+
+      // 7. 跨域 iframe 安全汇报与父级裁切（支持多层嵌套中继 + 保护主播放器 iframe）
+      function reportAdCardToParent(hasVideo, matchInfo) {
+        if (window === window.top || hasVideo) return;
+        const now = Date.now();
+        if (now - lastFrameReportTs < 250) return;
+        lastFrameReportTs = now;
+        try {
+          window.parent.postMessage({ type: 'XSP_FLOATING_CARD_GUARD', version: 10, action: 'clip-ad-card-frame', kind: matchInfo.kind, confidence: matchInfo.confidence, nonce: NONCE }, '*');
+        } catch (_) {}
+      }
+      window.addEventListener('message', function (ev) {
+        const d = ev.data;
+        if (!d || d.type !== 'XSP_FLOATING_CARD_GUARD' || d.version !== 10 || d.action !== 'clip-ad-card-frame' || d.confidence !== 'high' || d.nonce !== NONCE) return;
+        ev.stopImmediatePropagation();
+        const roots = getAllRoots();
+        const prot = buildProtectedContext(roots);
+        const vp = getViewportMetrics();
+        let clippedAny = false;
+        for (let r = 0; r < roots.length; r++) {
+          const root = roots[r];
+          const iframes = root.querySelectorAll ? root.querySelectorAll('iframe') : [];
+          for (let i = 0; i < iframes.length; i++) {
+            const frame = iframes[i];
+            try {
+              if (frame.contentWindow !== ev.source) continue;
+              const now = Date.now();
+              if (now - (frameThrottle.get(frame) || 0) < 250) continue;
+              frameThrottle.set(frame, now);
+              if (hardVeto(frame, '', prot)) continue;
+              let allowClip = prot.hasVideo;
+              if (!allowClip) {
+                const st = getComputedStyle(frame);
+                const rRect = frame.getBoundingClientRect();
+                const isFloating = st.position === 'fixed' || st.position === 'absolute';
+                const smallerThanFullPage = vp.w > 0 && vp.h > 0 && (rRect.width < vp.w * 0.90 || rRect.height < vp.h * 0.85);
+                allowClip = isFloating || smallerThanFullPage;
+              }
+              if (allowClip) { injectStyleSheet(root); enforceHideEffect(frame, CARD_ATTR); disarmClickShells(frame, root, prot, vp); clippedAny = true; }
+            } catch (_) {}
+          }
+        }
+        if (!prot.hasVideo && window !== window.top && clippedAny) reportAdCardToParent(false, { kind: d.kind, confidence: 'high' });
+      }, true);
+
+      // 8. 候选收集 -> 面积从小到大分类 -> 批量写入
+      function collectCandidates(root, prot) {
+        const seen = new Set();
+        const out = [];
+        function push(el) {
+          if (!el || el.nodeType !== 1 || seen.has(el)) return;
+          if (el.getAttribute(CARD_ATTR) === '1' || prot.ancestors.has(el)) return;
+          const tag = el.tagName;
+          if (tag === 'HEAD' || tag === 'BODY' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK' || tag === 'META') return;
+          if (el.shadowRoot && !shadowRoots.has(el.shadowRoot)) registerShadowRoot(el.shadowRoot);
+          seen.add(el);
+          out.push(el);
+        }
+        const topContainers = [];
+        if (root === document) {
+          if (document.documentElement) topContainers.push(document.documentElement);
+          if (document.body) topContainers.push(document.body);
+        } else topContainers.push(root);
+        for (let c = 0; c < topContainers.length; c++) {
+          const kids1 = topContainers[c].children;
+          if (!kids1) continue;
+          for (let i = 0; i < kids1.length; i++) {
+            const k1 = kids1[i];
+            if (!prot.ancestors.has(k1)) observeShallowElement(k1);
+            push(k1);
+            const kids2 = k1.children;
+            if (kids2 && kids2.length <= 16) {
+              for (let j = 0; j < kids2.length; j++) {
+                const k2 = kids2[j];
+                if (!prot.ancestors.has(k2)) observeShallowElement(k2);
+                push(k2);
+                const kids3 = k2.children;
+                if (kids3 && kids3.length <= 10) { for (let m = 0; m < kids3.length; m++) push(kids3[m]); }
+              }
+            }
+          }
+        }
+        if (root.querySelectorAll) {
+          const nodes = root.querySelectorAll('a, button, [role="button"], [onclick], div, span');
+          for (let i = 0; i < nodes.length; i++) {
+            const n = nodes[i];
+            if (n.children && n.children.length > 2) continue;
+            if (prot.ancestors.has(n)) continue;
+            const t = getCleanText(n, 26, true);
+            if (!t || t.length < 2 || t.length > 24) continue;
+            if (!VPN_DOWNLOAD_CTA_RE.test(t) && !ANON_PUSH_CTA_RE.test(t)) continue;
+            let cur = n.parentElement;
+            for (let up = 0; up < 5 && cur && cur !== document.body && cur !== document.documentElement; up++) {
+              if (prot.ancestors.has(cur)) break;
+              push(cur);
+              cur = cur.parentElement;
+            }
+          }
+        }
+        return out;
+      }
+      function scanOnce() {
+        microQueued = false;
+        rafQueued = false;
+        if (document.hidden) return;
+        try {
+          injectStyleSheet(document);
+          const roots = getAllRoots();
+          const prot = buildProtectedContext(roots);
+          const vp = getViewportMetrics();
+          const isAdSubframe = window !== window.top && !prot.hasVideo;
+          const matched = [];
+          for (let r = 0; r < roots.length; r++) {
+            const root = roots[r];
+            const raw = collectCandidates(root, prot);
+            const geoPassed = [];
+            for (let i = 0; i < raw.length; i++) {
+              const el = raw[i];
+              if (isInsidePlayerChrome(el)) continue;
+              if (!isInFloatingLayer(el, root, prot)) continue;
+              const rect = el.getBoundingClientRect();
+              const vrect = toViewportRect(rect, vp);
+              if (!matchesCardGeometry(vrect, vp, isAdSubframe)) continue;
+              geoPassed.push({ el: el, rect: rect, area: rect.width * rect.height });
+            }
+            geoPassed.sort(function (a, b) { return a.area - b.area; });
+            const confirmedInRoot = [];
+            for (let i = 0; i < geoPassed.length; i++) {
+              const item = geoPassed[i];
+              const el = item.el;
+              let wrapsConfirmed = false;
+              for (let c = 0; c < confirmedInRoot.length; c++) { if (el.contains(confirmedInRoot[c])) { wrapsConfirmed = true; break; } }
+              if (wrapsConfirmed) continue;
+              const txt = getCleanText(el, 600, false);
+              if (hardVeto(el, txt, prot)) continue;
+              const hasClose = hasTopRightClose(el, item.rect);
+              const hit = classifyVpnCard(el, item.rect, txt, hasClose) || classifyAnonPushCard(el, item.rect, txt, hasClose);
+              if (hit) { confirmedInRoot.push(el); matched.push({ el: el, root: root, hit: hit }); }
+            }
+          }
+          let firstHit = null;
+          for (let m = 0; m < matched.length; m++) {
+            const entry = matched[m];
+            if (hideCard(entry.el, entry.root, prot, vp) && !firstHit) firstHit = entry.hit;
+          }
+          if (firstHit) reportAdCardToParent(prot.hasVideo, firstHit);
+        } catch (_) {}
+      }
+      function scheduleMicroScan() {
+        if (!microQueued) {
+          microQueued = true;
+          if (typeof queueMicrotask === 'function') queueMicrotask(scanOnce);
+          else Promise.resolve().then(scanOnce);
+        }
+        scheduleRafScan();
+      }
+      function scheduleRafScan() {
+        if (rafQueued) return;
+        rafQueued = true;
+        if (typeof requestAnimationFrame === 'function') requestAnimationFrame(scanOnce);
+        else setTimeout(scanOnce, 16);
+      }
+
+      // 9. 三层低开销监听：childList(微任务) + 过滤控件的 characterData(rAF) + 浅层 attributes(微任务)
+      function observeShallowElement(el) {
+        if (!el || el.nodeType !== 1 || observedShallowEls.has(el)) return;
+        const tag = el.tagName;
+        if (tag === 'HEAD' || tag === 'BODY' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK') return;
+        if (matchesChromeToken(el)) return;
+        observedShallowEls.add(el);
+        try {
+          const obs = new MutationObserver(function () {
+            if (el.getAttribute(CARD_ATTR) !== '1' && el.getAttribute(WRAP_ATTR) !== '1' && el.getAttribute(BACKDROP_ATTR) !== '1') scheduleMicroScan();
+          });
+          obs.observe(el, { attributes: true, attributeFilter: ['style', 'class', 'hidden'] });
+        } catch (_) {}
+      }
+      function observeRoot(root) {
+        if (!root || observedRoots.has(root) || typeof MutationObserver === 'undefined') return;
+        const target = root === document ? document.documentElement : root;
+        if (!target) return;
+        observedRoots.add(root);
+        try {
+          const mo = new MutationObserver(function (mutations) {
+            let needMicro = false;
+            let needRaf = false;
+            for (let i = 0; i < mutations.length; i++) {
+              const m = mutations[i];
+              if (m.type === 'childList') {
+                const added = m.addedNodes;
+                if (!added || added.length === 0) continue;
+                for (let j = 0; j < added.length; j++) { const n = added[j]; if (n.nodeType === 1 && !isInsidePlayerLiveUI(n)) { needMicro = true; break; } }
+              } else if (m.type === 'characterData') {
+                if (!isInsidePlayerLiveUI(m.target)) needRaf = true;
+              }
+              if (needMicro) break;
+            }
+            if (needMicro) scheduleMicroScan();
+            else if (needRaf) scheduleRafScan();
+          });
+          mo.observe(target, { childList: true, characterData: true, subtree: true });
+        } catch (_) {}
+      }
+      function boot() {
+        injectStyleSheet(document);
+        observeRoot(document);
+        scanOnce();
+      }
+      if (document.documentElement) boot();
+      else document.addEventListener('DOMContentLoaded', boot, { once: true });
+      window.addEventListener('load', scheduleMicroScan);
+      window.addEventListener('resize', scheduleRafScan);
+      if (window.visualViewport) window.visualViewport.addEventListener('resize', scheduleRafScan);
+      document.addEventListener('visibilitychange', function () { if (!document.hidden) scheduleRafScan(); });
+      setInterval(function () { if (!document.hidden) scanOnce(); }, 1200);
     })();
     """
 }
