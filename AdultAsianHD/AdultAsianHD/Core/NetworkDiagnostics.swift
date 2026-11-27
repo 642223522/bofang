@@ -158,15 +158,17 @@ final class NetworkDiagnostics: ObservableObject {
 
     @Published private(set) var events: [NetworkDiagEvent] = []
 
-    /// 诊断事件插入串行队列（R4-7）：并发完成时 Task 进 MainActor 的顺序不保证
-    /// 与完成顺序一致；串行队列保证插入顺序与 record() 调用顺序一致。
-    private static let recordQueue = DispatchQueue(label: "com.liudehen.xiaoshipin.netdiag.record")
-
     private init() {}
 
+    /// 诊断事件插入（R5-9）：直接 DispatchQueue.main.async——主队列是串行
+    /// 队列，GCD 保证入队顺序，插入顺序即 record() 调用顺序。R4-7 的串行
+    /// 队列 + Task { @MainActor in } 不保证顺序（无结构 Task 在 MainActor
+    /// 上的执行顺序没有 FIFO 契约）；删掉 recordQueue 也去掉了 Swift 6
+    /// 下的跨隔离访问（@MainActor 类上的 static let 不能从 nonisolated
+    /// 代码里读，属编译风险）。
     nonisolated static func record(_ event: NetworkDiagEvent) {
-        recordQueue.async {
-            Task { @MainActor in
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
                 let store = NetworkDiagnostics.shared
                 store.events.insert(event, at: 0)
                 if store.events.count > Self.maxEvents {
@@ -566,18 +568,50 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
     /// 锁内解析当前 session（代理变化时轮换，与旧 currentSession() 同一套
     /// 判定）。调用方必须已持有 sessionLock；F7 的 makeDataTask 在同一把
     /// 锁内解析 session 并建任务，建任务与轮换之间插不进一次 rotate。
-    private func resolveSessionLocked() -> URLSession {
+    /// 返回代理是否刚变化——变化时 DoH 重置由 makeDataTask 在解锁后补调
+    ///（R5-7：resetForNetworkChange() 绝不在持有 sessionLock 时调）。
+    private func resolveSessionLocked() -> (session: URLSession, proxyChanged: Bool) {
         let nowProxy = ActiveSystemProxy.current()
+        var proxyChanged = false
         if nowProxy != lastProxyState {
+            proxyChanged = true
             lastProxyState = nowProxy
             networkEpoch &+= 1
             breaker.removeAll()
             // F9：代理变化触发的轮换不清 Cookie 不行——代理后的网络与之前
             // 是不同出口，直连时沾上的 WAF 坏 Cookie 不能带过去；同时清 DoH 缓存。
             rotateSessionLocked(preserveCookies: false)
+        }
+        return (session, proxyChanged)
+    }
+
+    /// 同步代理状态 + 网络世代（R5-7）：data() 入口调一次，替代原来先读
+    /// startEpoch、后在 Branch 3 才发现代理变了的做法。代理切换不触发
+    /// NWPathMonitor，只能靠 ActiveSystemProxy.current() 与 lastProxyState
+    /// 对比；若等到 Branch 3 才同步，入口抓的 startEpoch 是旧世代，换代理后
+    /// 第一个请求的 tripBreaker 会被 epoch 不符静默丢弃，且 Branch 1 的
+    /// isBreakerTripped 会拿旧 epoch 把 host 困在 DoH 路上、永远走不到同步。
+    /// 代理变化时在锁内做 epoch+1、清 breaker、轮换（不继承 Cookie），
+    /// resetForNetworkChange() 在解锁后才调（锁内调它会与
+    /// handleNetworkTransition()/rotateSession() 的锁顺序不一致）。
+    /// 幂等：第二次调时 nowProxy == lastProxyState，什么都不做，不重复 +1。
+    private func syncProxyStateAndEpoch() -> (proxy: ActiveSystemProxy, epoch: UInt64) {
+        let nowProxy = ActiveSystemProxy.current()
+        var changed = false
+        sessionLock.lock()
+        if nowProxy != lastProxyState {
+            changed = true
+            lastProxyState = nowProxy
+            networkEpoch &+= 1
+            breaker.removeAll()
+            rotateSessionLocked(preserveCookies: false)
+        }
+        let epoch = networkEpoch
+        sessionLock.unlock()
+        if changed {
             DoHFallbackClient.shared.resetForNetworkChange()
         }
-        return session
+        return (nowProxy, epoch)
     }
 
     private func rotateSession(preserveCookies: Bool = true) {
@@ -696,13 +730,6 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         return entry.until > Date()
     }
 
-    /// 当前网络世代（sessionLock 内读，R4-11：data() 入口抓 startEpoch 用）。
-    private func currentNetworkEpoch() -> UInt64 {
-        sessionLock.lock()
-        defer { sessionLock.unlock() }
-        return networkEpoch
-    }
-
     /// 跳闸：该 host 10 分钟内直降代理感知 NWConnection。
     /// R4-11：只在 networkEpoch == ifEpoch 时写——中途换网/换代理后，旧网的
     /// 失败不再把新网的 breaker 跳闸 10 分钟（epoch 隔离）。
@@ -712,6 +739,16 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         defer { sessionLock.unlock() }
         guard networkEpoch == expectedEpoch else { return }
         breaker[host] = (epoch: networkEpoch, until: Date().addingTimeInterval(600))
+    }
+
+    /// 清掉某 host 的熔断器（R5-12）：熔断 host 在 DoH 上失败后回退到
+    /// URLSession 时清掉，否则该 host 永远钉在 Branch 1 的 DoH 路上。
+    /// 强制 host（模块声明）不走这条路，不清。
+    private func clearBreaker(host: String?) {
+        guard let host = host?.lowercased(), !host.isEmpty else { return }
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        breaker.removeValue(forKey: host)
     }
 
     /// kCFHostErrorHostNotFound 的数值（CFNetworkErrors：1 = DNS 解析失败）。
@@ -848,12 +885,20 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         // 绝对 deadline：一本账，整条请求链（URLSession + 兜底 + 救援）共用；
         // 各层只拿剩余时间，不再每层重起一份全额预算（26.238s 就是这么来的）。
         let deadline = Date().addingTimeInterval(totalDeadline)
-        // R4-11：入口抓网络世代——中途换网/换代理后，旧网的失败不再给新网跳闸。
-        let startEpoch = currentNetworkEpoch()
-        let proxy = ActiveSystemProxy.current()
-        // R4-5：流式 body（httpBodyStream）不走 DoH/强制传输——DoH 自研栈只读
+        // R5-7：入口先同步代理状态 + 网络世代（R4-11 的 startEpoch 由它返回）——
+        // 代理切换不触发 NWPathMonitor，只能靠对比；若等到 Branch 3 才同步，
+        // 入口抓的 startEpoch 是旧世代，换代理后第一个请求的跳闸会被丢弃，
+        // Branch 1 也会拿旧 epoch 把 host 困在 DoH 路上。
+        let (proxy, startEpoch) = syncProxyStateAndEpoch()
+        // R5-6：流式 body（httpBodyStream）不走 DoH/强制传输——DoH 自研栈只读
         // httpBody，流会被丢掉；有流的请求直接走 URLSession（原生处理流）。
-        let hasStreamBody = rawRequest.httpBody == nil && rawRequest.httpBodyStream != nil
+        // 只要 httpBodyStream 非空就是流式请求（即使 httpBody 也填了，
+        // URLSession 也是用流，不用 httpBody）。
+        let hasStreamBody = rawRequest.httpBodyStream != nil
+        // R5-3：本请求是否已试过直连 DoH——Branch 2 失败后 Branch 3 不许
+        // 再回 DoH（否则 DoH→URLSession→DoH 乒乓，还把 10 分钟熔断器
+        // 钉到刚失败的 DoH 路上）。
+        var triedDirectDoH = false
 
         // 1. 强制 host（已知 URLSession 不可靠）与熔断 host：代理感知 NWConnection。
         // PAC-only 时 NWConnection 执行不了 JS PAC，回落系统 URLSession。
@@ -862,31 +907,61 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
            url.scheme?.lowercased() == "https",
            isForcedTransportHost(url.host) || isBreakerTripped(host: url.host) {
             if !proxy.isPACOnly {
-                return try await performViaProxyAwareTransport(
-                    request: request,
-                    source: source,
-                    preservedHeaders: preservedHeaders,
-                    timeout: max(0, deadline.timeIntervalSinceNow),
-                    proxy: proxy
-                )
+                // R5-3：无代理时 Branch 1 走的就是直连 DoH，记下来，
+                // Branch 2/3 不再重复试。
+                if proxy == .none { triedDirectDoH = true }
+                // R5-12：熔断 host 的 DoH 失败要清闸回退——否则一个站
+                // 在 DoH 上一挂就永远钉在 Branch 1；强制 host（模块声明）
+                // 保持原样，不清闸、不回退。
+                do {
+                    return try await performViaProxyAwareTransport(
+                        request: request,
+                        source: source,
+                        preservedHeaders: preservedHeaders,
+                        timeout: max(0, deadline.timeIntervalSinceNow),
+                        proxy: proxy,
+                        preserveResponseStarted: true
+                    )
+                } catch let failure as DoHResponseStartedFailure {
+                    // R5-4e：已收到响应头后 body 失败——直接抛原错，不清闸、
+                    // 不回退（重发会复制请求）。
+                    throw failure.underlying
+                } catch {
+                    if error is CancellationError { throw error }
+                    if isForcedTransportHost(url.host) { throw error }
+                    clearBreaker(host: url.host)
+                }
             }
         }
 
         // 2. DoH 偏好 host（之前走 DoH 成功过）：仅无显式代理时直连 DoH；
         // 代理开着时由代理做 DNS（远程解析本来就是干净的），走 URLSession。
         //（系统 DNS 给的是被污染的 Facebook IP，TCP 黑洞 12 秒。）
+        // R5-12：Branch 1 已试过直连 DoH（triedDirectDoH）时不再重复试。
         if !hasStreamBody,
+           !triedDirectDoH,
            proxy == .none,
            DoHFallbackClient.shared.isDoHPreferred(for: url.host),
            url.scheme?.lowercased() == "https" {
-            // R4-4：DoH 偏好失效就撤销——取消原样抛；其他错先撤销该 host 偏好，
-            // 再落入下方 URLSession 路径（同一绝对 deadline，不另起预算），
-            // 不让一个站因 DoH 一挂就持续失败到切网。
+            // R5-4/R5-2：DoH 偏好失效就撤销——取消原样抛；已收到响应头
+            // 的错（DoHResponseStartedFailure）直接抛原错，不撤销、不回退
+            //（重发会复制请求）；预算耗尽（<=0.2s）也直接抛 DoH 原错，
+            // 不撤销、不回退（回退只会起一个 0ms 的 URLSession 任务，
+            // 记一条假超时事件，还把 DoH 原错盖掉）。其余错按版本号
+            // 条件撤销（R5-5），再落入下方 URLSession 路径（同一绝对
+            // deadline，不另起预算），不让一个站因 DoH 一挂就持续失败到切网。
+            let prefRevision = DoHFallbackClient.shared.doHPreferenceSnapshot(for: url.host)
+            triedDirectDoH = true
             do {
-                return try await performViaDoH(request: request, source: source, preservedHeaders: preservedHeaders, timeout: max(0, deadline.timeIntervalSinceNow))
+                return try await performViaDoH(request: request, source: source, preservedHeaders: preservedHeaders, timeout: max(0, deadline.timeIntervalSinceNow), preserveResponseStarted: true)
+            } catch let failure as DoHResponseStartedFailure {
+                throw failure.underlying
             } catch {
                 if error is CancellationError { throw error }
-                DoHFallbackClient.shared.removeDoHPreferred(host: url.host)
+                if deadline.timeIntervalSinceNow <= 0.2 { throw error }
+                if let rev = prefRevision {
+                    DoHFallbackClient.shared.removeDoHPreferred(host: url.host, ifRevision: rev)
+                }
             }
         }
 
@@ -903,6 +978,10 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
             // 剩余预算从绝对 deadline 算（不再 max(3, ...) 垫底——deadline
             // 到了就是到了，0 秒超时直接报，不再多拖 3 秒）。
             let remaining = max(0, deadline.timeIntervalSinceNow)
+            // R5-2：预算耗尽时不再起任务——0 秒超时的 runURLSessionOnce 只会
+            // 立即取消、白记一条假超时事件并盖掉真正的上游错误（Branch 2
+            // 的 DoH 原错）。到这里预算已用完，直接报超时。
+            guard remaining > 0 else { throw URLError(.timedOut) }
             do {
                 let (data, response) = try await runURLSessionOnce(
                     request: request,
@@ -924,7 +1003,15 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                 return (data, response)
             } catch {
                 let elapsedMs = Int(Date().timeIntervalSince(started) * 1000)
-                let metrics = await delegate.takeMetricsSoon(for: error)
+                // R5-13：错误路径不等多余的 metrics——takeMetricsSoon 最多等
+                // 150ms，会把 data() 推出绝对 deadline；预算已用完（<=0）或
+                // 本来就是超时错时直接拿现有的，不等。
+                let metrics: URLSessionTaskMetrics?
+                if deadline.timeIntervalSinceNow <= 0 || (error as? URLError)?.code == .timedOut {
+                    metrics = delegate.takeMetrics()
+                } else {
+                    metrics = await delegate.takeMetricsSoon(for: error)
+                }
                 let event = NetworkDiagnostics.makeEvent(
                     source: source,
                     request: request,
@@ -943,6 +1030,11 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                 // R4-11：catch 里重读当前代理——入口抓的 proxy 可能已过期（中途
                 // 开了/关了代理）；救援与兜底都用最新的代理（仍受 !isPACOnly 守卫）。
                 let currentProxy = ActiveSystemProxy.current()
+                // R5-6：流式 body 的请求到这里直接抛原错，不重试、不救援、
+                // 不回退——第一遍 URLSession 已把 InputStream 读掉（再试
+                // 是空流），DoH 自研栈又只读 httpBody（nil），回退只会
+                // 悄悄发一个 0 字节空 body。这一道检查同时拦住下面三条路。
+                if hasStreamBody { throw error }
                 // F12：-1002 救援先于 TTFB 保护判——-1002 是 URL 问题，不是传输
                 // 问题，不应被“已收到响应头”拦住。预算不够时不救，直接抛原错。
                 if isStrict1002Rescue(error: error, request: request), !currentProxy.isPACOnly {
@@ -979,10 +1071,14 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                 if url.scheme?.lowercased() == "https",
                    let host = url.host, !host.isEmpty,
                    isTransportFallbackEligible(error) {
-                    if shouldTripBreaker(error: error, metrics: metrics) {
+                    // R5-3：本请求已试过直连 DoH（Branch 1/2）且当前无代理时，
+                    // 不跳闸、不回 DoH——DoH 本请求已失败，再试是乒乓，还会把
+                    // 10 分钟熔断器钉到刚失败的 DoH 路上；直接抛原错。
+                    let canFallbackTransport = !(triedDirectDoH && currentProxy == .none)
+                    if canFallbackTransport, shouldTripBreaker(error: error, metrics: metrics) {
                         tripBreaker(host: host, ifEpoch: startEpoch)
                     }
-                    if !currentProxy.isPACOnly {
+                    if canFallbackTransport, !currentProxy.isPACOnly {
                         return try await performViaProxyAwareTransport(
                             request: request,
                             source: source,
@@ -1049,7 +1145,7 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         box: URLSessionRaceBox
     ) -> URLSessionDataTask {
         sessionLock.lock()
-        let s = resolveSessionLocked()
+        let (s, proxyChanged) = resolveSessionLocked()
         let task = s.dataTask(with: request) { data, response, error in
             if let error {
                 box.finish(.failure(error), cancelTask: false)
@@ -1061,6 +1157,10 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         }
         task.delegate = delegate
         sessionLock.unlock()
+        // R5-7：代理变化的 DoH 重置在解锁后做（见 resolveSessionLocked）。
+        if proxyChanged {
+            DoHFallbackClient.shared.resetForNetworkChange()
+        }
         return task
     }
 
@@ -1071,13 +1171,14 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         source: String,
         preservedHeaders: [String: String],
         timeout: TimeInterval,
-        proxy: ActiveSystemProxy
+        proxy: ActiveSystemProxy,
+        preserveResponseStarted: Bool = false
     ) async throws -> (Data, URLResponse) {
         switch proxy {
         case .none:
-            return try await performViaDoH(request: request, source: source, preservedHeaders: preservedHeaders, timeout: timeout)
+            return try await performViaDoH(request: request, source: source, preservedHeaders: preservedHeaders, timeout: timeout, preserveResponseStarted: preserveResponseStarted)
         case .http, .socks5:
-            return try await performViaProxy(request: request, source: source, preservedHeaders: preservedHeaders, timeout: timeout, proxy: proxy)
+            return try await performViaProxy(request: request, source: source, preservedHeaders: preservedHeaders, timeout: timeout, proxy: proxy, preserveResponseStarted: preserveResponseStarted)
         case .pacOnly:
             throw URLError(.unsupportedURL)
         }
@@ -1085,11 +1186,16 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
 
     /// 经 DoH 客户端发请求（直连 DoH 解析出的 IP）：成功记偏好，
     /// 失败记一条诊断事件后把错抛回调用方。
+    /// preserveResponseStarted（R5-4）：true 时已收到响应头后 body 失败
+    /// 的包装（DoHResponseStartedFailure）原样抛给调用方（Branch 2 靠它
+    /// 区分“可回退”与“不可重发”）；false（默认）时解开抛原错，包装绝不
+    /// 漏出 data()。
     private func performViaDoH(
         request: URLRequest,
         source: String,
         preservedHeaders: [String: String],
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        preserveResponseStarted: Bool = false
     ) async throws -> (Data, URLResponse) {
         let started = Date()
         let networkClassAtStart = PlaybackLedger.networkClass
@@ -1101,6 +1207,15 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
             )
             recordTransportEvent(source: source, request: request, response: http, bodyData: data, error: nil, elapsedMs: Int(Date().timeIntervalSince(started) * 1000), networkClass: networkClassAtStart)
             return (data, http)
+        } catch let failure as DoHResponseStartedFailure {
+            // R5-4：已收到响应头后 body 失败——诊断事件记原错；调用方
+            // 要区分时（Branch 2）原样抛包装，不要时（代理感知传输）
+            // 解开抛原错。
+            recordTransportEvent(source: source, request: request, response: nil, bodyData: nil, error: failure.underlying, elapsedMs: Int(Date().timeIntervalSince(started) * 1000), networkClass: networkClassAtStart)
+            if preserveResponseStarted {
+                throw failure
+            }
+            throw failure.underlying
         } catch {
             recordTransportEvent(source: source, request: request, response: nil, bodyData: nil, error: error, elapsedMs: Int(Date().timeIntervalSince(started) * 1000), networkClass: networkClassAtStart)
             throw error
@@ -1114,7 +1229,8 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         source: String,
         preservedHeaders: [String: String],
         timeout: TimeInterval,
-        proxy: ActiveSystemProxy
+        proxy: ActiveSystemProxy,
+        preserveResponseStarted: Bool = false
     ) async throws -> (Data, URLResponse) {
         let started = Date()
         do {
@@ -1129,6 +1245,12 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
             // 没有 metrics，tx 为 nil 时类别会被记错）。
             recordTransportEvent(source: source, request: request, response: http, bodyData: data, error: nil, elapsedMs: Int(Date().timeIntervalSince(started) * 1000), networkClass: "proxy")
             return (data, http)
+        } catch let failure as DoHResponseStartedFailure {
+            recordTransportEvent(source: source, request: request, response: nil, bodyData: nil, error: failure.underlying, elapsedMs: Int(Date().timeIntervalSince(started) * 1000), networkClass: "proxy")
+            if preserveResponseStarted {
+                throw failure
+            }
+            throw failure.underlying
         } catch {
             recordTransportEvent(source: source, request: request, response: nil, bodyData: nil, error: error, elapsedMs: Int(Date().timeIntervalSince(started) * 1000), networkClass: "proxy")
             throw error
@@ -1526,6 +1648,10 @@ final class WordPressHTTP: @unchecked Sendable {
             if seconds > 0 {
                 try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
             }
+            // R5-11：睡醒再复核一次预算——Task.sleep 可能因定时器合并 /
+            // 应用切后台而睡过 deadline；预算没了返回 false，调用方
+            // 返回 429/5xx 响应 / 重抛原错，不再继续抛一个假 .timedOut。
+            guard deadline.timeIntervalSinceNow > 0.5 else { return false }
             return true
         }
         var attempt = 0

@@ -87,6 +87,15 @@ struct DoHTransportFailure: Error {
     let responseStarted: Bool
 }
 
+/// 已收到最终响应头后 body 失败的包装（R5-4）：perform() 的 IP 循环不再
+/// 把 responseStarted 标志丢掉——外层 data() 的 DoH 偏好分支要靠它区分
+/// “建连失败（可撤销偏好、可回退 URLSession）”与“已收到头（不可重发，
+/// 否则 POST 等非幂等请求会被重复提交）”。只在 DoHFallbackClient 内部
+/// 与 performViaDoH 之间流转；对外错误永远是 underlying，包装绝不漏出 data()。
+struct DoHResponseStartedFailure: Error {
+    let underlying: Error
+}
+
 /// DoH 解析结果（F13）：三种空结果分开，不再一律映射成 .cannotFindHost。
 enum DoHResolution {
     case resolved([String])
@@ -144,6 +153,10 @@ final class DoHFallbackClient: @unchecked Sendable {
     private let lock = NSLock()
     private var ipCache: [String: CachedIPs] = [:]
     private var preferredHosts: Set<String> = []
+    /// DoH 偏好版本号（R5-5）：与 preferredHosts 同一把锁管；每次记偏好
+    /// +1，条件撤销成功时也 +1——并发里后到的成功会把版本号顶上去，
+    /// 旧失败拿旧快照撤销时版本号已变，撤销成空操作，不再误删新偏好。
+    private var preferredRevision: [String: UInt64] = [:]
     /// 网络世代（R3-6）：resetForNetworkChange() 时 +1。resolveIPs() 与
     /// perform() 在入口捕获它，写缓存 / 记偏好前重新核对——旧网在途的
     /// 解析/请求绝不把旧 IP 写进新网的缓存与偏好表。
@@ -230,6 +243,7 @@ final class DoHFallbackClient: @unchecked Sendable {
         networkGeneration &+= 1
         ipCache.removeAll()
         preferredHosts.removeAll()
+        preferredRevision.removeAll()
         lock.unlock()
     }
 
@@ -240,23 +254,40 @@ final class DoHFallbackClient: @unchecked Sendable {
         return preferredHosts.contains(host)
     }
 
+    /// DoH 偏好版本号快照（R5-5）：调用方在 performViaDoH 前抓，失败时
+    /// 凭它条件撤销。nil = 该 host 当前无偏好（不用撤销）。
+    func doHPreferenceSnapshot(for host: String?) -> UInt64? {
+        guard let host = host?.lowercased(), !host.isEmpty else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        guard preferredHosts.contains(host) else { return nil }
+        return preferredRevision[host, default: 0]
+    }
+
     /// 原子围栏记偏好（R4-10）：同一把锁内校验 generation == expected 再插入——
     /// 避免 resetForNetworkChange() 在检查与写入之间跑、把旧网的偏好插回新网的表。
     func markDoHPreferred(host: String, ifGeneration expected: UInt64) {
         lock.lock()
         defer { lock.unlock() }
         guard networkGeneration == expected else { return }
-        preferredHosts.insert(host.lowercased())
+        let key = host.lowercased()
+        preferredHosts.insert(key)
+        // R5-5：记偏好时版本号 +1（见 preferredRevision 注释）。
+        preferredRevision[key, default: 0] &+= 1
     }
 
-    /// 撤销某 host 的 DoH 偏好（R4-4）：DoH 一挂就摘掉，下次请求重新走
+    /// 撤销某 host 的 DoH 偏好（R4-4/R5-5）：DoH 一挂就摘掉，下次请求重新走
     /// URLSession（偏好一旦建立永不撤销，会让一个站持续失败到切网）。
-    /// 只 lock 内删除，不用 generation 校验。
-    func removeDoHPreferred(host: String?) {
+    /// 只在版本号与调用方快照一致时删——快照之后若有并发请求成功重标了
+    /// 偏好（版本号已 +1），这次撤销是陈旧的，直接跳过。撤销成功时
+    /// 版本号也 +1，让更早的快照同样失效。
+    func removeDoHPreferred(host: String?, ifRevision expected: UInt64) {
         guard let host = host?.lowercased(), !host.isEmpty else { return }
         lock.lock()
+        defer { lock.unlock() }
+        guard preferredRevision[host, default: 0] == expected else { return }
         preferredHosts.remove(host)
-        lock.unlock()
+        preferredRevision[host, default: 0] &+= 1
     }
 
     /// 走 DoH 解析商链解析并直连 IP 发 HTTPS 请求（最多跟随 5 次重定向）。
@@ -314,6 +345,10 @@ final class DoHFallbackClient: @unchecked Sendable {
                     // 代理标签不是 IP——返回空串，展示层空值即“经代理”。
                     hop = (res.0, res.1, "", res.2)
                 } catch let failure as DoHTransportFailure {
+                    // R5-4e：与 IP 循环一致——已收到响应头后 body 失败时包着原错
+                    // 抛（DoHResponseStartedFailure），让外层知道不可重发；
+                    // 未收到头时仍解包抛原错（R3-2：classify() 要看原错）。
+                    if failure.responseStarted { throw DoHResponseStartedFailure(underlying: failure.underlying) }
                     throw failure.underlying
                 }
             } else {
@@ -353,8 +388,10 @@ final class DoHFallbackClient: @unchecked Sendable {
                         markDoHPreferred(host: host, ifGeneration: generation)
                         break
                     } catch let failure as DoHTransportFailure {
-                        // F4：该 IP 已收到最终响应头，body 失败不再换 IP。
-                        if failure.responseStarted { throw failure.underlying }
+                        // F4/R5-4：该 IP 已收到最终响应头，body 失败不再换 IP；
+                        // 用 DoHResponseStartedFailure 包着原错抛，让外层 data()
+                        // 知道已收到头、不可回退重发（原错仍在 underlying 里）。
+                        if failure.responseStarted { throw DoHResponseStartedFailure(underlying: failure.underlying) }
                         lastError = failure.underlying
                         continue
                     } catch {
@@ -486,7 +523,9 @@ final class DoHFallbackClient: @unchecked Sendable {
         // 同名不同 Path 的 cookie 都保留（同名 jar 条目按 path 长度降序排）。
         // R3-10：每个对都带范围（domain/hostOnly/path），过期删除只删范围匹配的。
         // 种子的范围是 (origin host, host-only, "/")。
-        var merged: [(name: String, value: String, domain: String, hostOnly: Bool, path: String)] = []
+        // R5-1：每个对再带 isSeed——等 path 长时 jar（服务端刚给的新值）在前、
+        // 种子（旧值）在后，服务端读第一个。
+        var merged: [(name: String, value: String, domain: String, hostOnly: Bool, path: String, isSeed: Bool)] = []
         let originHost = originURL?.host?.lowercased() ?? ""
         if sameOrigin, let seedCookie = originRequest.value(forHTTPHeaderField: "Cookie") {
             for pair in seedCookie.split(separator: ";") {
@@ -498,11 +537,11 @@ final class DoHFallbackClient: @unchecked Sendable {
                 let name = kv[0].trimmingCharacters(in: .whitespaces)
                 let value = kv[1].trimmingCharacters(in: .whitespaces)
                 guard !name.isEmpty else { continue }
-                merged.append((name: name, value: value, domain: originHost, hostOnly: true, path: "/"))
+                merged.append((name: name, value: value, domain: originHost, hostOnly: true, path: "/", isSeed: true))
             }
         }
         merged.removeAll { pair in
-            expiredKeys.contains { Self.expiredKeyAppliesToSeed($0, name: pair.name, domain: pair.domain, nextURL: nextURL) }
+            expiredKeys.contains { Self.expiredKeyAppliesToSeed($0, name: pair.name, domain: pair.domain) }
         }
         let matching = cookies.filter { Self.cookieMatches($0, url: nextURL) }
         // 按 name 分组（保持首次出现顺序）；组内按 path 长度降序——最具体的在前。
@@ -518,31 +557,43 @@ final class DoHFallbackClient: @unchecked Sendable {
                 // R4-1：只删与 jar 条目 (name, domain, path) 身份相同的对——
                 // 不同 path/domain 的种子保留（同名不同 path 是两个合法 cookie，
                 // 按裸 name 全删会把种子的 sid=root 连同 jar 的 sid=admin 一起丢掉）。
+                // R5-1：域级 jar 条目（Domain=.thaiporntv.com）还覆盖同名同 path
+                // 且域名在其域范围内的对——Cookie 头不带 Domain 元数据，种子
+                // 的域只是原始 host，父域新值就是同一 cookie 的更新值；不覆盖
+                // 会把旧值排在新值前面发出去（服务端读第一个，仍是旧值）。
+                let jarDomain = Self.normalizedCookieDomain(entry.cookie.domain)
                 merged.removeAll {
-                    $0.name == entry.cookie.name
-                        && Self.normalizedCookieDomain($0.domain) == Self.normalizedCookieDomain(entry.cookie.domain)
-                        && $0.path == entry.cookie.path
+                    guard $0.name == entry.cookie.name, $0.path == entry.cookie.path else { return false }
+                    let mergedDomain = Self.normalizedCookieDomain($0.domain)
+                    if mergedDomain == jarDomain { return true }
+                    return !entry.hostOnly && mergedDomain.hasSuffix("." + jarDomain)
                 }
                 merged.append((
                     name: entry.cookie.name,
                     value: entry.cookie.value,
                     domain: Self.normalizedCookieDomain(entry.cookie.domain),
                     hostOnly: entry.hostOnly,
-                    path: entry.cookie.path
+                    path: entry.cookie.path,
+                    isSeed: false
                 ))
             }
         }
         // R4-1：同名条目（种子 + jar 一起）按 path 长度降序排——最具体的 path
         // 在前（RFC 6265：同名 cookie 按 path 长度降序发）。按 name 首次出现
         // 顺序分组，只排组内，不动组间顺序。
+        // R5-1：等 path 长时 jar 在前、种子在后（isSeed false 优先）——同名
+        // 同 path 下 jar 是服务端刚给的新值，种子是旧值；服务端读第一个。
         if !merged.isEmpty {
             var order: [String] = []
-            var groups: [String: [(name: String, value: String, domain: String, hostOnly: Bool, path: String)]] = [:]
+            var groups: [String: [(name: String, value: String, domain: String, hostOnly: Bool, path: String, isSeed: Bool)]] = [:]
             for pair in merged {
                 if groups[pair.name] == nil { order.append(pair.name) }
                 groups[pair.name, default: []].append(pair)
             }
-            merged = order.flatMap { (groups[$0] ?? []).sorted(by: { $0.path.count > $1.path.count }) }
+            merged = order.flatMap { (groups[$0] ?? []).sorted(by: {
+                if $0.path.count != $1.path.count { return $0.path.count > $1.path.count }
+                return !$0.isSeed && $1.isSeed
+            }) }
         }
         if merged.isEmpty {
             nextReq.setValue(nil, forHTTPHeaderField: "Cookie")
@@ -575,21 +626,17 @@ final class DoHFallbackClient: @unchecked Sendable {
         return d
     }
 
-    /// 过期键是否删种子 cookie（R4-3，种子专用——全代码只有 redirectRequest
+    /// 过期键是否删种子 cookie（R4-3/R5-8，种子专用——全代码只有 redirectRequest
     /// 的种子删除一个调用点；Set-Cookie 循环用身份 remove/insert，不走这里）。
     /// 种子永远是 host-only：domain-scope（Domain=）的过期键不删种子；
-    /// domain 精确相等；path 用 RFC 6265 前缀规则对 nextURL.path 匹配——
-    /// 不是与种子建模的 "/" 精确相等（种子没有 path 元数据，服务端可能按
-    /// /app 删它；nextURL.path 在过期键的 path 前缀内才算覆盖）。
-    private static func expiredKeyAppliesToSeed(_ key: ExpiredCookieKey, name: String, domain: String, nextURL: URL) -> Bool {
+    /// domain 精确相等；path 精确相等——种子建模为 Path="/"，只有 Path="/"
+    /// 的删除键才删它。path 匹配决定 cookie“发不发给某路径”，不是“某 path
+    /// 的删除删不删另一 path 的 cookie”（Path=/app 的删除删的是 /app 的
+    /// cookie，不是 / 的种子；拿 nextURL.path 当身份是错的）。
+    private static func expiredKeyAppliesToSeed(_ key: ExpiredCookieKey, name: String, domain: String) -> Bool {
         guard key.name == name, key.hostOnly else { return false }
         guard Self.normalizedCookieDomain(domain) == key.domain else { return false }
-        let path = nextURL.path.isEmpty ? "/" : nextURL.path
-        if path == key.path { return true }
-        guard path.hasPrefix(key.path) else { return false }
-        if key.path.hasSuffix("/") { return true }
-        let nextIndex = path.index(path.startIndex, offsetBy: key.path.count)
-        return path[nextIndex] == "/"
+        return key.path == "/"
     }
 
     /// host 是否为 IP 字面量（IPv4 四段数字 / 含冒号的 IPv6）：IP 上后缀匹配
@@ -1317,6 +1364,16 @@ final class DoHFallbackClient: @unchecked Sendable {
         return .incomplete
     }
 
+    /// header 名是否是合法 RFC 9110 token（R5-10）：非空，只含 tchar
+    ///（字母、数字与 !#$%&'*+-.^_`|~）。去 \r\n 后仍可能剩空串或含
+    /// ":" / 空格的名（如模块给了 "\r\n" 或 "X-Bad: Name"），直接拼会
+    /// 写出 ": value" 这种非法行，严格源站会 400。
+    private static func isHeaderToken(_ s: String) -> Bool {
+        guard !s.isEmpty else { return false }
+        let tchars = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&'*+-.^_`|~")
+        return s.unicodeScalars.allSatisfy { tchars.contains($0) }
+    }
+
     private func buildHTTP11Request(url: URL, host: String, request: URLRequest) -> Data {
         let method = request.httpMethod ?? "GET"
         var pathAndQuery = url.path.isEmpty ? "/" : url.path
@@ -1336,6 +1393,9 @@ final class DoHFallbackClient: @unchecked Sendable {
                 // URLSession 会拒这类头，含换行的值会注入换行（header injection）。
                 let cleanKey = k.replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: "")
                 let cleanValue = v.replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: "")
+                // R5-10：去换行后名仍可能非法（空串、含 ":" / 空格）——
+                // 只发 RFC 9110 token 名的头，其余跳过不发。
+                guard Self.isHeaderToken(cleanKey) else { continue }
                 let lower = cleanKey.lowercased()
                 guard !seen.contains(lower) else { continue }
                 seen.insert(lower)
