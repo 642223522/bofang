@@ -624,7 +624,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             URLError.Code.dnsLookupFailed.rawValue,
             URLError.Code.secureConnectionFailed.rawValue
         ]
-        if case let WidgetHostError.transport(code, _) = error {
+        if case let WidgetHost.WidgetHostError.transport(code, _) = error {
             return blockCodes.contains(code) ? code : nil
         }
         let nsError = error as NSError
@@ -989,7 +989,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             steps.append(CheckStepResult(name: "详情", passed: true, reason: nil, milliseconds: detailElapsed()))
         } catch {
             try throwIfCancelled()
-            if let hostError = error as? WidgetHostError, case .functionMissing = hostError {
+            if let hostError = error as? WidgetHost.WidgetHostError, case .functionMissing = hostError {
                 // 模块没有 loadDetail：http(s) 回退裸 GET；自定义 scheme 跳过本步
                 if let url = URL(string: sample.link), url.scheme == "http" || url.scheme == "https" {
                     do {
