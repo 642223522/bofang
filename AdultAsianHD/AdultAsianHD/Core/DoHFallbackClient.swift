@@ -457,7 +457,12 @@ final class DoHFallbackClient: @unchecked Sendable {
         let wireData = buildHTTP11Request(url: url, host: host, request: request)
         let params = makeHTTP11TLSParameters(sniHost: host, proxy: proxy)
         let rawResponse = try await driveConnection(
-            endpoint: .hostPort(host: .name(host, nil), port: nwPort),
+            // 注意：不要写 .name(host, nil)——NWEndpoint.Host.name 的第二个
+            // 关联值没有公开文档可查，无法确认 nil 是否合法（run #31 构建
+            // 1 分钟挂，唯一未经核实的 API 就是这一行）。Host 的 String
+            // 初始化器 NWEndpoint.Host(host) 是公开且被 WireGuard 等生产
+            // 代码在用的写法，主机名进 .name、IP 进 .ipv4/.ipv6，语义相同。
+            endpoint: .hostPort(host: .init(host), port: nwPort),
             params: params,
             wireData: wireData,
             timeout: timeout
