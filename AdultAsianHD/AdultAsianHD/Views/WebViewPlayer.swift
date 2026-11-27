@@ -116,8 +116,14 @@ enum AdBlockRuleStore {
 // MARK: - 第三层：CF 通过后删广告 DOM + playsinline（分两阶段）
 
 /// 广告 DOM 清理脚本（document-start 注入，主框架 + 子框架都跑，每帧独立实例）。
-/// 两阶段：每轮先查有没有 Cloudflare 验证在跑（标题 "Just a moment"、
-/// 挑战 iframe、cf- 标记，含中文标题“请稍候/正在验证/您是真人吗”），有就跳过这轮、什么都不碰；验证过了才删广告。
+/// run #23 (v13)：共享 Cloudflare 门只停挑战文档本身（同 URL 的 403/503 挑战页
+/// 也能认出来）；挑战 iframe 残留在 DOM 里不再杀掉 v5——改成按元素保护（是挑战
+/// 组件、包在挑战里、或包着挑战的候选卡才不碰）；v5 不再用 display:none 覆盖
+/// v10 已裁切的卡（一卡只归一个清理器）；新分类器治两张新卡——假下载进度卡
+/// （D1 有进度结构才藏，D2 纯文本要再加大的下半区 Continue 按钮，防误藏真人
+/// 点的下载确认框）与假真人验证卡（验证词 + 验证 CTA + 关闭按钮）。
+/// 几何阈值恢复到 run #22 真机确认过的 v10 原值（88px 下限）。诊断浮层只在
+/// 检测 Tab 开关打开时显示（左下角小字：扫描/拦截计数，测试用）。
 /// 删什么（run #21 XSPModalGuard v5 合成版，Gemini v2/v4 + ChatGPT v3/v5 四轮互撕收敛）：
 /// ① 弹窗层（新增，治 onlybokep 那三个假弹窗）：文本签名 + CTA 组合评分
 ///    （Finish Download / Download pending / REMINDER (N) / Resume playing?，
@@ -143,8 +149,271 @@ enum AdBlockRuleStore {
 /// 另：所有 video 元素都打上 playsinline，让嵌页视频在页内播、
 /// 走我们的外层控制条，而不是一播就跳系统全屏播放器。
 enum AdStripScript {
-    static let source = """
+    /// run #23 (v13): diagBadgeEnabled 在每个 frame 的 document-start 就置位，
+    /// 这样嵌页 iframe 里的清理器也能装诊断浮层（didFinish 只够得到主框架）。
+    static func source(diagBadgeEnabled: Bool) -> String {
+        (diagBadgeEnabled ? "window.__xspDiagBadge = true;\n" : "") + """
+    // XSP shared prologue (run #23, v13) — runs BEFORE the v5 and v10 IIFEs in the same
+    // injected script, so both IIFEs call these instead of keeping their own copies.
+    // Lives inside a Swift triple-quote string: NO backticks, NO dollar-brace sequences.
+    // Backslashes are single here; the splice step doubles them for Swift.
+    // ES5 style (var / function) so it matches the v5 file and the v12 v10 file.
+
+    // ---------- Shared Cloudflare challenge-document gate (ChatGPT v13) ----------
+    // ONE function, recomputed on every scan, shared by v5 stripOnce and v10 scanOnce.
+    // Do NOT cache a hasVideo boolean: the player element may be inserted after the
+    // flag was captured, and a challenge overlay over an existing player is still a
+    // challenge. Strong markers win even if a <video> is present underneath.
+    // "您是真人吗" is deliberately NOT a title trigger: the fake verification card
+    // itself carries that text, and it must never shut down scanning.
+    window.__xspShared = window.__xspShared || {};
+
+    function xspIsCloudflareChallengeDocument(doc) {
+      try {
+        if (!doc || !doc.documentElement) return false;
+        var href = String((doc.location && doc.location.href) || '').toLowerCase();
+        var title = String(doc.title || '').toLowerCase();
+        var urlSignal = href.indexOf('challenges.cloudflare.com') >= 0 ||
+          href.indexOf('/cdn-cgi/challenge-platform/') >= 0;
+        var titleSignal = /just a moment|checking your browser|verify you are human|正在验证|请稍候/.test(title);
+        var markerSignal = false;
+        try {
+          markerSignal = !!doc.querySelector(
+            '#challenge-form, #challenge-running, #challenge-stage, ' +
+            '#cf-wrapper, #cf-spinner, #cf-browser-verification, ' +
+            '[id*="cf-chl-"], [class*="cf-challenge"], ' +
+            '[class*="challenge-running"], [class*="turnstile"]'
+          );
+        } catch (_) {}
+        var globalSignal = false;
+        try {
+          globalSignal = !!(doc.defaultView && doc.defaultView._cf_chl_opt);
+        } catch (_) {}
+        var scriptSignal = false;
+        try {
+          scriptSignal = !!doc.querySelector('script[src*="/cdn-cgi/challenge-platform/"]');
+        } catch (_) {}
+        // Script alone is supporting evidence only; a generic "challenge" word proves nothing.
+        return !!(urlSignal || markerSignal || globalSignal || (titleSignal && scriptSignal));
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function xspChallengeGate() {
+      try {
+        return xspIsCloudflareChallengeDocument(document);
+      } catch (_) {
+        return false;
+      }
+    }
+
+    // ---------- Shared per-element challenge protection (ChatGPT v13) ----------
+    // Protect a candidate iff it IS, is INSIDE, or CONTAINS a real challenge
+    // component/iframe — but only the candidate itself, never "any ancestor in the
+    // document that happens to contain a challenge" (that would immunize the page).
+    // No depth cap: a real challenge container can nest arbitrarily. Composed-tree
+    // walk crosses registered ShadowRoot hosts; closed roots we never registered
+    // cannot be inspected and are not pretended to be.
+    var XSP_CF_MARKER =
+      '[id*="cf-"], [class*="cf-challenge"], ' +
+      '[class*="challenge-running"], [class*="turnstile"], ' +
+      '#challenge-form, #challenge-stage, #challenge-running';
+
+    function xspIsCFFrame(el) {
+      if (!el || el.nodeType !== 1) return false;
+      if ((el.tagName || '').toLowerCase() !== 'iframe') return false;
+      var src = (el.getAttribute('src') || '').toLowerCase();
+      var title = (el.getAttribute('title') || '').toLowerCase();
+      return src.indexOf('challenges.cloudflare.com') >= 0 ||
+        src.indexOf('turnstile') >= 0 ||
+        /cloudflare|turnstile|security challenge/.test(title);
+    }
+
+    function xspIsCFComponent(el) {
+      if (!el || el.nodeType !== 1) return false;
+      if (xspIsCFFrame(el)) return true;
+      try {
+        return el.matches(XSP_CF_MARKER);
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function xspComposedParent(el) {
+      if (!el) return null;
+      if (el.parentElement) return el.parentElement;
+      var root = el.getRootNode && el.getRootNode();
+      return root && root.host ? root.host : null;
+    }
+
+    function xspCandidateContainsCF(candidate, roots) {
+      if (xspIsCFComponent(candidate)) return true;
+      try {
+        var found = candidate.querySelectorAll(XSP_CF_MARKER + ', iframe');
+        for (var i = 0; i < found.length; i++) {
+          if (xspIsCFComponent(found[i])) return true;
+        }
+      } catch (_) {}
+      // Shadow descendants: only registered roots whose host is composed-descended
+      // from this candidate.
+      var list = roots || [];
+      for (var r = 0; r < list.length; r++) {
+        var root = list[r];
+        if (!root || !root.host) continue;
+        var host = root.host;
+        var belongs = false;
+        for (var depth = 0; host && depth < 32; depth++) {
+          if (host === candidate) { belongs = true; break; }
+          host = xspComposedParent(host);
+        }
+        if (!belongs) continue;
+        try {
+          var els = root.querySelectorAll(XSP_CF_MARKER + ', iframe');
+          for (var j = 0; j < els.length; j++) {
+            if (xspIsCFComponent(els[j])) return true;
+          }
+        } catch (_) {}
+      }
+      return false;
+    }
+
+    function xspIsInsideCFComponent(candidate) {
+      var p = candidate;
+      for (var depth = 0; p && depth < 32; depth++) {
+        if (xspIsCFComponent(p)) return true;
+        p = xspComposedParent(p);
+      }
+      return false;
+    }
+
+    function xspIsChallengeProtected(candidate, roots) {
+      if (!candidate || candidate.nodeType !== 1) return true;
+      if (xspIsInsideCFComponent(candidate)) return true;
+      if (xspCandidateContainsCF(candidate, roots)) return true;
+      return false;
+    }
+
+    // ---------- Shared v10-ownership guard ----------
+    // v10 clips confirmed cards (keeps offsetHeight > 0 so the ad SDK does not
+    // resurrect them). v5 must never overwrite that with display:none, and must
+    // not hide a wrapper around a v10-managed card either.
+    function xspIsV10Managed(el) {
+      if (!el || el.nodeType !== 1) return false;
+      try {
+        if (el.getAttribute && el.getAttribute('data-xsp-fg-v10') === '1') return true;
+        var p = el.parentElement;
+        for (var i = 0; p && i < 8; i++, p = p.parentElement) {
+          if (p.getAttribute && p.getAttribute('data-xsp-fg-v10') === '1') return true;
+        }
+      } catch (_) {}
+      return false;
+    }
+
+    // ---------- Shared on-device telemetry: counters + visible phone badge ----------
+    // window.__xspDiag counters (readable via evaluateJavaScript when a Mac is around).
+    // The badge is the phone-only reader: it is installed ONLY when Swift sets
+    // window.__xspDiagBadge = true (toggle in the 检测 tab, default off), lives in
+    // its own closed ShadowRoot, and is excluded from every candidate scan.
+    function xspDiagBump(key, detail) {
+      try {
+        var d = window.__xspDiag;
+        if (!d) {
+          d = {
+            v5Runs: 0, v5SkipChallengeDoc: 0, v5VetoChallengeEl: 0, v5Hid: 0,
+            v10Runs: 0, v10SkipChallengeDoc: 0, v10Candidates: 0,
+            v10HidVpn: 0, v10HidAnon: 0, v10HidVerify: 0, v10HidDlProg: 0, lastHits: []
+          };
+          window.__xspDiag = d;
+        }
+        if (key === 'v10Candidates') {
+          d[key] = Number(detail || 0);
+        } else if (typeof d[key] === 'number') {
+          d[key] += 1;
+        }
+        if (detail && typeof detail === 'string') {
+          d.lastHits.push(detail);
+          if (d.lastHits.length > 10) d.lastHits.shift();
+        }
+        if (detail && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.xspDiag) {
+          try { window.webkit.messageHandlers.xspDiag.postMessage({ key: key, detail: detail }); } catch (_) {}
+        }
+        var badgeMap = {
+          v5Runs: 'scans', v10Runs: 'scans',
+          v5SkipChallengeDoc: 'challengeSkips', v10SkipChallengeDoc: 'challengeSkips',
+          v10Candidates: 'candidates',
+          v10HidVpn: 'hiddenVPN', v10HidAnon: 'hiddenViewMore',
+          v10HidVerify: 'hiddenVerification', v10HidDlProg: 'hiddenDownload',
+          v5VetoChallengeEl: 'protectedVetoes'
+        };
+        if (badgeMap[key]) xspDiagEvent(badgeMap[key], detail);
+        else if (key === 'v5Hid') xspDiagEvent('v5 hid' + (detail ? ': ' + detail : ''));
+      } catch (_) {}
+    }
+
+    function xspDiagEvent(name, detail) {
+      try {
+        var api = window.__xspPhoneDiag;
+        if (api && api.event) api.event(name, detail);
+      } catch (_) {}
+    }
+
+    function xspInstallPhoneDiag() {
+      try {
+        if (!window.__xspDiagBadge) return null;
+        if (window.__xspPhoneDiag) return window.__xspPhoneDiag;
+        var state = {
+          scans: 0, challengeSkips: 0, candidates: 0,
+          hiddenVPN: 0, hiddenViewMore: 0, hiddenVerification: 0, hiddenDownload: 0,
+          protectedVetoes: 0, last: 'started'
+        };
+        var host = document.createElement('div');
+        host.setAttribute('data-xsp-debug-ui', '1');
+        var shadow = host.attachShadow({ mode: 'closed' });
+        var panel = document.createElement('div');
+        panel.style.cssText =
+          'position:fixed;left:5px;bottom:5px;z-index:2147483647;' +
+          'background:rgba(0,0,0,.88);color:#fff;padding:7px 9px;' +
+          'font:11px/1.4 monospace;border:1px solid #777;' +
+          'border-radius:6px;max-width:240px;pointer-events:none;';
+        shadow.appendChild(panel);
+        (document.documentElement || document).appendChild(host);
+        var api = {
+          state: state,
+          event: function (name, detail) {
+            if (name === 'candidates') {
+              state.candidates = Number(detail || 0);
+            } else if (Object.prototype.hasOwnProperty.call(state, name)) {
+              state[name] += Number(detail || 1);
+            }
+            state.last = String(name).slice(0, 80);
+            render();
+          }
+        };
+        function render() {
+          panel.textContent =
+            'XSP diag\\n' +
+            'scan ' + state.scans +
+            ' | gate ' + state.challengeSkips +
+            ' | cand ' + state.candidates + '\\n' +
+            'VPN ' + state.hiddenVPN +
+            ' | More ' + state.hiddenViewMore + '\\n' +
+            'Verify ' + state.hiddenVerification +
+            ' | Download ' + state.hiddenDownload + '\\n' +
+            'veto ' + state.protectedVetoes + '\\n' +
+            'last: ' + state.last;
+        }
+        window.__xspPhoneDiag = api;
+        render();
+        return api;
+      } catch (_) {
+        return null;
+      }
+    }
+
     // XSPModalGuard v5 synthesis (run #21) — replaces the old AdStripScript.
+    // run #23 (v13): cfRunning() global gate replaced by the shared xspChallengeGate()
+    // in the prologue; hideTarget() skips v10-managed + challenge-protected nodes.
     // Lives inside a Swift triple-quote string: NO backticks, NO dollar-brace sequences in this file.
     // Backslashes are single here; the splice step doubles them for Swift.
     (function(){
@@ -171,7 +440,7 @@ enum AdStripScript {
       var MAX_TEXT_NODES_PER_SCAN = 5000;
       var MAX_CARD_TEXT = 2000;
       var MAX_PROTECT_HOPS = 10;
-    
+
       // ---------- per-frame state ----------
       var shadowRoots = [];
       var hiddenNodes = [];
@@ -181,7 +450,7 @@ enum AdStripScript {
       var lastTrustedAt = 0;            // trusted pointer/key interaction on this page
       var lastModalHiddenAt = 0;
       var lastPauseAt = 0;
-    
+
       // ---------- 0. attachShadow hook FIRST (document-start runs before any page script) ----------
       try {
         var nativeAttachShadow = Element.prototype.attachShadow;
@@ -191,26 +460,15 @@ enum AdStripScript {
           return root;
         };
       } catch(e){}
-    
-      function cfRunning(){
-        try {
-          var t = (document.title || '').toLowerCase();
-          if (t.indexOf('just a moment') >= 0) return true;
-          if (t.indexOf('checking your browser') >= 0) return true;
-          if (t.indexOf('请稍候') >= 0) return true;
-          if (t.indexOf('正在验证') >= 0) return true;
-          if (t.indexOf('您是真人吗') >= 0) return true;
-          if (document.querySelector('iframe[src*="challenges.cloudflare.com"]')) return true;
-          if (document.querySelector('iframe[src*="turnstile"]')) return true;
-          if (document.querySelector('[id*="cf-"], [class*="cf-challenge"], [class*="challenge-running"], [class*="turnstile"]')) return true;
-        } catch(e){}
-        return false;
-      }
-    
+
+      // cfRunning() REMOVED in run #23 (v13): the global kill-switch is replaced by
+      // the shared xspChallengeGate() in the prologue (only the challenge's own
+      // document stops scanning; a leftover challenge iframe no longer kills v5).
+
       function hasVideoInside(el){
         return el && (el.tagName === 'VIDEO' || (el.querySelector && el.querySelector('video')));
       }
-    
+
       function isAdSrc(u){
         if (!u) return false;
         u = String(u).toLowerCase();
@@ -219,7 +477,7 @@ enum AdStripScript {
         }
         return false;
       }
-    
+
       function isFakeDownloadLabel(label){
         var s = (label || '').trim();
         if (s.length === 0 || s.length > 28) return false;
@@ -229,7 +487,7 @@ enum AdStripScript {
         }
         return false;
       }
-    
+
       // ---------- 1. protected ancestors: walk up from every <video> + player controls ----------
       // Composed traversal (cross shadow boundaries via getRootNode().host), capped hops.
       // Only video/control ancestors are protected — never the whole player host, or
@@ -265,11 +523,11 @@ enum AdStripScript {
         } catch(e){}
         return set;
       }
-    
+
       function isProtected(el, set){
         return el && set.indexOf(el) >= 0;
       }
-    
+
       // ---------- 2. modal detection: one bounded text-node pass, no innerText ----------
       function scanTextNodes(root, out){
         try {
@@ -279,6 +537,12 @@ enum AdStripScript {
               if (!p) return NodeFilter.FILTER_REJECT;
               var t = p.tagName;
               if (t === 'SCRIPT' || t === 'STYLE' || t === 'NOSCRIPT') return NodeFilter.FILTER_REJECT;
+              // run #23: never scan the phone-diag badge's own text ("Download"/"Verify"
+              // counters would otherwise feed the modal scorer).
+              var pp = p;
+              for (var up = 0; pp && up < 8; up++, pp = pp.parentElement) {
+                if (pp.getAttribute && pp.getAttribute('data-xsp-debug-ui') === '1') return NodeFilter.FILTER_REJECT;
+              }
               return NodeFilter.FILTER_ACCEPT;
             }
           });
@@ -293,7 +557,7 @@ enum AdStripScript {
           }
         } catch(e){}
       }
-    
+
       // Walk up from a matching text node to the modal card: first <dialog>,
       // role=dialog / aria-modal ancestor, or fixed/absolute ancestor (the
       // backdrop counts — hiding it hides the card too). Stop at protected
@@ -315,7 +579,7 @@ enum AdStripScript {
         }
         return null;
       }
-    
+
       function scoreCard(card){
         var txt = '';
         try { txt = (card.textContent || '').slice(0, MAX_CARD_TEXT); } catch(e){}
@@ -348,10 +612,14 @@ enum AdStripScript {
         }
         return score;
       }
-    
+
       // ---------- 3. hiding: keep the node, mark it, !important hide, restore on reset ----------
       function hideTarget(el){
         if (!el) return false;
+        // run #23 (v13): never overwrite v10's non-collapsing clip-hide with
+        // display:none (SDK resurrection), and never hide a real challenge node.
+        if (xspIsV10Managed(el)) return false;
+        if (xspIsChallengeProtected(el, shadowRoots)) { xspDiagBump('v5VetoChallengeEl'); return false; }
         try {
           // Native <dialog>: close() first — display:none alone leaves the page
           // stuck in top-layer modal inert state + body overflow locked.
@@ -370,10 +638,11 @@ enum AdStripScript {
           el.style.setProperty('pointer-events', 'none', 'important');
           el.style.setProperty('visibility', 'hidden', 'important');
           if (hiddenNodes.indexOf(el) < 0) hiddenNodes.push(el);
+          xspDiagBump('v5Hid', 'v5:' + (el.tagName || 'EL'));
           return true;
         } catch(e){ return false; }
       }
-    
+
       function reapplyHide(el){
         try {
           if (!el.getAttribute('data-xsp-hidden')) return;
@@ -388,7 +657,7 @@ enum AdStripScript {
           }
         } catch(e){}
       }
-    
+
       // ---------- 4. resume attribution: pause() is EVIDENCE, four-way classification ----------
       // Native iOS pauses (Control Center / lock screen / AirPods) never call the JS
       // prototype — EXCEPT through a page-registered Media Session handler, which
@@ -401,7 +670,7 @@ enum AdStripScript {
           return nativePause.apply(this, arguments);
         };
       } catch(e){}
-    
+
       try {
         if (navigator.mediaSession && navigator.mediaSession.setActionHandler) {
           var nativeSAH = navigator.mediaSession.setActionHandler.bind(navigator.mediaSession);
@@ -417,7 +686,7 @@ enum AdStripScript {
           };
         }
       } catch(e){}
-    
+
       function findVideo(){
         try {
           var v = document.querySelector('video');
@@ -431,7 +700,7 @@ enum AdStripScript {
         } catch(e){}
         return null;
       }
-    
+
       function maybeResume(){
         try {
           var v = findVideo();
@@ -445,7 +714,7 @@ enum AdStripScript {
           v.play();
         } catch(e){}
       }
-    
+
       // ---------- 5. cross-origin iframe protocol (versioned, source-checked, no nonce) ----------
       // Child frame: after hiding a high-confidence modal, report to the parent ONLY
       // when this frame has no <video> (a player frame never reports). Parent: hide
@@ -458,7 +727,7 @@ enum AdStripScript {
           }
         } catch(e){}
       }
-    
+
       window.addEventListener('message', function(ev){
         try {
           var d = ev.data || {};
@@ -478,13 +747,15 @@ enum AdStripScript {
           }
         } catch(e){}
       });
-    
+
       // ---------- 6. the scan: modal layer first, then the old rules ----------
       function stripOnce(){
-        if (cfRunning()) return;
+        xspInstallPhoneDiag();
+        if (xspChallengeGate()) { xspDiagBump('v5SkipChallengeDoc'); return; }
+        xspDiagBump('v5Runs');
         try {
           var prot = buildProtectedSet();
-    
+
           // --- modal layer ---
           var hits = [];
           scanTextNodes(document, hits);
@@ -509,7 +780,7 @@ enum AdStripScript {
             if (!document.querySelector('video')) reportToParent();
             maybeResume();
           }
-    
+
           // --- rule 1: fake Download buttons (kept verbatim) ---
           var clickables = document.querySelectorAll('a, button, div[role="button"]');
           for (var d = 0; d < clickables.length; d++) {
@@ -583,7 +854,7 @@ enum AdStripScript {
           }
         } catch(e){}
       }
-    
+
       function forceInline(){
         try {
           var vs = document.querySelectorAll('video');
@@ -594,7 +865,7 @@ enum AdStripScript {
           }
         } catch(e){}
       }
-    
+
       function scheduleScan(){
         if (rafPending) return;
         rafPending = true;
@@ -610,7 +881,7 @@ enum AdStripScript {
           forceInline();
         }
       }
-    
+
       // ---------- 7. wiring ----------
       // Trusted interaction: a pause within 700ms after a tap/keypress is a user pause.
       document.addEventListener('pointerdown', function(){ lastTrustedAt = Date.now(); }, true);
@@ -623,7 +894,7 @@ enum AdStripScript {
         scheduleScan();
         maybeResume();
       }, true);
-    
+
       // Main observer: childList + attributes (style/class/hidden/open/marker) +
       // characterData. Re-apply hiding when the ad SDK resets a hidden node's style.
       // characterData only schedules a scan when the changed text matches a signature.
@@ -654,31 +925,42 @@ enum AdStripScript {
           characterData: true, subtree: true
         });
       } catch(e){}
-    
+
       stripOnce();
       forceInline();
       setInterval(function(){ stripOnce(); forceInline(); }, 1000);
     })();
-    // XSPFloatingCardGuard v10 (run #22) — appended after v5, separate IIFE, v5 untouched.
-    // Gemini v10: v9 synthesis + 5 fixes (two-tier click shell, getComputedStyle-verified hide,
-    // chrome-vs-container hardVeto split, shallow attributes, 180x88 geometry floor).
+    // XSPFloatingCardGuard v13 (run #23) — v12 + ChatGPT v13 corrections, separate IIFE.
+    // Shared CF gate + per-element CF protection (prologue), tightened D2, restored
+    // v10 device-confirmed geometry, v10-owns-its-cards, phone-diag badge wiring.
+    // XSPFloatingCardGuard v13 (run #23) — v12 + ChatGPT v13 corrections:
+    // shared CF gate + per-element CF protection (prologue), tightened D2,
+    // restored v10 device-confirmed geometry, v10-owns-its-cards, phone-diag badge.
     (function () {
       if (window.__xspFloatingCardGuardV10) return;
       window.__xspFloatingCardGuardV10 = true;
 
-      // Swift 注入时可替换为 UUID().uuidString；未替换时同页全 frame 仍保持一致可用
-      const NONCE = '__XSP_SESSION_NONCE__';
-      const CARD_ATTR = 'data-xsp-fg-v10';
-      const WRAP_ATTR = 'data-xsp-fg-wrap-v10';
-      const BACKDROP_ATTR = 'data-xsp-fg-bd-v10';
-      const STYLE_ID = '__xsp_fg_v10_css';
+      // Swift replaces this with UUID().uuidString per WKWebView instance; works identically across frames even if unchanged
+      var NONCE = '__XSP_SESSION_NONCE__';
+      var CARD_ATTR = 'data-xsp-fg-v10';
+      var WRAP_ATTR = 'data-xsp-fg-wrap-v10';
+      var BACKDROP_ATTR = 'data-xsp-fg-bd-v10';
+      var STYLE_ID = '__xsp_fg_v10_css';
 
-      // ---------------- 受保护与硬否决规则 ----------------
-      const SAFE_IFRAME_RE =
+      // ---------------- Real Challenge & Hard-Veto Rules ----------------
+      // run #23 (v13): challenge-document + per-element CF checks moved to the
+      // shared prologue (xspChallengeGate / xspIsChallengeProtected) — one live
+      // decision shared by v5 and v10, never two copies that can disagree.
+      var REAL_CHALLENGE_SEL =
+        'iframe[src*="challenges.cloudflare.com"], iframe[src*="hcaptcha.com"], ' +
+        'iframe[src*="recaptcha.net"], iframe[src*="google.com/recaptcha"], ' +
+        '.cf-turnstile, #turnstile-wrapper, #challenge-form, #challenge-running, #challenge-stage, ' +
+        '[data-sitekey], input[name="cf-turnstile-response"], .g-recaptcha, .h-captcha';
+
+      var SAFE_IFRAME_RE =
         /(challenges\\.cloudflare\\.com|hcaptcha\\.com|recaptcha\\.net|google\\.com\\/recaptcha|accounts\\.|login\\.|oauth|pay\\.|stripe\\.com|paypal\\.com)/i;
 
-      // 核心控件栏（这些节点及其祖先不可藏，其内部子孙也不参与广告判定）
-      const CONTROL_BAR_SELECTOR =
+      var CONTROL_BAR_SELECTOR =
         '.vjs-control-bar, .vjs-menu, .vjs-text-track-display, .vjs-title-bar, .vjs-error-display, ' +
         '.plyr__controls, .plyr__menu, .plyr__captions, ' +
         '.jw-controls, .jw-settings-menu, .jw-captions, .jw-title, ' +
@@ -686,74 +968,99 @@ enum AdStripScript {
         '.art-bottom, .art-setting, .art-subtitle, ' +
         '[role="slider"], input[type="range"], .cf-turnstile';
 
-      // 严格限定到播放器 UI 部件，绝不包含宽泛的 #player / .video-js / .plyr 外壳
-      const PLAYER_CHROME_RE =
+      var PLAYER_CHROME_RE =
         /(^|[\\s_-])(vjs-(control|menu|text-track|title|error|loading|big-play|poster|time|progress|volume|fullscreen|subs|caption)|plyr__(controls?|menu|captions?|poster|progress|time|volume|tooltip)|jw-(controls?|settings|captions?|title|display|icon|slider|tooltip)|dplayer-(controller|setting|subtitle|bar|icons|notice|menu)|art-(bottom|controls?|setting|subtitle|notice|loading|layer-title)|control-?bar|seek-?bar|progress-?bar|top-?bar|header-?bar|nav-?bar|cf-turnstile)/i;
 
-      // 仅用于过滤 characterData 高频刷新（时间轴/缓冲/字幕跳字）
-      const PLAYER_LIVE_UI_RE =
+      var PLAYER_LIVE_UI_RE =
         /(vjs-(current-time|duration|remaining|time|progress|control|text-track)|plyr__(time|progress|captions?|tooltip)|jw-(text-elapsed|text-duration|slider|captions?|tooltip)|dplayer-(ptime|dtime|bar|subtitle)|art-(time|progress|subtitle)|time-?display|current-?time|duration|progress-?bar|seek-?bar|subtitle|caption|text-?track)/i;
 
-      // 播放器菜单文案硬否决：明确设置词 OR >=2 个分辨率/倍速选项（避免单出现 "4K" 误放 VPN 广告）
-      const MENU_EXPLICIT_RE =
+      var MENU_EXPLICIT_RE =
         /\\b(subtitles?|captions?|playback\\s+speed|audio\\s+track|quality|picture[\\s-]in[\\s-]picture|chromecast|airplay)\\b|(清晰度|画质|倍速|字幕|音轨|切换线路|画中画|投屏)/i;
-      const MENU_OPTION_TOKEN_RE = /\\b(2160p|1080p|720p|480p|360p|4k|0\\.5x|0\\.75x|1\\.0?x|1\\.25x|1\\.5x|2\\.?0?x|auto)\\b/gi;
+      var MENU_OPTION_TOKEN_RE = /\\b(2160p|1080p|720p|480p|360p|4k|0\\.5x|0\\.75x|1\\.0?x|1\\.25x|1\\.5x|2\\.?0?x|auto)\\b/gi;
 
-      // 合法「下一集」卡片硬否决
-      const NEXT_EPISODE_VETO_RE =
+      var NEXT_EPISODE_VETO_RE =
         /(下一集|下集|即将播放|自动播放下|选集|第\\s*\\d+\\s*[集话期部]|合集列表|\\bup\\s+next\\b|\\bnext\\s+episode\\b|\\bnext\\s+video\\b|\\bplay\\s+next\\b|\\bauto[\\s-]?play\\b|\\bep\\.?\\s*\\d+\\b|\\bs\\d+\\s*e\\d+\\b)/i;
 
-      // 真实登录/支付/验证码 DOM 结构硬否决
-      const AUTH_PAY_CAPTCHA_SELECTOR =
+      var AUTH_PAY_CAPTCHA_SELECTOR =
         'input[type="password"], input[type="email"], input[autocomplete*="cc-"], [data-sitekey], .cf-turnstile, .g-recaptcha, .h-captcha';
 
-      // ---------------- 分类器 1：VPN / 翻墙 / 加速器推广卡 ----------------
-      const VPN_STRONG_RE = /(vpn|翻墙|梯子|科学上网|加速神器|看片神器|翻墙看片|看片加速|回国加速|游戏加速器|加速器)/i;
+      // ---------------- Classifier A: VPN / Accelerator Promo Card ----------------
+      var VPN_STRONG_RE = /(vpn|翻墙|梯子|科学上网|加速神器|看片神器|翻墙看片|看片加速|回国加速|游戏加速器|加速器)/i;
 
-      const VPN_AUX_NET_CLUSTERS = [
+      var VPN_AUX_NET_CLUSTERS = [
         /(\\d+\\s*\\+\\s*节点|全球.{0,6}节点|高速节点|专线节点|多国节点)/i,
         /(无限流量|不限流量|不限速|零日志|不限带宽)/i,
         /(支持订阅|一键订阅|订阅链接|多端同步)/i
       ];
-      const VPN_AUX_OTHER_CLUSTERS = [
+      var VPN_AUX_OTHER_CLUSTERS = [
         /(免费试用|免费体验|限时免费|永久免费|新人免费)/i,
         /(独立\\s*app|原生\\s*app|客户端下载|官方\\s*app)/i,
         /(支持.{0,12}(安卓|苹果|ios|android|pc|mac|windows))/i
       ];
 
-      const VPN_DOWNLOAD_CTA_RE =
+      var VPN_DOWNLOAD_CTA_RE =
         /^(立即下载体验|立即下载|下载体验|立即安装|免费下载|高速下载|极速下载|免费试用|立即体验|点击下载|马上下载|下载\\s*app|download\\s+now|install\\s+now|free\\s+download|try\\s+free)(\\s*[!！>»→])?$/i;
 
-      // ---------------- 分类器 2：匿名 / 打码推送信卡片（View More 类） ----------------
-      const ANON_PUSH_CTA_RE =
+      // ---------------- Classifier B: Anonymous Push / Blurred Card (View More) ----------------
+      var ANON_PUSH_CTA_RE =
         /^(view\\s+more|learn\\s+more|see\\s+more|read\\s+more|show\\s+more|open\\s+now|visit\\s+site|view\\s+details|see\\s+details|more\\s+info|go\\s+now|查看更多|查看详情|了解详情|立即查看)(\\s*[!！>»→])?$/i;
 
-      const CLOSE_TEXT_RE = /^([×✕✖╳xX]|关闭|close)$/i;
-      const CLOSE_ATTR_RE = /(close|dismiss|cancel-?ad|btn-?x|icon-?close)/i;
-      const ZERO_WIDTH_RE = /[\\u200B-\\u200D\\uFEFF\\u00AD]/g;
+      // ---------------- Classifier C: Fake Human Verification Card ----------------
+      var VERIFY_PHRASE_RE =
+        /(您是真人吗|需要验证身份|请验证身份|身份验证|真人验证|人机验证|\\bare\\s+you\\s+(a\\s+)?human\\b|\\bverify\\s+you\\s+are\\s+human\\b|\\bhuman\\s+verification\\b|\\brobot\\s+check\\b|\\bprove\\s+you\\s+are\\s+human\\b)/i;
 
-      const shadowRoots = new Set();
-      const observedRoots = new WeakSet();
-      const observedShallowEls = new WeakSet();
-      const cardWatchers = new WeakMap();
-      const cardReevalTimers = new WeakMap();
-      const cardInlineFallback = new WeakSet();
-      const cardToWrappers = new WeakMap();
-      const wrapperToCards = new WeakMap();
-      const frameThrottle = new WeakMap();
+      var VERIFY_CTA_RE =
+        /^(点击了解更多|了解更多|立即验证|开始验证|点击验证|验证身份|learn\\s+more|verify\\s+now|continue\\s+verification|click\\s+to\\s+verify|verify\\s+human)(\\s*[!！>»→])?$/i;
 
-      let microQueued = false;
-      let rafQueued = false;
-      let lastFrameReportTs = 0;
+      // ---------------- Classifier D: Fake Download Progress Card ----------------
+      var DOWNLOAD_TEXT_RE =
+        /(\\bfinish\\s+(your\\s+)?download\\b|\\bdownload\\s*:|\\bdownload\\s+pending\\b|\\breminder\\s*\\(\\s*\\d+\\s*\\)|\\byour\\s+(download|file|video)\\s+is\\s+(ready|pending)\\b|下载未完成|完成下载|继续下载|下载待完成|下载进度|下载)/i;
+
+      var HIGH_CONF_FAKE_DL_RE =
+        /(\\bfinish\\s+(your\\s+)?download\\b|\\bdownload\\s*:\\s*(finish|pending|ready)|\\bdownload\\s+pending\\b|\\breminder\\s*\\(\\s*\\d+\\s*\\)\\s*download\\b|\\byour\\s+download\\s+is\\s+(ready|pending)\\b|下载未完成|完成下载|继续下载|下载待完成)/i;
+
+      var CONTINUE_CTA_RE =
+        /^(continue|finish|finish\\s+download|proceed|resume\\s+download|download\\s+now|继续|继续下载|立即继续|完成下载)(\\s*[!！>»→])?$/i;
+
+      var NEG_DISMISS_CTA_RE =
+        /^(no,?\\s*thanks?|cancel|later|close|dismiss|skip|not\\s+now|decline|取消|不用了|稍后|关闭)(\\s*[!！])?$/i;
+
+      var BLOCK_GLYPH_RE = /[■█▓▒░▪▬🟩🟥⬜⬛]/g;
+
+      // ---------------- Leaf Text-Anchor Discovery (per-root TreeWalker) ----------------
+      var TEXT_ANCHOR_RE =
+        /(\\bfinish\\s+(your\\s+)?download\\b|\\bdownload\\s*:|\\bdownload\\s+pending\\b|\\breminder\\s*\\(\\s*\\d+\\s*\\)|下载|您是真人吗|需要验证身份|请验证身份|真人验证|\\bare\\s+you\\s+(a\\s+)?human\\b|\\bverify\\s+you\\s+are\\s+human\\b|\\bhuman\\s+verification\\b|\\brobot\\s+check\\b)/i;
+
+      var CLOSE_TEXT_RE = /^([×✕✖╳xX]|关闭|close)$/i;
+      var CLOSE_ATTR_RE = /(close|dismiss|cancel-?ad|btn-?x|icon-?close)/i;
+      var ZERO_WIDTH_RE = /[\\u200B-\\u200D\\uFEFF\\u00AD]/g;
+
+      var shadowRoots = new Set();
+      var observedRoots = new WeakSet();
+      var observedShallowEls = new WeakSet();
+      var cardWatchers = new WeakMap();
+      var cardReevalTimers = new WeakMap();
+      var cardInlineFallback = new WeakSet();
+      var cardToWrappers = new WeakMap();
+      var wrapperToCards = new WeakMap();
+      var frameThrottle = new WeakMap();
+
+      var microQueued = false;
+      var rafQueued = false;
+      var lastFrameReportTs = 0;
 
       // ---------------------------------------------------------------------------
-      // 1. 样式表优先隐藏规则（默认零 inline style 污染）
+      // run #23 (v13): telemetry moved to the shared prologue (xspDiagBump).
+      
+
+      // ---------------------------------------------------------------------------
+      // 1. Stylesheet-First Clip Hiding & ShadowRoot Capture
       // ---------------------------------------------------------------------------
       function injectStyleSheet(root) {
         try {
           if (root.getElementById && root.getElementById(STYLE_ID)) return true;
           if (root.querySelector && root.querySelector('#' + STYLE_ID)) return true;
-          const s = document.createElement('style');
+          var s = document.createElement('style');
           s.id = STYLE_ID;
           s.textContent =
             '[' + CARD_ATTR + '="1"][' + CARD_ATTR + '="1"],' +
@@ -769,7 +1076,7 @@ enum AdStripScript {
             '[' + WRAP_ATTR + '="1"][' + WRAP_ATTR + '="1"]{' +
             'pointer-events:none!important;' +
             'transition:none!important;}';
-          const target = root === document ? (document.head || document.documentElement) : root;
+          var target = root === document ? (document.head || document.documentElement) : root;
           if (!target) return false;
           target.appendChild(s);
           return true;
@@ -785,11 +1092,11 @@ enum AdStripScript {
         observeRoot(root);
       }
 
-      const origAttachShadow = Element.prototype.attachShadow;
+      var origAttachShadow = Element.prototype.attachShadow;
       if (origAttachShadow && !origAttachShadow.__xspFgV10Hooked) {
         try {
-          const wrapped = function attachShadow(init) {
-            const root = origAttachShadow.call(this, init);
+          var wrapped = function attachShadow(init) {
+            var root = origAttachShadow.call(this, init);
             try {
               registerShadowRoot(root);
               scheduleMicroScan();
@@ -802,7 +1109,7 @@ enum AdStripScript {
       }
 
       function getAllRoots() {
-        const out = [document];
+        var out = [document];
         shadowRoots.forEach(function (sr) {
           if (sr.host && sr.host.isConnected) out.push(sr);
           else shadowRoots.delete(sr);
@@ -811,7 +1118,7 @@ enum AdStripScript {
       }
 
       // ---------------------------------------------------------------------------
-      // 2. 无回流文本提取 & visualViewport 坐标系工具
+      // 2. Layout-Free Text Extraction & visualViewport Coordinates
       // ---------------------------------------------------------------------------
       function normalizeText(s) {
         return (s || '')
@@ -819,31 +1126,32 @@ enum AdStripScript {
           .replace(/[！]/g, '!')
           .replace(/[：]/g, ':')
           .replace(/[＋]/g, '+')
+          .replace(/[？]/g, '?')
           .replace(/\\s+/g, ' ')
           .trim();
       }
 
       function getCleanText(el, maxLen, skipClippedDescendants) {
-        let out = '';
-        const stack = [el];
+        var out = '';
+        var stack = [el];
         while (stack.length && out.length <= maxLen) {
-          const n = stack.pop();
+          var n = stack.pop();
           if (!n) continue;
           if (n.nodeType === 3) {
             if (n.nodeValue) out += (out ? ' ' : '') + n.nodeValue;
           } else if (n.nodeType === 1) {
-            const tag = n.tagName;
+            var tag = n.tagName;
             if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEMPLATE') continue;
             if (skipClippedDescendants && n !== el && n.getAttribute && n.getAttribute(CARD_ATTR) === '1') continue;
-            const kids = n.childNodes;
-            for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
+            var kids = n.childNodes;
+            for (var i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
           }
         }
         return normalizeText(out);
       }
 
       function getViewportMetrics() {
-        const vv = window.visualViewport;
+        var vv = window.visualViewport;
         if (vv && vv.width > 0 && vv.height > 0) {
           return { w: vv.width, h: vv.height, ox: vv.offsetLeft || 0, oy: vv.offsetTop || 0 };
         }
@@ -862,34 +1170,38 @@ enum AdStripScript {
       }
 
       // ---------------------------------------------------------------------------
-      // 3. 统一前置 hardVeto（分类前 & hideCard 内双重执行，不误豁免容器内注入广告）
+      // 3. Challenge-Document Stop, Per-Element Challenge Guard & hardVeto(el, txt, prot)
       // ---------------------------------------------------------------------------
+      
+
+      
+
       function matchesChromeToken(el) {
         if (!el || el.nodeType !== 1) return false;
-        const tag = el.tagName;
+        var tag = el.tagName;
         if (tag === 'VIDEO' || tag === 'AUDIO' || tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return true;
         if (el.getAttribute && el.getAttribute('role') === 'slider') return true;
-        const cls = typeof el.className === 'string' ? el.className : '';
-        const id = typeof el.id === 'string' ? el.id : '';
+        var cls = typeof el.className === 'string' ? el.className : '';
+        var id = typeof el.id === 'string' ? el.id : '';
         return PLAYER_CHROME_RE.test(cls) || PLAYER_CHROME_RE.test(id);
       }
 
       function isInsidePlayerChrome(el) {
-        let cur = el;
-        for (let up = 0; up < 6 && cur && cur.nodeType === 1; up++, cur = cur.parentElement) {
+        var cur = el;
+        for (var up = 0; up < 6 && cur && cur.nodeType === 1; up++, cur = cur.parentElement) {
           if (matchesChromeToken(cur)) return true;
         }
         return false;
       }
 
       function isInsidePlayerLiveUI(node) {
-        let cur = node && node.nodeType === 1 ? node : (node ? node.parentElement : null);
-        for (let up = 0; up < 6 && cur && cur.nodeType === 1; up++, cur = cur.parentElement) {
-          const tag = cur.tagName;
+        var cur = node && node.nodeType === 1 ? node : (node ? node.parentElement : null);
+        for (var up = 0; up < 6 && cur && cur.nodeType === 1; up++, cur = cur.parentElement) {
+          var tag = cur.tagName;
           if (tag === 'VIDEO' || tag === 'AUDIO') return true;
           if (cur.getAttribute && cur.getAttribute('role') === 'slider') return true;
-          const cls = typeof cur.className === 'string' ? cur.className : '';
-          const id = typeof cur.id === 'string' ? cur.id : '';
+          var cls = typeof cur.className === 'string' ? cur.className : '';
+          var id = typeof cur.id === 'string' ? cur.id : '';
           if (PLAYER_LIVE_UI_RE.test(cls) || PLAYER_LIVE_UI_RE.test(id)) return true;
         }
         return false;
@@ -898,43 +1210,59 @@ enum AdStripScript {
       function isPlayerMenuText(txt) {
         if (!txt) return false;
         if (MENU_EXPLICIT_RE.test(txt)) return true;
-        const m = txt.match(MENU_OPTION_TOKEN_RE);
+        var m = txt.match(MENU_OPTION_TOKEN_RE);
         return !!(m && m.length >= 2);
       }
 
       function buildProtectedContext(roots) {
-        const ancestors = new Set();
-        let hasVideo = false;
+        var ancestors = new Set();
+        var hasVideo = false;
+
         function markUp(node) {
-          let cur = node;
+          var cur = node;
           while (cur) {
             if (ancestors.has(cur)) break;
             ancestors.add(cur);
             cur = cur.parentNode || cur.host || null;
           }
         }
-        for (let r = 0; r < roots.length; r++) {
-          const root = roots[r];
+
+        for (var r = 0; r < roots.length; r++) {
+          var root = roots[r];
           if (!root.querySelectorAll) continue;
-          const vids = root.querySelectorAll('video');
+
+          var vids = root.querySelectorAll('video');
           if (vids.length > 0) hasVideo = true;
-          for (let i = 0; i < vids.length; i++) markUp(vids[i]);
-          const controls = root.querySelectorAll(CONTROL_BAR_SELECTOR);
-          for (let i = 0; i < controls.length; i++) markUp(controls[i]);
-          const iframes = root.querySelectorAll('iframe[src]');
-          for (let i = 0; i < iframes.length; i++) {
-            if (SAFE_IFRAME_RE.test(String(iframes[i].src || ''))) markUp(iframes[i]);
+          for (var i = 0; i < vids.length; i++) markUp(vids[i]);
+
+          var controls = root.querySelectorAll(CONTROL_BAR_SELECTOR);
+          for (var j = 0; j < controls.length; j++) markUp(controls[j]);
+
+          // run #23: the phone-diag badge host is protected so no classifier can hide it.
+          var dbg = root.querySelectorAll('[data-xsp-debug-ui]');
+          for (var g = 0; g < dbg.length; g++) markUp(dbg[g]);
+
+          var challenges = root.querySelectorAll(REAL_CHALLENGE_SEL);
+          for (var k = 0; k < challenges.length; k++) markUp(challenges[k]);
+
+          var iframes = root.querySelectorAll('iframe[src]');
+          for (var f = 0; f < iframes.length; f++) {
+            if (SAFE_IFRAME_RE.test(String(iframes[f].src || ''))) markUp(iframes[f]);
           }
         }
-        return { ancestors: ancestors, hasVideo: hasVideo };
+
+        return { ancestors: ancestors, hasVideo: hasVideo, roots: roots };
       }
 
       function hardVeto(el, txt, prot) {
         if (!el || el.nodeType !== 1) return true;
-        const tag = el.tagName;
-        if (tag === 'HTML' || tag === 'BODY' || tag === 'HEAD' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK' || tag === 'META') return true;
+        var tag = el.tagName;
+        if (tag === 'HTML' || tag === 'BODY' || tag === 'HEAD' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK' || tag === 'META') {
+          return true;
+        }
         if (prot && prot.ancestors.has(el)) return true;
         if (isInsidePlayerChrome(el)) return true;
+        if (xspIsChallengeProtected(el, prot.roots)) return true;
         if (tag === 'IFRAME' && SAFE_IFRAME_RE.test(String(el.src || ''))) return true;
         if (el.querySelector) {
           if (el.querySelector('video, audio, [role="slider"], input[type="range"]')) return true;
@@ -948,14 +1276,15 @@ enum AdStripScript {
       }
 
       // ---------------------------------------------------------------------------
-      // 4. 几何发现过滤（visualViewport 对齐 + 绝对像素下限，仅发现不作证明）
+      // 4. Geometry Pipeline (Real v10 Signatures)
       // ---------------------------------------------------------------------------
       function isInFloatingLayer(el, root, prot) {
+        // run #23 (v13): climb restored to the v10 device-confirmed 5.
         if (root !== document) return true;
-        let cur = el;
-        for (let up = 0; up < 5 && cur && cur.nodeType === 1; up++) {
+        var cur = el;
+        for (var up = 0; up < 5 && cur && cur.nodeType === 1; up++) {
           if (cur === document.body || cur === document.documentElement || prot.ancestors.has(cur)) break;
-          const st = getComputedStyle(cur);
+          var st = getComputedStyle(cur);
           if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity) === 0) return false;
           if (st.position === 'fixed' || st.position === 'absolute') return true;
           cur = cur.parentElement;
@@ -965,13 +1294,18 @@ enum AdStripScript {
 
       function matchesCardGeometry(vrect, vp, isAdSubframe) {
         if (vp.w <= 0 || vp.h <= 0) return false;
+        // run #23 (v13): restored the v10 device-confirmed thresholds. Card A already
+        // passes these; widen only the failing dimension when a real missed card proves it.
         if (vrect.width < 180 || vrect.height < 88) return false;
+
         if (isAdSubframe) {
           return vrect.width >= vp.w * 0.52 && vrect.height >= vp.h * 0.32;
         }
-        const isLandscape = vp.w > vp.h;
-        const wRatio = vrect.width / vp.w;
-        const hRatio = vrect.height / vp.h;
+
+        var isLandscape = vp.w > vp.h;
+        var wRatio = vrect.width / vp.w;
+        var hRatio = vrect.height / vp.h;
+
         if (isLandscape) {
           if (wRatio < 0.28 || wRatio > 1.02) return false;
           if (hRatio < 0.20 || hRatio > 0.86) return false;
@@ -979,72 +1313,95 @@ enum AdStripScript {
           if (wRatio < 0.52 || wRatio > 1.02) return false;
           if (hRatio < 0.15 || hRatio > 0.66) return false;
         }
-        const cx = vrect.left + vrect.width / 2;
-        const centered = Math.abs(cx - vp.w / 2) <= vp.w * (isLandscape ? 0.24 : 0.22);
-        const topOk = vrect.top >= -vp.h * 0.08 && vrect.top <= vp.h * 0.44;
-        const notBottomBar = vrect.bottom <= vp.h * (isLandscape ? 0.95 : 0.90);
+
+        var cx = vrect.left + vrect.width / 2;
+        var centered = Math.abs(cx - vp.w / 2) <= vp.w * (isLandscape ? 0.24 : 0.22);
+        var topOk = vrect.top >= -vp.h * 0.08 && vrect.top <= vp.h * 0.44;
+        var notBottomBar = vrect.bottom <= vp.h * (isLandscape ? 0.95 : 0.90);
         return centered && topOk && notBottomBar;
       }
 
       // ---------------------------------------------------------------------------
-      // 5. 按钮动作节点 / 关闭 X / 两个独立分类器（零外链加分，覆盖栅格打码图）
+      // 5. Shared UI Probes + Classifiers A (VPN), B (View More), C (Verify), D (Download Progress)
       // ---------------------------------------------------------------------------
       function isVisibleColor(c) {
-        return !!c && c !== 'rgba(0, 0, 0, 0)' && c !== 'transparent';
+        return !!c && c !== 'rgba(0, 0, 0, 0)' && c !== 'transparent' && c !== 'none';
       }
 
+      
+
+      
+
       function isActionLikeNode(node, rect, cardRect) {
-        const tag = node.tagName;
+        var tag = node.tagName;
         if (tag === 'BUTTON' || tag === 'A') return true;
         if (node.getAttribute('role') === 'button') return true;
         if (node.hasAttribute('onclick') || node.hasAttribute('aria-label') || node.hasAttribute('title')) return true;
-        const st = getComputedStyle(node);
+
+        var st = getComputedStyle(node);
         if (st.cursor === 'pointer') return true;
-        const hasButtonChrome =
+
+        var hasButtonChrome =
           isVisibleColor(st.backgroundColor) ||
           (st.backgroundImage && st.backgroundImage !== 'none') ||
           (parseFloat(st.borderTopWidth) > 0 && isVisibleColor(st.borderTopColor));
         return hasButtonChrome &&
-          rect.width >= Math.max(80, cardRect.width * 0.24) &&
-          rect.height >= 24 && rect.height <= 80;
+          rect.width >= Math.max(64, cardRect.width * 0.20) &&
+          rect.height >= 22 && rect.height <= 80;
       }
 
       function findCtaButton(card, cardRect, regex) {
-        const nodes = card.querySelectorAll('a, button, [role="button"], [onclick], div, span');
-        const limit = Math.min(nodes.length, 80);
-        for (let i = 0; i < limit; i++) {
-          const n = nodes[i];
+        var nodes = card.querySelectorAll('a, button, [role="button"], [onclick], div, span');
+        var limit = Math.min(nodes.length, 90);
+        for (var i = 0; i < limit; i++) {
+          var n = nodes[i];
           if (n.children && n.children.length > 2) continue;
-          const t = getCleanText(n, 28, false);
-          if (!t || t.length < 2 || t.length > 24) continue;
+          var t = getCleanText(n, 32, false);
+          if (!t || t.length < 2 || t.length > 28) continue;
           if (!regex.test(t)) continue;
-          const r = n.getBoundingClientRect();
-          if (r.width < 36 || r.height < 18) continue;
+
+          var r = n.getBoundingClientRect();
+          if (r.width < 32 || r.height < 16) continue;
           if (!isActionLikeNode(n, r, cardRect)) continue;
-          const centerYRatio = (r.top + r.height / 2 - cardRect.top) / Math.max(1, cardRect.height);
-          return { node: n, text: t, widthRatio: r.width / Math.max(1, cardRect.width), centerYRatio: centerYRatio };
+
+          var centerYRatio = (r.top + r.height / 2 - cardRect.top) / Math.max(1, cardRect.height);
+          return {
+            node: n,
+            text: t,
+            widthRatio: r.width / Math.max(1, cardRect.width),
+            centerYRatio: centerYRatio
+          };
         }
         return null;
       }
 
       function hasTopRightClose(card, cardRect) {
-        const nodes = card.querySelectorAll('button, a, [role="button"], [onclick], svg, img, span, div, i');
-        const limit = Math.min(nodes.length, 70);
-        for (let i = 0; i < limit; i++) {
-          const n = nodes[i];
+        var nodes = card.querySelectorAll('button, a, [role="button"], [onclick], svg, img, span, div, i');
+        var limit = Math.min(nodes.length, 80);
+        for (var i = 0; i < limit; i++) {
+          var n = nodes[i];
           if (n.children && n.children.length > 3) continue;
-          const r = n.getBoundingClientRect();
+          var r = n.getBoundingClientRect();
           if (r.width < 10 || r.height < 10 || r.width > 56 || r.height > 56) continue;
           if (r.right < cardRect.right - 64 || r.top > cardRect.top + 64) continue;
-          const t = getCleanText(n, 10, false);
+
+          var t = getCleanText(n, 10, false);
           if (CLOSE_TEXT_RE.test(t)) return true;
-          const meta = (n.getAttribute('aria-label') || '') + ' ' + (n.getAttribute('title') || '') + ' ' + (typeof n.className === 'string' ? n.className : '') + ' ' + (n.id || '');
+
+          var meta =
+            (n.getAttribute('aria-label') || '') + ' ' +
+            (n.getAttribute('title') || '') + ' ' +
+            (typeof n.className === 'string' ? n.className : '') + ' ' +
+            (n.id || '');
           if (CLOSE_ATTR_RE.test(meta)) return true;
+
           if (n.tagName === 'SVG' || n.tagName === 'IMG' || n.hasAttribute('onclick') || n.querySelector('svg')) return true;
-          const st = getComputedStyle(n);
+
+          var st = getComputedStyle(n);
           if (st.cursor === 'pointer' || n.tagName === 'BUTTON' || n.getAttribute('role') === 'button') return true;
-          const bc = getComputedStyle(n, '::before').content;
-          const ac = getComputedStyle(n, '::after').content;
+
+          var bc = getComputedStyle(n, '::before').content;
+          var ac = getComputedStyle(n, '::after').content;
           if ((bc && bc !== 'none' && bc !== 'normal') || (ac && ac !== 'none' && ac !== 'normal')) return true;
         }
         return false;
@@ -1052,97 +1409,286 @@ enum AdStripScript {
 
       function parseRadiusPx(radiusStr, minSide) {
         if (!radiusStr) return 0;
-        const first = radiusStr.split(' ')[0];
+        var first = radiusStr.split(' ')[0];
         if (first.indexOf('%') >= 0) return (parseFloat(first) / 100) * minSide;
         return parseFloat(first) || 0;
       }
 
+      // Classifier A: VPN / Accelerator Promo Card
       function classifyVpnCard(card, cardRect, fullTxt, hasClose) {
         if (fullTxt.length < 6 || fullTxt.length > 520) return null;
-        const cta = findCtaButton(card, cardRect, VPN_DOWNLOAD_CTA_RE);
+        var cta = findCtaButton(card, cardRect, VPN_DOWNLOAD_CTA_RE);
         if (!cta) return null;
-        const hasStrong = VPN_STRONG_RE.test(fullTxt);
-        let netAux = 0;
-        for (let i = 0; i < VPN_AUX_NET_CLUSTERS.length; i++) { if (VPN_AUX_NET_CLUSTERS[i].test(fullTxt)) netAux++; }
-        let otherAux = 0;
-        for (let i = 0; i < VPN_AUX_OTHER_CLUSTERS.length; i++) { if (VPN_AUX_OTHER_CLUSTERS[i].test(fullTxt)) otherAux++; }
-        const totalAux = netAux + otherAux;
-        const pathA = hasStrong && hasClose;
-        const pathB = hasClose && (totalAux >= 3 || (totalAux >= 2 && netAux >= 1));
-        const pathC = hasStrong && totalAux >= 2 && cta.widthRatio >= 0.44 && cta.centerYRatio >= 0.48;
+
+        var hasStrong = VPN_STRONG_RE.test(fullTxt);
+        var netAux = 0;
+        for (var i = 0; i < VPN_AUX_NET_CLUSTERS.length; i++) {
+          if (VPN_AUX_NET_CLUSTERS[i].test(fullTxt)) netAux++;
+        }
+        var otherAux = 0;
+        for (var j = 0; j < VPN_AUX_OTHER_CLUSTERS.length; j++) {
+          if (VPN_AUX_OTHER_CLUSTERS[j].test(fullTxt)) otherAux++;
+        }
+        var totalAux = netAux + otherAux;
+
+        var pathA = hasStrong && hasClose;
+        var pathB = hasClose && (totalAux >= 3 || (totalAux >= 2 && netAux >= 1));
+        var pathC = hasStrong && totalAux >= 2 && cta.widthRatio >= 0.44 && cta.centerYRatio >= 0.48;
+
         return (pathA || pathB || pathC) ? { kind: 'vpn-promo', confidence: 'high' } : null;
       }
 
+      // Classifier B: Anonymous Push / Blurred Card (View More)
       function inspectAnonCardVisuals(card, cardRect, ctaNode) {
-        const nodes = card.querySelectorAll('img, svg, canvas, div, span, p, i');
-        const limit = Math.min(nodes.length, 85);
-        let avatarNode = null;
-        let blurredOrMaskedRows = 0;
-        let distinctBodyGraphic = false;
-        const cardSt = getComputedStyle(card);
-        if (cardSt.backgroundImage && cardSt.backgroundImage !== 'none' && cardSt.backgroundImage.indexOf('url(') >= 0) distinctBodyGraphic = true;
-        for (let i = 0; i < limit; i++) {
-          const n = nodes[i];
-          if (n === ctaNode || (ctaNode && ctaNode.contains(n))) continue;
-          const r = n.getBoundingClientRect();
-          if (r.width < 24 || r.width > 108 || r.height < 24 || r.height > 108) continue;
-          const ratio = r.width / r.height;
-          const inLeft = r.left <= cardRect.left + cardRect.width * 0.46;
-          if (!inLeft || ratio < 0.78 || ratio > 1.28) continue;
-          const st = getComputedStyle(n);
-          const minSide = Math.min(r.width, r.height);
-          const rad = parseRadiusPx(st.borderTopLeftRadius, minSide);
-          if (rad < minSide * 0.40) continue;
-          const hasFill = n.tagName === 'IMG' || n.tagName === 'SVG' || n.tagName === 'CANVAS' || (st.backgroundImage && st.backgroundImage !== 'none') || isVisibleColor(st.backgroundColor);
-          if (hasFill) { avatarNode = n; break; }
+        var nodes = card.querySelectorAll('img, svg, canvas, div, span, p, i');
+        var limit = Math.min(nodes.length, 85);
+
+        var avatarNode = null;
+        var blurredOrMaskedRows = 0;
+        var distinctBodyGraphic = false;
+
+        var cardSt = getComputedStyle(card);
+        if (cardSt.backgroundImage && cardSt.backgroundImage !== 'none' && cardSt.backgroundImage.indexOf('url(') >= 0) {
+          distinctBodyGraphic = true;
         }
-        if (!avatarNode) return { hasAvatar: false, blurredRows: 0, hasDistinctBodyGraphic: false };
-        for (let i = 0; i < limit; i++) {
-          const n = nodes[i];
-          if (n === avatarNode || avatarNode.contains(n)) continue;
+
+        for (var i = 0; i < limit; i++) {
+          var n = nodes[i];
           if (n === ctaNode || (ctaNode && ctaNode.contains(n))) continue;
-          const r = n.getBoundingClientRect();
-          if (r.width < 8 || r.height < 6) continue;
-          const st = getComputedStyle(n);
-          const tag = n.tagName;
-          const hasBlur = (st.filter && st.filter.indexOf('blur(') >= 0) || (st.color === 'rgba(0, 0, 0, 0)' && st.textShadow && st.textShadow !== 'none');
-          const lowOpacityRow = r.width >= 48 && r.height >= 8 && r.height <= 36 && parseFloat(st.opacity) > 0 && parseFloat(st.opacity) <= 0.55;
-          const skeletonBar = (tag === 'DIV' || tag === 'SPAN' || tag === 'P') && n.children.length === 0 && r.width >= 48 && r.height >= 6 && r.height <= 24 && isVisibleColor(st.backgroundColor) && getCleanText(n, 4, false).length === 0;
-          if (hasBlur || lowOpacityRow || skeletonBar) blurredOrMaskedRows++;
-          if (!distinctBodyGraphic) {
-            const isGraphic = tag === 'IMG' || tag === 'CANVAS' || (st.backgroundImage && st.backgroundImage !== 'none' && st.backgroundImage.indexOf('url(') >= 0);
-            if (isGraphic && r.width >= 60 && r.height >= 24) distinctBodyGraphic = true;
+          var r = n.getBoundingClientRect();
+          if (r.width < 24 || r.width > 108 || r.height < 24 || r.height > 108) continue;
+          var ratio = r.width / r.height;
+          var inLeft = r.left <= cardRect.left + cardRect.width * 0.46;
+          if (!inLeft || ratio < 0.78 || ratio > 1.28) continue;
+
+          var st = getComputedStyle(n);
+          var minSide = Math.min(r.width, r.height);
+          var rad = parseRadiusPx(st.borderTopLeftRadius, minSide);
+          if (rad < minSide * 0.40) continue;
+
+          var hasFill =
+            n.tagName === 'IMG' || n.tagName === 'SVG' || n.tagName === 'CANVAS' ||
+            (st.backgroundImage && st.backgroundImage !== 'none') ||
+            isVisibleColor(st.backgroundColor);
+          if (hasFill) {
+            avatarNode = n;
+            break;
           }
         }
-        return { hasAvatar: true, blurredRows: blurredOrMaskedRows, hasDistinctBodyGraphic: distinctBodyGraphic };
+
+        if (!avatarNode) {
+          return { hasAvatar: false, blurredRows: 0, hasDistinctBodyGraphic: false };
+        }
+
+        for (var j = 0; j < limit; j++) {
+          var m = nodes[j];
+          if (m === avatarNode || avatarNode.contains(m)) continue;
+          if (m === ctaNode || (ctaNode && ctaNode.contains(m))) continue;
+          var mr = m.getBoundingClientRect();
+          if (mr.width < 8 || mr.height < 6) continue;
+
+          var mst = getComputedStyle(m);
+          var tag = m.tagName;
+
+          var hasBlur =
+            (mst.filter && mst.filter.indexOf('blur(') >= 0) ||
+            (mst.color === 'rgba(0, 0, 0, 0)' && mst.textShadow && mst.textShadow !== 'none');
+          var lowOpacityRow =
+            mr.width >= 48 && mr.height >= 8 && mr.height <= 36 &&
+            parseFloat(mst.opacity) > 0 && parseFloat(mst.opacity) <= 0.55;
+          var skeletonBar =
+            (tag === 'DIV' || tag === 'SPAN' || tag === 'P') && m.children.length === 0 &&
+            mr.width >= 48 && mr.height >= 6 && mr.height <= 24 &&
+            isVisibleColor(mst.backgroundColor) &&
+            getCleanText(m, 4, false).length === 0;
+
+          if (hasBlur || lowOpacityRow || skeletonBar) blurredOrMaskedRows++;
+
+          if (!distinctBodyGraphic) {
+            var isGraphic =
+              tag === 'IMG' || tag === 'CANVAS' ||
+              (mst.backgroundImage && mst.backgroundImage !== 'none' && mst.backgroundImage.indexOf('url(') >= 0);
+            if (isGraphic && mr.width >= 60 && mr.height >= 24) {
+              distinctBodyGraphic = true;
+            }
+          }
+        }
+
+        return {
+          hasAvatar: true,
+          blurredRows: blurredOrMaskedRows,
+          hasDistinctBodyGraphic: distinctBodyGraphic
+        };
       }
 
       function classifyAnonPushCard(card, cardRect, fullTxt, hasClose) {
         if (!hasClose) return null;
-        const cta = findCtaButton(card, cardRect, ANON_PUSH_CTA_RE);
+        var cta = findCtaButton(card, cardRect, ANON_PUSH_CTA_RE);
         if (!cta) return null;
-        const vis = inspectAnonCardVisuals(card, cardRect, cta.node);
+
+        var vis = inspectAnonCardVisuals(card, cardRect, cta.node);
         if (!vis.hasAvatar) return null;
-        const residualTextLen = Math.max(0, fullTxt.length - cta.text.length - 2);
-        const hasDomBlurEvidence = vis.blurredRows >= 2;
-        const hasGatedRasterEvidence = vis.hasDistinctBodyGraphic && residualTextLen <= 18 && cta.centerYRatio >= 0.46;
+
+        var residualTextLen = Math.max(0, fullTxt.length - cta.text.length - 2);
+        var hasDomBlurEvidence = vis.blurredRows >= 2;
+        var hasGatedRasterEvidence =
+          vis.hasDistinctBodyGraphic && residualTextLen <= 18 && cta.centerYRatio >= 0.46;
+
         if (!hasDomBlurEvidence && !hasGatedRasterEvidence) return null;
         return { kind: 'anon-push', confidence: 'high' };
       }
 
-      function classifyElement(el, root, prot, vp, isAdSubframe) {
-        const txt = getCleanText(el, 600, false);
-        if (hardVeto(el, txt, prot)) return null;
-        if (!isInFloatingLayer(el, root, prot)) return null;
-        const rect = el.getBoundingClientRect();
-        const vrect = toViewportRect(rect, vp);
-        if (!matchesCardGeometry(vrect, vp, isAdSubframe)) return null;
-        const hasClose = hasTopRightClose(el, rect);
-        return classifyVpnCard(el, rect, txt, hasClose) || classifyAnonPushCard(el, rect, txt, hasClose);
+      // Classifier C: Fake Human Verification Card (4-way AND; red "!" is NOT used as evidence)
+      function classifyFakeVerifyCard(card, cardRect, fullTxt, hasClose) {
+        if (!hasClose) return null;
+        if (fullTxt.length < 4 || fullTxt.length > 420) return null;
+        if (!VERIFY_PHRASE_RE.test(fullTxt)) return null;
+        var cta = findCtaButton(card, cardRect, VERIFY_CTA_RE);
+        if (!cta) return null;
+        return { kind: 'fake-verify', confidence: 'high' };
       }
 
-      // 6. 样式表优先隐藏 + 内联 !important / CSP 自动升级 + 内容变更复检解藏
-      const INLINE_FALLBACK_PROPS = [
+      // Classifier D: Fake Download Progress Card (supports DOM/SVG/glyph/CSS/img bars + high-conf text fallback)
+      
+
+      
+
+      var CONTINUE_STRICT_RE = /^continue\\s*[>›→]?$/i;
+
+      // Classifier D: Fake Download Progress Card (ChatGPT v13, mapped to the real v10 API).
+      // D1: download text + Continue + dismiss + real progress structure (DOM/SVG fill /
+      // glyph color row, semantic <progress>, unicode block run, gradient / thin bar).
+      // D2 (fallback for ::before/::after or opaque-PNG decoration): exact fake-ad phrase
+      // family + Continue + dismiss + a large lower-half Continue CTA. Text alone never fires,
+      // so a legit user-initiated download dialog (Finish Download + Download pending +
+      // Continue + Cancel) is not hidden.
+      function colorKind(value) {
+        if (!value) return null;
+        var m = String(value).match(/rgba?\\(\\s*(\\d+)[,\\s]+(\\d+)[,\\s]+(\\d+)/);
+        if (!m) return null;
+        var r = Number(m[1]);
+        var g = Number(m[2]);
+        var b = Number(m[3]);
+        if (g >= 70 && g > r * 1.18 && g > b * 1.08) return 'green';
+        if (r >= 90 && r > g * 1.20 && r > b * 1.15) return 'red';
+        return null;
+      }
+
+      function elementPaintKind(el) {
+        var cs = getComputedStyle(el);
+        var bg = colorKind(cs.backgroundColor);
+        if (bg) return bg;
+        var color = colorKind(cs.color);
+        if (color) return color;
+        var vals = [
+          el.getAttribute && el.getAttribute('fill'),
+          el.getAttribute && el.getAttribute('stroke'),
+          cs.fill,
+          cs.stroke
+        ];
+        for (var i = 0; i < vals.length; i++) {
+          var kind = colorKind(vals[i]);
+          if (kind) return kind;
+        }
+        return null;
+      }
+
+      function getProgressEvidence(card, cardRect, fullTxt) {
+        try {
+          if (card.querySelector('progress, [role="progressbar"], meter')) return 'semantic-progress';
+        } catch (_) {}
+        var nodes = card.querySelectorAll('div, span, i, li, td, rect, img, canvas');
+        var limit = Math.min(nodes.length, 200);
+        var blocks = [];
+        for (var i = 0; i < limit; i++) {
+          var n = nodes[i];
+          var tag = n.tagName;
+          var r = n.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) continue;
+          // Wide thin horizontal progress bar via CSS gradient or raster image/canvas
+          if (r.width >= cardRect.width * 0.35 && r.height >= 4 && r.height <= 28 && (r.width / r.height) >= 4) {
+            if (tag === 'IMG' || tag === 'CANVAS') return 'thin-visual-progress-bar';
+            var barSt = getComputedStyle(n);
+            if (barSt.backgroundImage && barSt.backgroundImage.indexOf('gradient(') >= 0) return 'thin-visual-progress-bar';
+          }
+          if (r.width < 3 || r.width > 24 || r.height < 3 || r.height > 24) continue;
+          if (tag !== 'RECT' && n.children && n.children.length > 0) continue;
+          var kind = elementPaintKind(n);
+          if (!kind) continue;
+          blocks.push({ y: r.top + r.height / 2, kind: kind });
+        }
+        var rows = [];
+        for (var b = 0; b < blocks.length; b++) {
+          var row = null;
+          for (var k = 0; k < rows.length; k++) {
+            if (Math.abs(rows[k].y - blocks[b].y) <= 5) { row = rows[k]; break; }
+          }
+          if (!row) { row = { y: blocks[b].y, items: [] }; rows.push(row); }
+          row.items.push(blocks[b]);
+        }
+        for (var m = 0; m < rows.length; m++) {
+          var greens = 0;
+          var reds = 0;
+          for (var q = 0; q < rows[m].items.length; q++) {
+            if (rows[m].items[q].kind === 'green') greens++;
+            else if (rows[m].items[q].kind === 'red') reds++;
+          }
+          if (rows[m].items.length >= 6 && greens >= 4 && reds >= 1) return 'colored-block-row';
+        }
+        if (/[■█▓▒░▪▬◼🟩🟥]{5,}/u.test(fullTxt)) return 'unicode-block-run';
+        return null;
+      }
+
+      function hasDismissControl(card, hasClose) {
+        if (hasClose) return true;
+        var nodes = card.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]');
+        for (var i = 0; i < nodes.length; i++) {
+          var t = getCleanText(nodes[i], 24, false);
+          if (t && NEG_DISMISS_CTA_RE.test(t)) return true;
+        }
+        return false;
+      }
+
+      function hasLargeLowerCTA(card, cardRect) {
+        var cta = findCtaButton(card, cardRect, CONTINUE_STRICT_RE);
+        if (!cta) return false;
+        var r = cta.node.getBoundingClientRect();
+        return r.width >= cardRect.width * 0.55 && r.height >= 28 &&
+          r.top >= cardRect.top + cardRect.height * 0.48;
+      }
+
+      function classifyFakeDownloadProgressCard(card, cardRect, fullTxt, hasClose) {
+        if (fullTxt.length < 6 || fullTxt.length > 520) return null;
+        if (!DOWNLOAD_TEXT_RE.test(fullTxt)) return null;
+        if (!findCtaButton(card, cardRect, CONTINUE_STRICT_RE)) return null;
+        if (!hasDismissControl(card, hasClose)) return null;
+        if (getProgressEvidence(card, cardRect, fullTxt)) return { kind: 'fake-dl-progress', confidence: 'high' };
+        if (HIGH_CONF_FAKE_DL_RE.test(fullTxt) && hasLargeLowerCTA(card, cardRect)) return { kind: 'fake-dl-progress', confidence: 'high' };
+        return null;
+      }
+
+      function classifyElement(el, root, prot, vp, isAdSubframe) {
+        var txt = getCleanText(el, 600, false);
+        if (hardVeto(el, txt, prot)) return null;
+        if (!isInFloatingLayer(el, root, prot)) return null;
+
+        var rect = el.getBoundingClientRect();
+        var vrect = toViewportRect(rect, vp);
+        if (!matchesCardGeometry(vrect, vp, isAdSubframe)) return null;
+
+        var hasClose = hasTopRightClose(el, rect);
+        return (
+          classifyVpnCard(el, rect, txt, hasClose) ||
+          classifyAnonPushCard(el, rect, txt, hasClose) ||
+          classifyFakeVerifyCard(el, rect, txt, hasClose) ||
+          classifyFakeDownloadProgressCard(el, rect, txt, hasClose)
+        );
+      }
+
+      // ---------------------------------------------------------------------------
+      // 6. Stylesheet-First Hide, Click-Shell Disarm & Re-Eval Unhide (Real v10 API)
+      // ---------------------------------------------------------------------------
+      var INLINE_FALLBACK_PROPS = [
         ['clip-path', 'inset(100%)'],
         ['-webkit-clip-path', 'inset(100%)'],
         ['filter', 'opacity(0)'],
@@ -1150,33 +1696,44 @@ enum AdStripScript {
         ['transition', 'none'],
         ['animation', 'none']
       ];
+
       function applyInlineFallback(el) {
         cardInlineFallback.add(el);
-        for (let i = 0; i < INLINE_FALLBACK_PROPS.length; i++) {
-          const prop = INLINE_FALLBACK_PROPS[i][0];
-          const val = INLINE_FALLBACK_PROPS[i][1];
-          if (el.style.getPropertyValue(prop) !== val || el.style.getPropertyPriority(prop) !== 'important') el.style.setProperty(prop, val, 'important');
+        for (var i = 0; i < INLINE_FALLBACK_PROPS.length; i++) {
+          var prop = INLINE_FALLBACK_PROPS[i][0];
+          var val = INLINE_FALLBACK_PROPS[i][1];
+          if (el.style.getPropertyValue(prop) !== val || el.style.getPropertyPriority(prop) !== 'important') {
+            el.style.setProperty(prop, val, 'important');
+          }
         }
       }
+
       function clearInlineFallback(el) {
         if (!cardInlineFallback.has(el)) return;
         cardInlineFallback.delete(el);
-        for (let i = 0; i < INLINE_FALLBACK_PROPS.length; i++) el.style.removeProperty(INLINE_FALLBACK_PROPS[i][0]);
+        for (var i = 0; i < INLINE_FALLBACK_PROPS.length; i++) {
+          el.style.removeProperty(INLINE_FALLBACK_PROPS[i][0]);
+        }
       }
+
       function enforceHideEffect(el, attrName) {
         if (el.getAttribute(attrName) !== '1') el.setAttribute(attrName, '1');
         if (el.getAttribute('aria-hidden') !== 'true') el.setAttribute('aria-hidden', 'true');
-        const st = getComputedStyle(el);
-        const clip = st.clipPath || st.webkitClipPath || '';
-        const clippedOk = clip.indexOf('inset(100%)') >= 0;
-        const pointerOk = st.pointerEvents === 'none';
-        if (!clippedOk || !pointerOk) applyInlineFallback(el);
+
+        var st = getComputedStyle(el);
+        var clip = st.clipPath || st.webkitClipPath || '';
+        var clippedOk = clip.indexOf('inset(100%)') >= 0;
+        var pointerOk = st.pointerEvents === 'none';
+        if (!clippedOk || !pointerOk) {
+          applyInlineFallback(el);
+        }
       }
+
       function releaseWrappersForCard(card) {
-        const wraps = cardToWrappers.get(card);
+        var wraps = cardToWrappers.get(card);
         if (!wraps) return;
         wraps.forEach(function (w) {
-          const set = wrapperToCards.get(w);
+          var set = wrapperToCards.get(w);
           if (set) {
             set.delete(card);
             if (set.size === 0) {
@@ -1189,68 +1746,106 @@ enum AdStripScript {
         });
         cardToWrappers.delete(card);
       }
+
       function unhideCard(card) {
-        const obs = cardWatchers.get(card);
-        if (obs) { try { obs.disconnect(); } catch (_) {} cardWatchers.delete(card); }
-        const tid = cardReevalTimers.get(card);
-        if (tid) { clearTimeout(tid); cardReevalTimers.delete(card); }
+        var obs = cardWatchers.get(card);
+        if (obs) {
+          try { obs.disconnect(); } catch (_) {}
+          cardWatchers.delete(card);
+        }
+        var tid = cardReevalTimers.get(card);
+        if (tid) {
+          clearTimeout(tid);
+          cardReevalTimers.delete(card);
+        }
         card.removeAttribute(CARD_ATTR);
         if (card.getAttribute('aria-hidden') === 'true') card.removeAttribute('aria-hidden');
         clearInlineFallback(card);
         releaseWrappersForCard(card);
       }
+
       function scheduleCardReeval(card, root) {
         if (cardReevalTimers.has(card)) return;
-        const tid = setTimeout(function () {
+        var tid = setTimeout(function () {
           cardReevalTimers.delete(card);
-          if (!card.isConnected) { unhideCard(card); return; }
-          const roots = getAllRoots();
-          const prot = buildProtectedContext(roots);
-          const vp = getViewportMetrics();
-          const isAdSubframe = window !== window.top && !prot.hasVideo;
-          const stillAd = classifyElement(card, root, prot, vp, isAdSubframe);
-          if (!stillAd) unhideCard(card);
-          else enforceHideEffect(card, CARD_ATTR);
+          if (!card.isConnected) {
+            unhideCard(card);
+            return;
+          }
+          var roots = getAllRoots();
+          var prot = buildProtectedContext(roots);
+          var vp = getViewportMetrics();
+          var isAdSubframe = window !== window.top && !prot.hasVideo;
+          var stillAd = classifyElement(card, root, prot, vp, isAdSubframe);
+          if (!stillAd) {
+            unhideCard(card);
+          } else {
+            enforceHideEffect(card, CARD_ATTR);
+          }
         }, 180);
         cardReevalTimers.set(card, tid);
       }
+
       function disarmClickShells(card, root, prot, vp) {
-        const cardRect = card.getBoundingClientRect();
-        const cardArea = Math.max(1, cardRect.width * cardRect.height);
-        let cur = card.parentElement;
-        for (let up = 0; up < 4 && cur; up++, cur = cur.parentElement) {
+        var cardRect = card.getBoundingClientRect();
+        var cardArea = Math.max(1, cardRect.width * cardRect.height);
+        var cur = card.parentElement;
+
+        for (var up = 0; up < 4 && cur; up++, cur = cur.parentElement) {
           if (hardVeto(cur, '', prot)) break;
-          const st = getComputedStyle(cur);
+          var st = getComputedStyle(cur);
           if (st.position !== 'fixed' && st.position !== 'absolute') continue;
-          const leftoverText = getCleanText(cur, 12, true);
+
+          var leftoverText = getCleanText(cur, 12, true);
           if (leftoverText.length > 4) break;
-          const others = cur.querySelectorAll('video, iframe, button, a, input, select, textarea, img, canvas');
-          let hasIndependentContent = false;
-          for (let i = 0; i < others.length; i++) {
-            const o = others[i];
-            if (!card.contains(o) && !o.closest('[' + CARD_ATTR + '="1"]')) { hasIndependentContent = true; break; }
+
+          var others = cur.querySelectorAll('video, iframe, button, a, input, select, textarea, img, canvas');
+          var hasIndependentContent = false;
+          for (var i = 0; i < others.length; i++) {
+            var o = others[i];
+            if (!card.contains(o) && !o.closest('[' + CARD_ATTR + '="1"]')) {
+              hasIndependentContent = true;
+              break;
+            }
           }
           if (hasIndependentContent) break;
-          const r = cur.getBoundingClientRect();
-          const area = Math.max(1, r.width * r.height);
-          const ix = Math.max(0, Math.min(r.right, cardRect.right) - Math.max(r.left, cardRect.left));
-          const iy = Math.max(0, Math.min(r.bottom, cardRect.bottom) - Math.max(r.top, cardRect.top));
-          const overlap = (ix * iy) / cardArea;
-          const isTightShell = overlap >= 0.78 && area <= cardArea * 1.45;
-          const z = parseInt(st.zIndex, 10);
-          const isFullBackdrop = vp.w > 0 && vp.h > 0 && r.width >= vp.w * 0.60 && r.height >= vp.h * 0.60 && (st.position === 'fixed' || (Number.isFinite(z) && z >= 10));
+
+          var r = cur.getBoundingClientRect();
+          var area = Math.max(1, r.width * r.height);
+          var ix = Math.max(0, Math.min(r.right, cardRect.right) - Math.max(r.left, cardRect.left));
+          var iy = Math.max(0, Math.min(r.bottom, cardRect.bottom) - Math.max(r.top, cardRect.top));
+          var overlap = (ix * iy) / cardArea;
+
+          var isTightShell = overlap >= 0.78 && area <= cardArea * 1.45;
+          var z = parseInt(st.zIndex, 10);
+          var isFullBackdrop =
+            vp.w > 0 && vp.h > 0 &&
+            r.width >= vp.w * 0.60 && r.height >= vp.h * 0.60 &&
+            (st.position === 'fixed' || (Number.isFinite(z) && z >= 10));
+
           if (!isTightShell && !isFullBackdrop) continue;
-          const hasDimmingVisual = isVisibleColor(st.backgroundColor) || (st.backdropFilter && st.backdropFilter !== 'none') || (st.webkitBackdropFilter && st.webkitBackdropFilter !== 'none');
-          if (hasDimmingVisual) enforceHideEffect(cur, BACKDROP_ATTR);
-          else {
+
+          var hasDimmingVisual =
+            isVisibleColor(st.backgroundColor) ||
+            (st.backdropFilter && st.backdropFilter !== 'none') ||
+            (st.webkitBackdropFilter && st.webkitBackdropFilter !== 'none');
+
+          if (hasDimmingVisual) {
+            enforceHideEffect(cur, BACKDROP_ATTR);
+          } else {
             if (cur.getAttribute(WRAP_ATTR) !== '1') cur.setAttribute(WRAP_ATTR, '1');
-            if (getComputedStyle(cur).pointerEvents !== 'none') { cur.style.setProperty('pointer-events', 'none', 'important'); cardInlineFallback.add(cur); }
+            if (getComputedStyle(cur).pointerEvents !== 'none') {
+              cur.style.setProperty('pointer-events', 'none', 'important');
+              cardInlineFallback.add(cur);
+            }
           }
+
           if (!cardToWrappers.has(card)) cardToWrappers.set(card, new Set());
           cardToWrappers.get(card).add(cur);
           if (!wrapperToCards.has(cur)) wrapperToCards.set(cur, new Set());
           wrapperToCards.get(cur).add(card);
         }
+
         if (root !== document && root.host && !hardVeto(root.host, '', prot)) {
           if (root.host.getAttribute(WRAP_ATTR) !== '1') root.host.setAttribute(WRAP_ATTR, '1');
           if (!cardToWrappers.has(card)) cardToWrappers.set(card, new Set());
@@ -1259,175 +1854,310 @@ enum AdStripScript {
           wrapperToCards.get(root.host).add(card);
         }
       }
+
       function hideCard(card, root, prot, vp) {
-        const txt = getCleanText(card, 600, false);
+        var txt = getCleanText(card, 600, false);
         if (hardVeto(card, txt, prot)) return false;
+
         injectStyleSheet(root);
         enforceHideEffect(card, CARD_ATTR);
         disarmClickShells(card, root, prot, vp);
+
         if (!cardWatchers.has(card) && typeof MutationObserver !== 'undefined') {
           try {
-            const obs = new MutationObserver(function (mutations) {
-              let attrChanged = false;
-              let contentChanged = false;
-              for (let i = 0; i < mutations.length; i++) { const t = mutations[i].type; if (t === 'attributes') attrChanged = true; else contentChanged = true; }
+            var obs = new MutationObserver(function (mutations) {
+              var attrChanged = false;
+              var contentChanged = false;
+              for (var i = 0; i < mutations.length; i++) {
+                var t = mutations[i].type;
+                if (t === 'attributes') attrChanged = true;
+                else contentChanged = true;
+              }
               if (attrChanged) enforceHideEffect(card, CARD_ATTR);
               if (contentChanged) scheduleCardReeval(card, root);
             });
-            obs.observe(card, { attributes: true, attributeFilter: ['style', 'class', 'hidden', 'aria-hidden', CARD_ATTR], childList: true, characterData: true, subtree: true });
+            obs.observe(card, {
+              attributes: true,
+              attributeFilter: ['style', 'class', 'hidden', 'aria-hidden', CARD_ATTR],
+              childList: true,
+              characterData: true,
+              subtree: true
+            });
             cardWatchers.set(card, obs);
           } catch (_) {}
         }
         return true;
       }
 
-      // 7. 跨域 iframe 安全汇报与父级裁切（支持多层嵌套中继 + 保护主播放器 iframe）
+      // ---------------------------------------------------------------------------
+      // 7. Cross-Origin Subframe Report Bridge
+      // ---------------------------------------------------------------------------
       function reportAdCardToParent(hasVideo, matchInfo) {
         if (window === window.top || hasVideo) return;
-        const now = Date.now();
+        var now = Date.now();
         if (now - lastFrameReportTs < 250) return;
         lastFrameReportTs = now;
         try {
-          window.parent.postMessage({ type: 'XSP_FLOATING_CARD_GUARD', version: 10, action: 'clip-ad-card-frame', kind: matchInfo.kind, confidence: matchInfo.confidence, nonce: NONCE }, '*');
+          window.parent.postMessage({
+            type: 'XSP_FLOATING_CARD_GUARD',
+            version: 10,
+            action: 'clip-ad-card-frame',
+            kind: matchInfo.kind,
+            confidence: matchInfo.confidence,
+            nonce: NONCE
+          }, '*');
         } catch (_) {}
       }
+
       window.addEventListener('message', function (ev) {
-        const d = ev.data;
-        if (!d || d.type !== 'XSP_FLOATING_CARD_GUARD' || d.version !== 10 || d.action !== 'clip-ad-card-frame' || d.confidence !== 'high' || d.nonce !== NONCE) return;
+        var d = ev.data;
+        if (!d || d.type !== 'XSP_FLOATING_CARD_GUARD' || d.version !== 10 ||
+            d.action !== 'clip-ad-card-frame' || d.confidence !== 'high' || d.nonce !== NONCE) {
+          return;
+        }
         ev.stopImmediatePropagation();
-        const roots = getAllRoots();
-        const prot = buildProtectedContext(roots);
-        const vp = getViewportMetrics();
-        let clippedAny = false;
-        for (let r = 0; r < roots.length; r++) {
-          const root = roots[r];
-          const iframes = root.querySelectorAll ? root.querySelectorAll('iframe') : [];
-          for (let i = 0; i < iframes.length; i++) {
-            const frame = iframes[i];
+
+        var roots = getAllRoots();
+        var prot = buildProtectedContext(roots);
+        var vp = getViewportMetrics();
+        var clippedAny = false;
+
+        for (var r = 0; r < roots.length; r++) {
+          var root = roots[r];
+          var iframes = root.querySelectorAll ? root.querySelectorAll('iframe') : [];
+          for (var i = 0; i < iframes.length; i++) {
+            var frame = iframes[i];
             try {
               if (frame.contentWindow !== ev.source) continue;
-              const now = Date.now();
+              var now = Date.now();
               if (now - (frameThrottle.get(frame) || 0) < 250) continue;
               frameThrottle.set(frame, now);
+
               if (hardVeto(frame, '', prot)) continue;
-              let allowClip = prot.hasVideo;
+
+              var allowClip = prot.hasVideo;
               if (!allowClip) {
-                const st = getComputedStyle(frame);
-                const rRect = frame.getBoundingClientRect();
-                const isFloating = st.position === 'fixed' || st.position === 'absolute';
-                const smallerThanFullPage = vp.w > 0 && vp.h > 0 && (rRect.width < vp.w * 0.90 || rRect.height < vp.h * 0.85);
+                var st = getComputedStyle(frame);
+                var rRect = frame.getBoundingClientRect();
+                var isFloating = st.position === 'fixed' || st.position === 'absolute';
+                var smallerThanFullPage = vp.w > 0 && vp.h > 0 && (rRect.width < vp.w * 0.90 || rRect.height < vp.h * 0.85);
                 allowClip = isFloating || smallerThanFullPage;
               }
-              if (allowClip) { injectStyleSheet(root); enforceHideEffect(frame, CARD_ATTR); disarmClickShells(frame, root, prot, vp); clippedAny = true; }
+
+              if (allowClip) {
+                injectStyleSheet(root);
+                enforceHideEffect(frame, CARD_ATTR);
+                disarmClickShells(frame, root, prot, vp);
+                clippedAny = true;
+              }
             } catch (_) {}
           }
         }
-        if (!prot.hasVideo && window !== window.top && clippedAny) reportAdCardToParent(false, { kind: d.kind, confidence: 'high' });
+
+        if (!prot.hasVideo && window !== window.top && clippedAny) {
+          reportAdCardToParent(false, { kind: d.kind, confidence: 'high' });
+        }
       }, true);
 
-      // 8. 候选收集 -> 面积从小到大分类 -> 批量写入
+      // ---------------------------------------------------------------------------
+      // 8. Per-Root Candidate Discovery (Top Layers + CTA Upward + Leaf Text-Anchor Climb)
+      // ---------------------------------------------------------------------------
       function collectCandidates(root, prot) {
-        const seen = new Set();
-        const out = [];
+        var seen = new Set();
+        var out = [];
+
         function push(el) {
           if (!el || el.nodeType !== 1 || seen.has(el)) return;
+          try { if (el.closest && el.closest('[data-xsp-debug-ui]')) return; } catch (_) {}
           if (el.getAttribute(CARD_ATTR) === '1' || prot.ancestors.has(el)) return;
-          const tag = el.tagName;
+          var tag = el.tagName;
           if (tag === 'HEAD' || tag === 'BODY' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK' || tag === 'META') return;
           if (el.shadowRoot && !shadowRoots.has(el.shadowRoot)) registerShadowRoot(el.shadowRoot);
           seen.add(el);
           out.push(el);
         }
-        const topContainers = [];
+
+        // Entry 1: top 1-3 layers + shallow attribute observers
+        var topContainers = [];
         if (root === document) {
           if (document.documentElement) topContainers.push(document.documentElement);
           if (document.body) topContainers.push(document.body);
-        } else topContainers.push(root);
-        for (let c = 0; c < topContainers.length; c++) {
-          const kids1 = topContainers[c].children;
+        } else {
+          topContainers.push(root);
+        }
+
+        for (var c = 0; c < topContainers.length; c++) {
+          var kids1 = topContainers[c].children;
           if (!kids1) continue;
-          for (let i = 0; i < kids1.length; i++) {
-            const k1 = kids1[i];
+          for (var i = 0; i < kids1.length; i++) {
+            var k1 = kids1[i];
             if (!prot.ancestors.has(k1)) observeShallowElement(k1);
             push(k1);
-            const kids2 = k1.children;
+            var kids2 = k1.children;
             if (kids2 && kids2.length <= 16) {
-              for (let j = 0; j < kids2.length; j++) {
-                const k2 = kids2[j];
+              for (var j = 0; j < kids2.length; j++) {
+                var k2 = kids2[j];
                 if (!prot.ancestors.has(k2)) observeShallowElement(k2);
                 push(k2);
-                const kids3 = k2.children;
-                if (kids3 && kids3.length <= 10) { for (let m = 0; m < kids3.length; m++) push(kids3[m]); }
+                var kids3 = k2.children;
+                if (kids3 && kids3.length <= 10) {
+                  for (var m = 0; m < kids3.length; m++) push(kids3[m]);
+                }
               }
             }
           }
         }
+
+        // Entry 2: CTA upward discovery (VPN / View More / Verify / Continue)
         if (root.querySelectorAll) {
-          const nodes = root.querySelectorAll('a, button, [role="button"], [onclick], div, span');
-          for (let i = 0; i < nodes.length; i++) {
-            const n = nodes[i];
+          var nodes = root.querySelectorAll('a, button, [role="button"], [onclick], div, span');
+          for (var b = 0; b < nodes.length; b++) {
+            var n = nodes[b];
             if (n.children && n.children.length > 2) continue;
             if (prot.ancestors.has(n)) continue;
-            const t = getCleanText(n, 26, true);
-            if (!t || t.length < 2 || t.length > 24) continue;
-            if (!VPN_DOWNLOAD_CTA_RE.test(t) && !ANON_PUSH_CTA_RE.test(t)) continue;
-            let cur = n.parentElement;
-            for (let up = 0; up < 5 && cur && cur !== document.body && cur !== document.documentElement; up++) {
+            var t = getCleanText(n, 30, true);
+            if (!t || t.length < 2 || t.length > 26) continue;
+            if (!VPN_DOWNLOAD_CTA_RE.test(t) && !ANON_PUSH_CTA_RE.test(t) &&
+                !VERIFY_CTA_RE.test(t) && !CONTINUE_CTA_RE.test(t)) {
+              continue;
+            }
+
+            var cur = n.parentElement;
+            for (var up = 0; up < 6 && cur && cur !== document.body && cur !== document.documentElement; up++) {
               if (prot.ancestors.has(cur)) break;
               push(cur);
               cur = cur.parentElement;
             }
           }
         }
+
+        // Entry 3: Per-root leaf text-anchor discovery (TreeWalker: O(textNodes), zero layout flush)
+        try {
+          var walkStart = root === document ? (document.body || document.documentElement) : root;
+          if (walkStart && document.createTreeWalker && typeof NodeFilter !== 'undefined') {
+            var walker = document.createTreeWalker(walkStart, NodeFilter.SHOW_TEXT, null);
+            var tNode;
+            var textVisits = 0;
+            while ((tNode = walker.nextNode()) && textVisits < 2500) {
+              textVisits++;
+              var raw = tNode.nodeValue;
+              if (!raw || raw.length < 2 || raw.length > 200) continue;
+              var parentEl = tNode.parentElement;
+              if (!parentEl) continue;
+              var pTag = parentEl.tagName;
+              if (pTag === 'SCRIPT' || pTag === 'STYLE' || pTag === 'NOSCRIPT' || pTag === 'TEMPLATE') continue;
+              if (isInsidePlayerLiveUI(parentEl)) continue;
+
+              var norm = normalizeText(raw);
+              if (!norm || !TEXT_ANCHOR_RE.test(norm)) continue;
+
+              var anc = parentEl;
+              for (var climb = 0; climb < 8 && anc && anc !== document.body && anc !== document.documentElement; climb++) {
+                if (prot.ancestors.has(anc)) break;
+                push(anc);
+                anc = anc.parentElement;
+              }
+            }
+          }
+        } catch (_) {}
+
         return out;
       }
+
+      function recordHitDiag(kind) {
+        if (kind === 'vpn-promo') xspDiagBump('v10HidVpn', 'v10:vpn');
+        else if (kind === 'anon-push') xspDiagBump('v10HidAnon', 'v10:anon');
+        else if (kind === 'fake-verify') xspDiagBump('v10HidVerify', 'v10:verify');
+        else if (kind === 'fake-dl-progress') xspDiagBump('v10HidDlProg', 'v10:dlprog');
+      }
+
       function scanOnce() {
         microQueued = false;
         rafQueued = false;
         if (document.hidden) return;
         try {
           injectStyleSheet(document);
-          const roots = getAllRoots();
-          const prot = buildProtectedContext(roots);
-          const vp = getViewportMetrics();
-          const isAdSubframe = window !== window.top && !prot.hasVideo;
-          const matched = [];
-          for (let r = 0; r < roots.length; r++) {
-            const root = roots[r];
-            const raw = collectCandidates(root, prot);
-            const geoPassed = [];
-            for (let i = 0; i < raw.length; i++) {
-              const el = raw[i];
+          var roots = getAllRoots();
+          var prot = buildProtectedContext(roots);
+
+          xspInstallPhoneDiag();
+          if (xspChallengeGate()) {
+            xspDiagBump('v10SkipChallengeDoc');
+            return;
+          }
+          xspDiagBump('v10Runs');
+
+          var vp = getViewportMetrics();
+          var isAdSubframe = window !== window.top && !prot.hasVideo;
+          var matched = [];
+          var totalCandidates = 0;
+
+          for (var r = 0; r < roots.length; r++) {
+            var root = roots[r];
+            var raw = collectCandidates(root, prot);
+            totalCandidates += raw.length;
+            var geoPassed = [];
+
+            for (var i = 0; i < raw.length; i++) {
+              var el = raw[i];
               if (isInsidePlayerChrome(el)) continue;
               if (!isInFloatingLayer(el, root, prot)) continue;
-              const rect = el.getBoundingClientRect();
-              const vrect = toViewportRect(rect, vp);
+              var rect = el.getBoundingClientRect();
+              var vrect = toViewportRect(rect, vp);
               if (!matchesCardGeometry(vrect, vp, isAdSubframe)) continue;
               geoPassed.push({ el: el, rect: rect, area: rect.width * rect.height });
             }
+
+            // Smallest match first so inner card is clipped before any outer container
             geoPassed.sort(function (a, b) { return a.area - b.area; });
-            const confirmedInRoot = [];
-            for (let i = 0; i < geoPassed.length; i++) {
-              const item = geoPassed[i];
-              const el = item.el;
-              let wrapsConfirmed = false;
-              for (let c = 0; c < confirmedInRoot.length; c++) { if (el.contains(confirmedInRoot[c])) { wrapsConfirmed = true; break; } }
+
+            var confirmedInRoot = [];
+            for (var g = 0; g < geoPassed.length; g++) {
+              var item = geoPassed[g];
+              var cand = item.el;
+
+              var wrapsConfirmed = false;
+              for (var c = 0; c < confirmedInRoot.length; c++) {
+                if (cand.contains(confirmedInRoot[c])) {
+                  wrapsConfirmed = true;
+                  break;
+                }
+              }
               if (wrapsConfirmed) continue;
-              const txt = getCleanText(el, 600, false);
-              if (hardVeto(el, txt, prot)) continue;
-              const hasClose = hasTopRightClose(el, item.rect);
-              const hit = classifyVpnCard(el, item.rect, txt, hasClose) || classifyAnonPushCard(el, item.rect, txt, hasClose);
-              if (hit) { confirmedInRoot.push(el); matched.push({ el: el, root: root, hit: hit }); }
+
+              var txt = getCleanText(cand, 600, false);
+              if (hardVeto(cand, txt, prot)) continue;
+
+              var hasClose = hasTopRightClose(cand, item.rect);
+              var hit =
+                classifyVpnCard(cand, item.rect, txt, hasClose) ||
+                classifyAnonPushCard(cand, item.rect, txt, hasClose) ||
+                classifyFakeVerifyCard(cand, item.rect, txt, hasClose) ||
+                classifyFakeDownloadProgressCard(cand, item.rect, txt, hasClose);
+
+              if (hit) {
+                confirmedInRoot.push(cand);
+                matched.push({ el: cand, root: root, hit: hit });
+              }
             }
           }
-          let firstHit = null;
-          for (let m = 0; m < matched.length; m++) {
-            const entry = matched[m];
-            if (hideCard(entry.el, entry.root, prot, vp) && !firstHit) firstHit = entry.hit;
+
+          xspDiagBump('v10Candidates', totalCandidates);
+          var firstHit = null;
+          for (var m = 0; m < matched.length; m++) {
+            var entry = matched[m];
+            if (hideCard(entry.el, entry.root, prot, vp)) {
+              recordHitDiag(entry.hit.kind);
+              if (!firstHit) firstHit = entry.hit;
+            }
           }
-          if (firstHit) reportAdCardToParent(prot.hasVideo, firstHit);
+
+          if (firstHit) {
+            reportAdCardToParent(prot.hasVideo, firstHit);
+          }
         } catch (_) {}
       }
+
       function scheduleMicroScan() {
         if (!microQueued) {
           microQueued = true;
@@ -1436,6 +2166,7 @@ enum AdStripScript {
         }
         scheduleRafScan();
       }
+
       function scheduleRafScan() {
         if (rafQueued) return;
         rafQueued = true;
@@ -1443,60 +2174,89 @@ enum AdStripScript {
         else setTimeout(scanOnce, 16);
       }
 
-      // 9. 三层低开销监听：childList(微任务) + 过滤控件的 characterData(rAF) + 浅层 attributes(微任务)
+      // ---------------------------------------------------------------------------
+      // 9. Observers: childList (microtask) + filtered characterData (rAF) + shallow attributes
+      // ---------------------------------------------------------------------------
       function observeShallowElement(el) {
         if (!el || el.nodeType !== 1 || observedShallowEls.has(el)) return;
-        const tag = el.tagName;
+        var tag = el.tagName;
         if (tag === 'HEAD' || tag === 'BODY' || tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK') return;
         if (matchesChromeToken(el)) return;
         observedShallowEls.add(el);
         try {
-          const obs = new MutationObserver(function () {
-            if (el.getAttribute(CARD_ATTR) !== '1' && el.getAttribute(WRAP_ATTR) !== '1' && el.getAttribute(BACKDROP_ATTR) !== '1') scheduleMicroScan();
+          var obs = new MutationObserver(function () {
+            if (el.getAttribute(CARD_ATTR) !== '1' &&
+                el.getAttribute(WRAP_ATTR) !== '1' &&
+                el.getAttribute(BACKDROP_ATTR) !== '1') {
+              scheduleMicroScan();
+            }
           });
           obs.observe(el, { attributes: true, attributeFilter: ['style', 'class', 'hidden'] });
         } catch (_) {}
       }
+
       function observeRoot(root) {
         if (!root || observedRoots.has(root) || typeof MutationObserver === 'undefined') return;
-        const target = root === document ? document.documentElement : root;
+        var target = root === document ? document.documentElement : root;
         if (!target) return;
         observedRoots.add(root);
         try {
-          const mo = new MutationObserver(function (mutations) {
-            let needMicro = false;
-            let needRaf = false;
-            for (let i = 0; i < mutations.length; i++) {
-              const m = mutations[i];
+          var mo = new MutationObserver(function (mutations) {
+            var needMicro = false;
+            var needRaf = false;
+
+            for (var i = 0; i < mutations.length; i++) {
+              var m = mutations[i];
               if (m.type === 'childList') {
-                const added = m.addedNodes;
+                var added = m.addedNodes;
                 if (!added || added.length === 0) continue;
-                for (let j = 0; j < added.length; j++) { const n = added[j]; if (n.nodeType === 1 && !isInsidePlayerLiveUI(n)) { needMicro = true; break; } }
+                for (var j = 0; j < added.length; j++) {
+                  var n = added[j];
+                  if (n.nodeType === 1 && !isInsidePlayerLiveUI(n)) {
+                    needMicro = true;
+                    break;
+                  }
+                }
               } else if (m.type === 'characterData') {
-                if (!isInsidePlayerLiveUI(m.target)) needRaf = true;
+                if (!isInsidePlayerLiveUI(m.target)) {
+                  needRaf = true;
+                }
               }
               if (needMicro) break;
             }
+
             if (needMicro) scheduleMicroScan();
             else if (needRaf) scheduleRafScan();
           });
+
           mo.observe(target, { childList: true, characterData: true, subtree: true });
         } catch (_) {}
       }
+
       function boot() {
         injectStyleSheet(document);
         observeRoot(document);
         scanOnce();
       }
+
       if (document.documentElement) boot();
       else document.addEventListener('DOMContentLoaded', boot, { once: true });
+
       window.addEventListener('load', scheduleMicroScan);
       window.addEventListener('resize', scheduleRafScan);
-      if (window.visualViewport) window.visualViewport.addEventListener('resize', scheduleRafScan);
-      document.addEventListener('visibilitychange', function () { if (!document.hidden) scheduleRafScan(); });
-      setInterval(function () { if (!document.hidden) scanOnce(); }, 1200);
+      if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', scheduleRafScan);
+      }
+      document.addEventListener('visibilitychange', function () {
+        if (!document.hidden) scheduleRafScan();
+      });
+
+      setInterval(function () {
+        if (!document.hidden) scanOnce();
+      }, 1200);
     })();
     """
+    }
 }
 
 // MARK: - 嵌入页探针（读页内 video 元素的进度/状态，控制它播/停/快进/全屏；兼管底条显隐）
@@ -1945,7 +2705,7 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
         }
         // 第三层：CF 通过后删广告 DOM + video 打 playsinline（document-start，每秒再扫）。
         if adStrip {
-            let script = WKUserScript(source: AdStripScript.source, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+            let script = WKUserScript(source: AdStripScript.source(diagBadgeEnabled: UserDefaults.standard.bool(forKey: "xspDiagBadgeEnabled")), injectionTime: .atDocumentStart, forMainFrameOnly: false)
             config.userContentController.addUserScript(script)
         }
 

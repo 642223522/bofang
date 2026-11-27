@@ -20,6 +20,10 @@ struct DiagnosticsView: View {
     /// 当前网络摘要（direct/proxy + 触发原因）：进页时现测一次缓存起来，
     /// 不在 body 里每次都调 inspect()（getifaddrs + 代理字典每帧都跑没必要）。
     @State private var networkSummary = ""
+    /// run #23 (v13)：播放器诊断浮层开关。开着时下次播嵌页视频，画面左下角会
+    /// 显示清理器的小字计数（扫描/跳过/各卡拦截数），方便看清哪张卡被哪个分类
+    /// 器藏了、哪张漏了。默认关；只影响新打开的视频。
+    @AppStorage("xspDiagBadgeEnabled") private var diagBadgeEnabled = false
 
     var body: some View {
         WideContent {
@@ -62,6 +66,13 @@ struct DiagnosticsView: View {
                             infoRow("自检失败", "\(failedCheckCount) 个")
                             infoRow("竞速已测", "\(store.raceResults.count) 个")
                             infoRow("后台自检", store.autoCheckCycleDescription)
+                        }
+
+                        Section("播放器诊断") {
+                            Toggle("播放时显示诊断浮层", isOn: $diagBadgeEnabled)
+                            Text("开着时，下次播嵌页视频会在画面左下角显示清理器的扫描与拦截计数（VPN / View More / 假验证 / 假下载各藏了几张）。只用来测广告卡，平时请保持关闭。")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
                         }
 
                         Section("网络诊断（DNS/TCP/TLS/HTTP/WAF）") {
