@@ -158,14 +158,20 @@ final class NetworkDiagnostics: ObservableObject {
 
     @Published private(set) var events: [NetworkDiagEvent] = []
 
+    /// 诊断事件插入串行队列（R4-7）：并发完成时 Task 进 MainActor 的顺序不保证
+    /// 与完成顺序一致；串行队列保证插入顺序与 record() 调用顺序一致。
+    private static let recordQueue = DispatchQueue(label: "com.liudehen.xiaoshipin.netdiag.record")
+
     private init() {}
 
     nonisolated static func record(_ event: NetworkDiagEvent) {
-        Task { @MainActor in
-            let store = NetworkDiagnostics.shared
-            store.events.insert(event, at: 0)
-            if store.events.count > Self.maxEvents {
-                store.events.removeLast()
+        recordQueue.async {
+            Task { @MainActor in
+                let store = NetworkDiagnostics.shared
+                store.events.insert(event, at: 0)
+                if store.events.count > Self.maxEvents {
+                    store.events.removeLast()
+                }
             }
         }
     }
@@ -690,11 +696,21 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         return entry.until > Date()
     }
 
+    /// 当前网络世代（sessionLock 内读，R4-11：data() 入口抓 startEpoch 用）。
+    private func currentNetworkEpoch() -> UInt64 {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        return networkEpoch
+    }
+
     /// 跳闸：该 host 10 分钟内直降代理感知 NWConnection。
-    private func tripBreaker(host: String?) {
+    /// R4-11：只在 networkEpoch == ifEpoch 时写——中途换网/换代理后，旧网的
+    /// 失败不再把新网的 breaker 跳闸 10 分钟（epoch 隔离）。
+    private func tripBreaker(host: String?, ifEpoch expectedEpoch: UInt64) {
         guard let host = host?.lowercased(), !host.isEmpty else { return }
         sessionLock.lock()
         defer { sessionLock.unlock() }
+        guard networkEpoch == expectedEpoch else { return }
         breaker[host] = (epoch: networkEpoch, until: Date().addingTimeInterval(600))
     }
 
@@ -791,9 +807,10 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
     }
 
     /// 发请求并采集 URLSessionTaskMetrics。
-    /// timeout：单次请求总超时（秒，默认 12s；显式值钳制在 0.2...30s，nil 时默认 12s）——这是真正的总预算，
-    /// 用 deadline 任务赛跑实现；request.timeoutInterval 只作字节间空闲定时器，
-    /// 慢速滴漏（tarpit）再也拖不到 25s。
+    /// timeout：单次请求总超时（秒，默认 12s；显式值钳制在 (0, 30]s——<=0 直接
+    /// 报超时，不设下限，nil 时默认 12s）——这是真正的总预算，用 deadline
+    /// 任务赛跑实现；request.timeoutInterval 只作字节间空闲定时器，慢速滴漏
+    ///（tarpit）再也拖不到 25s。
     /// 路由顺序：严格校验 → 强制 host/熔断 host（代理感知 NWConnection，
     /// PAC-only 时回落 URLSession）→ DoH 偏好 host（仅无显式代理时）→
     /// URLSession（残留 socket 一次重试）→ 传输兜底 / -1002 守卫救援。
@@ -815,9 +832,12 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         // R3-3：3 秒下限只在 timeout == nil 时用（外部默认 12s）。显式传进来
         // 的 timeout 是上层算好的剩余预算（WordPress 的 remaining()），绝不能
         // 再放大——否则整条 WP 请求会超总预算（0.5s 剩 → 3s，超约 2.5s）。
+        // R4-2：0.2 下限也不要——显式预算 <0.2s 时把它抬到 0.2s 仍违一本账
+        //（WP 剩 0.1s 传进来，底层能跑 0.2s）。<=0 直接报超时，不设下限。
         let totalDeadline: TimeInterval
         if let timeout {
-            totalDeadline = min(max(timeout, 0.2), 30)
+            guard timeout > 0 else { throw URLError(.timedOut) }
+            totalDeadline = min(timeout, 30)
             request.timeoutInterval = totalDeadline
         } else {
             totalDeadline = 12
@@ -828,12 +848,18 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         // 绝对 deadline：一本账，整条请求链（URLSession + 兜底 + 救援）共用；
         // 各层只拿剩余时间，不再每层重起一份全额预算（26.238s 就是这么来的）。
         let deadline = Date().addingTimeInterval(totalDeadline)
+        // R4-11：入口抓网络世代——中途换网/换代理后，旧网的失败不再给新网跳闸。
+        let startEpoch = currentNetworkEpoch()
         let proxy = ActiveSystemProxy.current()
+        // R4-5：流式 body（httpBodyStream）不走 DoH/强制传输——DoH 自研栈只读
+        // httpBody，流会被丢掉；有流的请求直接走 URLSession（原生处理流）。
+        let hasStreamBody = rawRequest.httpBody == nil && rawRequest.httpBodyStream != nil
 
         // 1. 强制 host（已知 URLSession 不可靠）与熔断 host：代理感知 NWConnection。
         // PAC-only 时 NWConnection 执行不了 JS PAC，回落系统 URLSession。
         // 只对 https（DoH 客户端只做 https；http 请求直接走 URLSession）。
-        if url.scheme?.lowercased() == "https",
+        if !hasStreamBody,
+           url.scheme?.lowercased() == "https",
            isForcedTransportHost(url.host) || isBreakerTripped(host: url.host) {
             if !proxy.isPACOnly {
                 return try await performViaProxyAwareTransport(
@@ -849,10 +875,19 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         // 2. DoH 偏好 host（之前走 DoH 成功过）：仅无显式代理时直连 DoH；
         // 代理开着时由代理做 DNS（远程解析本来就是干净的），走 URLSession。
         //（系统 DNS 给的是被污染的 Facebook IP，TCP 黑洞 12 秒。）
-        if proxy == .none,
+        if !hasStreamBody,
+           proxy == .none,
            DoHFallbackClient.shared.isDoHPreferred(for: url.host),
            url.scheme?.lowercased() == "https" {
-            return try await performViaDoH(request: request, source: source, preservedHeaders: preservedHeaders, timeout: max(0, deadline.timeIntervalSinceNow))
+            // R4-4：DoH 偏好失效就撤销——取消原样抛；其他错先撤销该 host 偏好，
+            // 再落入下方 URLSession 路径（同一绝对 deadline，不另起预算），
+            // 不让一个站因 DoH 一挂就持续失败到切网。
+            do {
+                return try await performViaDoH(request: request, source: source, preservedHeaders: preservedHeaders, timeout: max(0, deadline.timeIntervalSinceNow))
+            } catch {
+                if error is CancellationError { throw error }
+                DoHFallbackClient.shared.removeDoHPreferred(host: url.host)
+            }
         }
 
         // 3. URLSession 尝试：残留 socket 一次重试 → 传输兜底 → -1002 守卫救援。
@@ -905,16 +940,19 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                 // 不写假 DoH 事件、不跳闸（-1002 救援与 TTFB 保护在它之前判，
                 // 它们不依赖预算；下面的重试/fallback 路径共用这一道门）。
                 let remainingNow = deadline.timeIntervalSinceNow
+                // R4-11：catch 里重读当前代理——入口抓的 proxy 可能已过期（中途
+                // 开了/关了代理）；救援与兜底都用最新的代理（仍受 !isPACOnly 守卫）。
+                let currentProxy = ActiveSystemProxy.current()
                 // F12：-1002 救援先于 TTFB 保护判——-1002 是 URL 问题，不是传输
                 // 问题，不应被“已收到响应头”拦住。预算不够时不救，直接抛原错。
-                if isStrict1002Rescue(error: error, request: request), !proxy.isPACOnly {
+                if isStrict1002Rescue(error: error, request: request), !currentProxy.isPACOnly {
                     guard remainingNow > 0.2 else { throw error }
                     return try await performViaProxyAwareTransport(
                         request: request,
                         source: source,
                         preservedHeaders: preservedHeaders,
                         timeout: max(0, remainingNow),
-                        proxy: proxy
+                        proxy: currentProxy
                     )
                 }
                 // F2：响应已开始（收到过任何一跳响应头）后再失败：不再回退到 DoH
@@ -942,15 +980,15 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                    let host = url.host, !host.isEmpty,
                    isTransportFallbackEligible(error) {
                     if shouldTripBreaker(error: error, metrics: metrics) {
-                        tripBreaker(host: host)
+                        tripBreaker(host: host, ifEpoch: startEpoch)
                     }
-                    if !proxy.isPACOnly {
+                    if !currentProxy.isPACOnly {
                         return try await performViaProxyAwareTransport(
                             request: request,
                             source: source,
                             preservedHeaders: preservedHeaders,
                             timeout: max(0, deadline.timeIntervalSinceNow),
-                            proxy: proxy
+                            proxy: currentProxy
                         )
                     }
                     throw error
@@ -1383,6 +1421,8 @@ final class WordPressHTTP: @unchecked Sendable {
     /// id 幂等 release；onCancel 只做 release、不直接 cancel 底层（可能还有
     /// 别的 waiter 在等），只有最后一个 waiter 离开时才 cancel 底层。
     func fetch(_ request: URLRequest, source: String, timeout: TimeInterval = 12) async throws -> (Data, HTTPURLResponse) {
+        // R4-14：已取消的调用方直接出——不加锁、不建 Task、不进 inFlight。
+        try Task.checkCancellation()
         guard let url = request.url else { throw URLError(.badURL) }
         let key = Self.dedupKey(for: request, timeout: timeout)
         let waiterID = UUID()
@@ -1477,23 +1517,28 @@ final class WordPressHTTP: @unchecked Sendable {
             guard value > 0 else { throw URLError(.timedOut) }
             return value
         }
-        /// 退避等待（受剩余预算约束）；等完预算没了就抛 .timedOut，不再重试。
-        func backoff(_ seconds: TimeInterval) async throws {
-            let wait = min(seconds, max(0, deadline.timeIntervalSinceNow))
-            if wait > 0 {
-                try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+        /// 退避等待（R4-12）：只有剩余够睡 + 再发一次（remaining > seconds + 0.5）
+        /// 才睡，返回 true；否则返回 false，调用方直接返回响应（429/5xx）或
+        /// 重抛原错——不再睡光预算再报个假 .timedOut。
+        func backoff(_ seconds: TimeInterval) async throws -> Bool {
+            let remainingNow = deadline.timeIntervalSinceNow
+            guard remainingNow > seconds + 0.5 else { return false }
+            if seconds > 0 {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
             }
-            _ = try remaining()
-        }
-        lock.lock()
-        let lastChallenge = lastChallengeAt[host]
-        lock.unlock()
-        if let lastChallenge, Date().timeIntervalSince(lastChallenge) < circuitOpenSeconds {
-            throw WordPressHTTPError.circuitOpen(host: host)
+            return true
         }
         var attempt = 0
         while true {
             attempt += 1
+            // R4-13：断路器每次 attempt 前都重查——并发请求可能在退避睡眠期间
+            // 刚撞上挑战开闸；醒来不能直接撞进挑战里。
+            lock.lock()
+            let lastChallenge = lastChallengeAt[host]
+            lock.unlock()
+            if let lastChallenge, Date().timeIntervalSince(lastChallenge) < circuitOpenSeconds {
+                throw WordPressHTTPError.circuitOpen(host: host)
+            }
             // 预算到了就停，不再发起新尝试（直接抛 .timedOut，不进 catch 的重试分支）。
             _ = try remaining()
             do {
@@ -1513,12 +1558,12 @@ final class WordPressHTTP: @unchecked Sendable {
                 let status = http.statusCode
                 if status == 429, attempt == 1 {
                     let wait = min(retryAfterSeconds(from: http) ?? retryBackoffSeconds, maxRetryAfterSeconds)
-                    try await backoff(wait)
-                    continue
+                    if try await backoff(wait) { continue }
+                    return (data, http)
                 }
                 if (500...599).contains(status), attempt == 1 {
-                    try await backoff(retryBackoffSeconds)
-                    continue
+                    if try await backoff(retryBackoffSeconds) { continue }
+                    return (data, http)
                 }
                 // G3：只有最终 2xx 成功才清挑战记录——429/5xx/超时重试路径
                 // 不调，并发里一条重试路径的 recordSuccess 会把另一条刚记下
@@ -1532,10 +1577,11 @@ final class WordPressHTTP: @unchecked Sendable {
                 if error is CancellationError { throw error }
                 if let wpError = error as? WordPressHTTPError { throw wpError }
                 // 超时/断连重试 1 次；别的传输错误不重试。
+                // R4-12：预算不够睡时 backoff 返回 false，直接重抛原错
+                //（不睡、不把原错换成假 .timedOut）。
                 if attempt == 1, let urlError = error as? URLError,
                    urlError.code == .timedOut || urlError.code == .networkConnectionLost {
-                    try await backoff(retryBackoffSeconds)
-                    continue
+                    if try await backoff(retryBackoffSeconds) { continue }
                 }
                 throw error
             }

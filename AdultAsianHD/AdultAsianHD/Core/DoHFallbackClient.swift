@@ -240,9 +240,22 @@ final class DoHFallbackClient: @unchecked Sendable {
         return preferredHosts.contains(host)
     }
 
-    func markDoHPreferred(host: String) {
+    /// 原子围栏记偏好（R4-10）：同一把锁内校验 generation == expected 再插入——
+    /// 避免 resetForNetworkChange() 在检查与写入之间跑、把旧网的偏好插回新网的表。
+    func markDoHPreferred(host: String, ifGeneration expected: UInt64) {
         lock.lock()
+        defer { lock.unlock() }
+        guard networkGeneration == expected else { return }
         preferredHosts.insert(host.lowercased())
+    }
+
+    /// 撤销某 host 的 DoH 偏好（R4-4）：DoH 一挂就摘掉，下次请求重新走
+    /// URLSession（偏好一旦建立永不撤销，会让一个站持续失败到切网）。
+    /// 只 lock 内删除，不用 generation 校验。
+    func removeDoHPreferred(host: String?) {
+        guard let host = host?.lowercased(), !host.isEmpty else { return }
+        lock.lock()
+        preferredHosts.remove(host)
         lock.unlock()
     }
 
@@ -297,7 +310,9 @@ final class DoHFallbackClient: @unchecked Sendable {
                         request: currentReq,
                         timeout: min(perHopTimeout, remaining())
                     )
-                    hop = (res.0, res.1, proxy.label, res.2)
+                    // R4-8：remoteIP 只用于展示（诊断事件的 remoteAddress），
+                    // 代理标签不是 IP——返回空串，展示层空值即“经代理”。
+                    hop = (res.0, res.1, "", res.2)
                 } catch let failure as DoHTransportFailure {
                     throw failure.underlying
                 }
@@ -335,9 +350,7 @@ final class DoHFallbackClient: @unchecked Sendable {
                             timeout: min(perIPTimeout, remaining())
                         )
                         succeeded = (res.0, res.1, ip, res.2)
-                        if generation == currentGeneration() {
-                            markDoHPreferred(host: host)
-                        }
+                        markDoHPreferred(host: host, ifGeneration: generation)
                         break
                     } catch let failure as DoHTransportFailure {
                         // F4：该 IP 已收到最终响应头，body 失败不再换 IP。
@@ -436,7 +449,9 @@ final class DoHFallbackClient: @unchecked Sendable {
         var nextReq = URLRequest(url: nextURL)
         let is303 = http.statusCode == 303
         nextReq.httpMethod = is303 ? "GET" : (currentReq.httpMethod ?? "GET")
-        if nextReq.httpMethod != "GET" { nextReq.httpBody = currentReq.httpBody }
+        // R4-5：流式 body（httpBodyStream）不复制——DoH 自研栈只读 httpBody，
+        // 流会被丢掉；有流的请求根本不进 DoH（data() 里已拦），这里只是兜底。
+        if nextReq.httpMethod != "GET", currentReq.httpBodyStream == nil { nextReq.httpBody = currentReq.httpBody }
         let sameOrigin = NetConstants.isSameOrigin(originURL, nextURL)
         // 跳步头（Connection/Transfer-Encoding/Keep-Alive/Proxy-Connection/
         // Upgrade）上 H2/H3 会违反 RFC 9113/9114，直接 RST_STREAM，永不复制。
@@ -475,7 +490,10 @@ final class DoHFallbackClient: @unchecked Sendable {
         let originHost = originURL?.host?.lowercased() ?? ""
         if sameOrigin, let seedCookie = originRequest.value(forHTTPHeaderField: "Cookie") {
             for pair in seedCookie.split(separator: ";") {
-                let kv = pair.split(separator: "=", maxSplits: 1)
+                // R4-9：空值 cookie（"flag="）必须拆成 ["flag", ""]——默认
+                // omittingEmptySubsequences: true 会把它拆成 ["flag"]，
+                // guard kv.count == 2 失败就把空值 cookie 悄悄丢了。
+                let kv = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
                 guard kv.count == 2 else { continue }
                 let name = kv[0].trimmingCharacters(in: .whitespaces)
                 let value = kv[1].trimmingCharacters(in: .whitespaces)
@@ -484,7 +502,7 @@ final class DoHFallbackClient: @unchecked Sendable {
             }
         }
         merged.removeAll { pair in
-            expiredKeys.contains { Self.expiredKeyApplies($0, name: pair.name, domain: pair.domain, path: pair.path) }
+            expiredKeys.contains { Self.expiredKeyAppliesToSeed($0, name: pair.name, domain: pair.domain, nextURL: nextURL) }
         }
         let matching = cookies.filter { Self.cookieMatches($0, url: nextURL) }
         // 按 name 分组（保持首次出现顺序）；组内按 path 长度降序——最具体的在前。
@@ -495,9 +513,16 @@ final class DoHFallbackClient: @unchecked Sendable {
             byName[entry.cookie.name, default: []].append(entry)
         }
         for name in namesInOrder {
-            merged.removeAll { $0.name == name }
             let entries = (byName[name] ?? []).sorted(by: { $0.cookie.path.count > $1.cookie.path.count })
             for entry in entries {
+                // R4-1：只删与 jar 条目 (name, domain, path) 身份相同的对——
+                // 不同 path/domain 的种子保留（同名不同 path 是两个合法 cookie，
+                // 按裸 name 全删会把种子的 sid=root 连同 jar 的 sid=admin 一起丢掉）。
+                merged.removeAll {
+                    $0.name == entry.cookie.name
+                        && Self.normalizedCookieDomain($0.domain) == Self.normalizedCookieDomain(entry.cookie.domain)
+                        && $0.path == entry.cookie.path
+                }
                 merged.append((
                     name: entry.cookie.name,
                     value: entry.cookie.value,
@@ -506,6 +531,18 @@ final class DoHFallbackClient: @unchecked Sendable {
                     path: entry.cookie.path
                 ))
             }
+        }
+        // R4-1：同名条目（种子 + jar 一起）按 path 长度降序排——最具体的 path
+        // 在前（RFC 6265：同名 cookie 按 path 长度降序发）。按 name 首次出现
+        // 顺序分组，只排组内，不动组间顺序。
+        if !merged.isEmpty {
+            var order: [String] = []
+            var groups: [String: [(name: String, value: String, domain: String, hostOnly: Bool, path: String)]] = [:]
+            for pair in merged {
+                if groups[pair.name] == nil { order.append(pair.name) }
+                groups[pair.name, default: []].append(pair)
+            }
+            merged = order.flatMap { (groups[$0] ?? []).sorted(by: { $0.path.count > $1.path.count }) }
         }
         if merged.isEmpty {
             nextReq.setValue(nil, forHTTPHeaderField: "Cookie")
@@ -538,14 +575,21 @@ final class DoHFallbackClient: @unchecked Sendable {
         return d
     }
 
-    /// 过期键是否适用于目标 cookie 的范围（R3-10）：name 相同、path 相同、
-    /// 域匹配（host-only 的过期条目只匹配完全相同的 host；domain 的过期条目
-    /// 匹配该域及其子域）。
-    private static func expiredKeyApplies(_ key: ExpiredCookieKey, name: String, domain: String, path: String) -> Bool {
-        guard key.name == name, key.path == path else { return false }
-        let target = normalizedCookieDomain(domain)
-        if key.hostOnly { return target == key.domain }
-        return target == key.domain || target.hasSuffix("." + key.domain)
+    /// 过期键是否删种子 cookie（R4-3，种子专用——全代码只有 redirectRequest
+    /// 的种子删除一个调用点；Set-Cookie 循环用身份 remove/insert，不走这里）。
+    /// 种子永远是 host-only：domain-scope（Domain=）的过期键不删种子；
+    /// domain 精确相等；path 用 RFC 6265 前缀规则对 nextURL.path 匹配——
+    /// 不是与种子建模的 "/" 精确相等（种子没有 path 元数据，服务端可能按
+    /// /app 删它；nextURL.path 在过期键的 path 前缀内才算覆盖）。
+    private static func expiredKeyAppliesToSeed(_ key: ExpiredCookieKey, name: String, domain: String, nextURL: URL) -> Bool {
+        guard key.name == name, key.hostOnly else { return false }
+        guard Self.normalizedCookieDomain(domain) == key.domain else { return false }
+        let path = nextURL.path.isEmpty ? "/" : nextURL.path
+        if path == key.path { return true }
+        guard path.hasPrefix(key.path) else { return false }
+        if key.path.hasSuffix("/") { return true }
+        let nextIndex = path.index(path.startIndex, offsetBy: key.path.count)
+        return path[nextIndex] == "/"
     }
 
     /// host 是否为 IP 字面量（IPv4 四段数字 / 含冒号的 IPv6）：IP 上后缀匹配
@@ -816,7 +860,7 @@ final class DoHFallbackClient: @unchecked Sendable {
             method: request.httpMethod ?? "GET"
         )
         do {
-            return try parseHTTP11Response(rawResponse, url: url)
+            return try parseHTTP11Response(rawResponse, url: url, method: request.httpMethod ?? "GET")
         } catch {
             // driveConnection 只返回收齐帧的原始响应（最终头已解析），
             // 解析失败意味着已收到响应头：包起来，外层不再换 IP（F4）。
@@ -871,7 +915,7 @@ final class DoHFallbackClient: @unchecked Sendable {
             method: request.httpMethod ?? "GET"
         )
         do {
-            return try parseHTTP11Response(rawResponse, url: url)
+            return try parseHTTP11Response(rawResponse, url: url, method: request.httpMethod ?? "GET")
         } catch {
             // F4：同 fetchSingleHopCore，解析失败 = 已收到响应头。
             throw DoHTransportFailure(underlying: error, responseStarted: true)
@@ -1288,10 +1332,14 @@ final class DoHFallbackClient: @unchecked Sendable {
         var seen = Set(["host", "connection", "accept-encoding", "content-length", "transfer-encoding"])
         if let fields = request.allHTTPHeaderFields {
             for (k, v) in fields {
-                let lower = k.lowercased()
+                // R4-6：header 名/值里的 \r、\n 直接去掉——自研 HTTP 栈不像
+                // URLSession 会拒这类头，含换行的值会注入换行（header injection）。
+                let cleanKey = k.replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: "")
+                let cleanValue = v.replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: "")
+                let lower = cleanKey.lowercased()
                 guard !seen.contains(lower) else { continue }
                 seen.insert(lower)
-                lines.append("\(k): \(v)")
+                lines.append("\(cleanKey): \(cleanValue)")
             }
         }
         let body = request.httpBody
@@ -1308,13 +1356,15 @@ final class DoHFallbackClient: @unchecked Sendable {
 
     /// 返回体 + 响应 + 原始 Set-Cookie 头行：多条 Set-Cookie 不能进
     /// [String: String]（后一条盖前一条），原始头行单独留一份给 cookie jar。
-    private func parseHTTP11Response(_ raw: Data, url: URL) throws -> (Data, HTTPURLResponse, [String]) {
+    private func parseHTTP11Response(_ raw: Data, url: URL, method: String) throws -> (Data, HTTPURLResponse, [String]) {
         // 1xx 中间响应（100 Continue / 103 Early Hints）会先发一组头：
         // 与 frameStatus 共用 skipInterimResponses（F21），只解析最终响应头。
         let skip = Self.skipInterimResponses(in: raw, from: raw.startIndex)
         guard case .finalBlock(let blockStart, let range, let statusCode) = skip else {
             throw URLError(.cannotParseResponse)
         }
+        // R4-15：HEAD/204/304 没有 body（RFC 9110）——跳过 TE 校验、body 直接 Data()。
+        let isBodyless = method.uppercased() == "HEAD" || statusCode == 204 || statusCode == 304
         let headStr = Self.decodeHeaderBlock(raw[blockStart..<range.lowerBound])
         let headerLines = headStr.components(separatedBy: "\r\n")
         guard headerLines.first != nil else { throw URLError(.cannotParseResponse) }
@@ -1326,7 +1376,8 @@ final class DoHFallbackClient: @unchecked Sendable {
             let k = line[..<colon].trimmingCharacters(in: .whitespaces)
             let v = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
             // F19：只有恰好 ["chunked"] 才算 chunked，别的编码组合判 malformed。
-            if k.lowercased() == "transfer-encoding" {
+            // R4-15：bodyless 响应跳过 TE 校验（frameStatus 已按头完成，不看 TE）。
+            if k.lowercased() == "transfer-encoding", !isBodyless {
                 guard Self.transferEncodingIsChunked(String(v)) else {
                     throw URLError(.cannotParseResponse)
                 }
@@ -1338,7 +1389,7 @@ final class DoHFallbackClient: @unchecked Sendable {
             headerFields[k] = v
         }
         let rawBody = Data(raw[range.upperBound...])
-        let body = isChunked ? try decodeChunked(rawBody) : rawBody
+        let body = isBodyless ? Data() : (isChunked ? try decodeChunked(rawBody) : rawBody)
         guard let httpResp = HTTPURLResponse(url: url, statusCode: statusCode, httpVersion: "HTTP/1.1", headerFields: headerFields) else {
             throw URLError(.cannotParseResponse)
         }
@@ -1352,6 +1403,9 @@ final class DoHFallbackClient: @unchecked Sendable {
         var out = Data()
         var idx = data.startIndex
         let crlf = Data("\r\n".utf8)
+        // R4-15：见过 size==0 终结块才算完整——没见过终结块、流直接到末尾
+        // 是截断，必须 throw（与本函数注释“任何截断都 throw”一致）。
+        var sawTerminator = false
         while idx < data.endIndex {
             guard let lineEnd = data.range(of: crlf, in: idx..<data.endIndex) else {
                 throw URLError(.cannotParseResponse)
@@ -1364,6 +1418,7 @@ final class DoHFallbackClient: @unchecked Sendable {
             }
             if size == 0 {
                 // 终结块：后面只有 trailer + CRLF，直接收尾。
+                sawTerminator = true
                 break
             }
             let bodyStart = lineEnd.upperBound
@@ -1378,6 +1433,7 @@ final class DoHFallbackClient: @unchecked Sendable {
             }
             idx = afterChunk
         }
+        guard sawTerminator else { throw URLError(.cannotParseResponse) }
         return out
     }
 }
