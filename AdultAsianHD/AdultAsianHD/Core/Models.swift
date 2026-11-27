@@ -83,7 +83,7 @@ enum CategoryDetectionRules {
 /// 关节点可用，不加。只改这里一行即可增减，不用改模块 JS（朋友模块改不了 JS）。
 /// 生效方式：导入/同步建 SourceRecord 时标题加后缀，下次同步后显示。
 enum NodeRequiredModules {
-    static let ids: Set<String> = ["user.huangguo", "user.javtiful"]
+    static let ids: Set<String> = ["user.huangguo", "user.javtiful", "user.javhd"]
 
     /// 源显示名：需节点的加 "（V）" 后缀；已带后缀的不重复加。
     static func displayTitle(for meta: WidgetMeta) -> String {
