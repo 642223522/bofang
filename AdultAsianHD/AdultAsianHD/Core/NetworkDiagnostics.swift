@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import CFNetwork
 
 /// 单次网络请求的死因/结果分层：区分 DNS / TCP / TLS / HTTP / WAF，定位真机无节点失败点。
 /// 404 归 .http（"HTTP 响应异常"），超时归 .timeout，连接中途丢归 .transport——
@@ -220,6 +221,37 @@ final class NetworkDiagnostics: ObservableObject {
             bodyData: bodyData,
             error: error
         )
+        // -1002 / code 1 的诊断补强：失败 URL（脱敏）+ 事务数 + 取指方式 +
+        // 代理状态 + 错误链，写进 summary 供检测页查看（不新增事件字段，
+        // run #14 教训：NetworkDiagEvent 的显式 init 不接受新字段的旧调用点）。
+        let enrichedSummary: String? = {
+            guard let error else { return summary }
+            let nsErr = error as NSError
+            let needsDetail = (nsErr.domain == NSURLErrorDomain && nsErr.code == URLError.unsupportedURL.rawValue)
+                || nsErr.code == 1
+            guard needsDetail else { return summary }
+            var parts: [String] = []
+            if let failing = nsErr.userInfo[NSURLErrorFailingURLStringErrorKey] as? String,
+               let failingURL = URL(string: failing) {
+                parts.append("fail=\(failingURL.host ?? "?")\(NetworkDiagEvent.sanitizePath(from: failingURL))")
+            }
+            let txs = metrics?.transactionMetrics ?? []
+            parts.append("tx=\(txs.count)")
+            if let fetchType = txs.last?.resourceFetchType {
+                parts.append("fetch=\(fetchType)")
+            }
+            parts.append("proxy=\(ActiveSystemProxy.current().label)")
+            let chain = DiagnosticHTTPClient.underlyingErrorChain(nsErr)
+                .prefix(3)
+                .map { "\($0.domain):\($0.code)" }
+                .joined(separator: ",")
+            parts.append("chain=[\(chain)]")
+            let detail = parts.joined(separator: " ")
+            if let summary, !summary.isEmpty {
+                return "\(summary) | \(detail)"
+            }
+            return detail
+        }()
         let nsError = error as NSError?
         return NetworkDiagEvent(
             id: UUID(),
@@ -234,7 +266,7 @@ final class NetworkDiagnostics: ObservableObject {
             statusCode: statusCode,
             errorDomain: nsError?.domain,
             errorCode: nsError?.code,
-            errorSummary: summary,
+            errorSummary: enrichedSummary,
             remoteAddress: tx?.remoteAddress,
             protocolName: tx?.networkProtocolName,
             reusedConnection: tx?.isReusedConnection ?? false,
@@ -401,14 +433,10 @@ final class NetworkDiagnostics: ObservableObject {
 final class DiagnosticHTTPClient: @unchecked Sendable {
     static let shared = DiagnosticHTTPClient()
 
-    private let session: URLSession
-    /// 网络切换监听：接口变了（Wi-Fi↔蜂窝、VPN 开关）就清 Cookie，
-    /// 直连时沾上的 WAF 坏 Cookie 不许带到 VPN 后。
-    private let pathMonitor = NWPathMonitor()
-    private let pathMonitorQueue = DispatchQueue(label: "com.liudehen.xiaoshipin.netdiag.path")
-    private var lastPathSignature = ""
-
-    private init() {
+    /// 会话配置工厂：每次轮换都用同一份配置。
+    /// urlCache = nil：.ephemeral 仍带内存 URLCache，会 0ms 命中缓存的
+    /// 301/302 重定向（坏 Location 直接报 -1002）与旧 HLS 播单；我们不要任何缓存。
+    private static func makeSessionConfig() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 12
         // 资源超时是最后防线（30s）；真正的总预算由 data() 里的 deadline 赛跑管，
@@ -418,7 +446,28 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         config.waitsForConnectivity = false
         config.httpCookieAcceptPolicy = .always
         config.httpShouldSetCookies = true
-        self.session = URLSession(configuration: config)
+        config.urlCache = nil
+        return config
+    }
+
+    private var session: URLSession
+    private let sessionLock = NSLock()
+    /// 上次建会话时的代理状态：代理开关 NWPathMonitor 捕捉不到，currentSession()
+    /// 前的检查是兜底（隧道内换节点不触发 path 回调，靠失败重试兜底）。
+    private var lastProxyState: ActiveSystemProxy
+    /// 网络世代：切网/代理变化时 +1，熔断器按世代清零（旧网的失败不污染新网）。
+    private var networkEpoch: UInt64 = 0
+    /// 传输熔断器：host → （跳闸世代，强制走 NWConnection 到期时间）。
+    private var breaker: [String: (epoch: UInt64, until: Date)] = [:]
+    /// 网络切换监听：接口变了（Wi-Fi↔蜂窝、VPN 开关）就清 Cookie，
+    /// 直连时沾上的 WAF 坏 Cookie 不许带到 VPN 后。
+    private let pathMonitor = NWPathMonitor()
+    private let pathMonitorQueue = DispatchQueue(label: "com.liudehen.xiaoshipin.netdiag.path")
+    private var lastPathSignature = ""
+
+    private init() {
+        self.session = URLSession(configuration: Self.makeSessionConfig())
+        self.lastProxyState = ActiveSystemProxy.current()
         pathMonitor.pathUpdateHandler = { [weak self] path in
             guard let self else { return }
             let signature = "wifi=\(path.usesInterfaceType(.wifi))|cell=\(path.usesInterfaceType(.cellular))|wired=\(path.usesInterfaceType(.wiredEthernet))|other=\(path.usesInterfaceType(.other))|ok=\(path.status == .satisfied)"
@@ -428,30 +477,222 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
             }
             if signature != self.lastPathSignature {
                 self.lastPathSignature = signature
-                self.resetCookies()
-                // 切网：DoH 解析出的 IP 与偏好表一起清空（新网络下
-                // 旧 IP 可能不可达，下一请求重新解析）。
-                DoHFallbackClient.shared.resetForNetworkChange()
+                self.handleNetworkTransition()
             }
         }
         pathMonitor.start(queue: pathMonitorQueue)
     }
 
+    /// 网络切换：世代 +1、熔断器清零、DoH 缓存清、会话轮换、Cookie 清。
+    /// 注意：隧道内换节点不改变接口签名，不触发这里——那种残留死连接靠
+    /// data() 里的复用重置重试（rotate + 重试一次）兜底。
+    private func handleNetworkTransition() {
+        sessionLock.lock()
+        networkEpoch &+= 1
+        breaker.removeAll()
+        sessionLock.unlock()
+        rotateSession()
+        resetCookies()
+        // 切网：DoH 解析出的 IP 与偏好表一起清空（新网络下
+        // 旧 IP 可能不可达，下一请求重新解析）。
+        DoHFallbackClient.shared.resetForNetworkChange()
+    }
+
+    /// 取当前会话：代理状态变了就轮换（代理开关不触发 path 回调）。
+    /// 轮换是原子的：旧会话 finishTasksAndInvalidate()，在途任务跑完才释放；
+    /// 并发请求不会互相打断。
+    private func currentSession() -> URLSession {
+        let nowProxy = ActiveSystemProxy.current()
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        if nowProxy != lastProxyState {
+            lastProxyState = nowProxy
+            networkEpoch &+= 1
+            breaker.removeAll()
+            rotateSessionLocked()
+        }
+        return session
+    }
+
+    private func rotateSession() {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        lastProxyState = ActiveSystemProxy.current()
+        rotateSessionLocked()
+    }
+
+    private func rotateSessionLocked() {
+        let old = session
+        session = URLSession(configuration: Self.makeSessionConfig())
+        old.finishTasksAndInvalidate()
+    }
+
     /// 清掉会话的 Cookie（网络切换后调；也可以手动调）。
     func resetCookies() {
-        session.configuration.httpCookieStorage?.removeCookies(since: .distantPast)
+        sessionLock.lock()
+        let s = session
+        sessionLock.unlock()
+        s.configuration.httpCookieStorage?.removeCookies(since: .distantPast)
+    }
+
+    // MARK: - 严格 URL 校验与错误分类
+
+    /// 严格 URL 校验（原生入口）：scheme 必须是 http/https、host 非空且不含
+    /// 空白/换行/反斜杠、整个 URL 不含 ASCII 控制字符（≤0x20 或 0x7F）。
+    /// iOS 17+ 的 URL(string:) 会接受 trim 后仍非法（如内部 \n、反斜杠、
+    /// 空 host）的字符串，那些进 URLSession 是 0ms -1002；这里直接拒掉，
+    /// 给出明确错误，不让它进诊断里冒充网络失败。
+    static func isStrictlyValidHTTPURL(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host, !host.isEmpty,
+              !host.contains(where: { $0.isWhitespace || $0.isNewline || $0 == "\\" })
+        else { return false }
+        return !url.absoluteString.unicodeScalars.contains(where: { $0.value <= 0x20 || $0.value == 0x7F })
+    }
+
+    /// 递归拆 NSUnderlyingErrorKey 链（去重防环），顶层错误在第一位。
+    static func underlyingErrorChain(_ error: NSError) -> [NSError] {
+        var result: [NSError] = []
+        var seen = Set<String>()
+        var current: NSError? = error
+        while let e = current {
+            let key = "\(e.domain):\(e.code)"
+            guard seen.insert(key).inserted else { break }
+            result.append(e)
+            current = e.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return result
+    }
+
+    /// 强制走 TCP/HTTP/1.1 的 host（已知 URLSession 在其上不可靠）：后缀匹配 +
+    /// 精确边界。泰国链跨两个 host：主站（页 + sign.bin）与 CDN（播单 + 分片）。
+    private static let forcedTransportHosts: Set<String> = ["thaiporntv.com", "web.techvids.top"]
+
+    private static func isForcedTransportHost(_ host: String?) -> Bool {
+        guard let host = host?.lowercased(), !host.isEmpty else { return false }
+        return forcedTransportHosts.contains { host == $0 || host.hasSuffix("." + $0) }
+    }
+
+    /// 熔断器是否跳闸（同世代 + 未过期）。
+    private func isBreakerTripped(host: String?) -> Bool {
+        guard let host = host?.lowercased(), !host.isEmpty else { return false }
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        guard let entry = breaker[host], entry.epoch == networkEpoch else { return false }
+        return entry.until > Date()
+    }
+
+    /// 跳闸：该 host 10 分钟内直降代理感知 NWConnection。
+    private func tripBreaker(host: String?) {
+        guard let host = host?.lowercased(), !host.isEmpty else { return }
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        breaker[host] = (epoch: networkEpoch, until: Date().addingTimeInterval(600))
+    }
+
+    /// 传输兜底资格：域 + 码双查（顶层 + underlying 链）。
+    /// 不进：-1002（URL/协议分发问题，见 -1002 守卫救援）、-999、CancellationError。
+    /// 进：原 6 个 URLError、POSIX 54/53/60/61/1、kCFHostErrorHostNotFound
+    ///（域必须是 kCFErrorDomainCFNetwork，数字 1 本身在不同域含义不同）。
+    /// POSIX 61/1 只是有条件可恢复（本地代理拒绝 ≠ 源站拒绝）：这里先按“进”
+    /// 处理，代理判定在调用方把关，直连被拒时原错返回。
+    private func isTransportFallbackEligible(_ error: Error) -> Bool {
+        if error is CancellationError { return false }
+        let chain = Self.underlyingErrorChain(error as NSError)
+        if chain.contains(where: {
+            $0.domain == NSURLErrorDomain &&
+            ($0.code == URLError.cancelled.rawValue || $0.code == URLError.unsupportedURL.rawValue)
+        }) {
+            return false
+        }
+        for e in chain {
+            if e.domain == NSURLErrorDomain {
+                switch e.code {
+                case URLError.timedOut.rawValue, URLError.cannotFindHost.rawValue,
+                     URLError.cannotConnectToHost.rawValue, URLError.networkConnectionLost.rawValue,
+                     URLError.dnsLookupFailed.rawValue, URLError.secureConnectionFailed.rawValue:
+                    return true
+                default:
+                    break
+                }
+            }
+            if e.domain == NSPOSIXErrorDomain {
+                switch e.code {
+                case Int(ECONNRESET), Int(ECONNABORTED), Int(ETIMEDOUT),
+                     Int(ECONNREFUSED), Int(EPERM):
+                    return true
+                default:
+                    break
+                }
+            }
+            if e.code == Int(kCFHostErrorHostNotFound),
+               e.domain == (kCFErrorDomainCFNetwork as String) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// 残留死 socket 重置：复用连接 + 重置类错误（POSIX 54/53 或 -1005）。
+    /// 隧道内换节点/代理切换后，旧池化连接就是这么死的；只轮换会话重试一次，
+    /// 不跳闸熔断器（host 本身没坏）。
+    private func isStaleSocketReset(error: Error, metrics: URLSessionTaskMetrics?) -> Bool {
+        guard metrics?.transactionMetrics.last?.isReusedConnection == true else { return false }
+        let chain = Self.underlyingErrorChain(error as NSError)
+        return chain.contains { e in
+            (e.domain == NSPOSIXErrorDomain && (e.code == Int(ECONNRESET) || e.code == Int(ECONNABORTED)))
+            || (e.domain == NSURLErrorDomain && e.code == URLError.networkConnectionLost.rawValue)
+        }
+    }
+
+    /// 该失败是否值得跳闸熔断器：h3 参与、EPERM、kCFHostErrorHostNotFound，
+    /// 或非复用连接的重置类失败。复用重置已走 rotate + 重试，不到这里。
+    private func shouldTripBreaker(error: Error, metrics: URLSessionTaskMetrics?) -> Bool {
+        let txs = metrics?.transactionMetrics ?? []
+        if txs.contains(where: { $0.networkProtocolName == "h3" }) { return true }
+        let chain = Self.underlyingErrorChain(error as NSError)
+        if chain.contains(where: { $0.domain == NSPOSIXErrorDomain && $0.code == Int(EPERM) }) { return true }
+        if chain.contains(where: {
+            $0.domain == (kCFErrorDomainCFNetwork as String) && $0.code == Int(kCFHostErrorHostNotFound)
+        }) { return true }
+        let reused = txs.last?.isReusedConnection ?? false
+        if !reused {
+            return chain.contains { e in
+                (e.domain == NSPOSIXErrorDomain && (e.code == Int(ECONNRESET) || e.code == Int(ECONNABORTED) || e.code == Int(ETIMEDOUT)))
+                || (e.domain == NSURLErrorDomain && e.code == URLError.networkConnectionLost.rawValue)
+            }
+        }
+        return false
+    }
+
+    /// -1002 守卫救援：URLSession 对通过严格校验的 URL 仍报 -1002（iOS 17
+    /// CFURL 怪癖、损坏的内存缓存重定向、坏 PAC 等）时才救一次；非法 URL
+    /// 早被入口校验拦下，绝不会走到这里。
+    private func isStrict1002Rescue(error: Error, request: URLRequest) -> Bool {
+        guard let url = request.url, Self.isStrictlyValidHTTPURL(url) else { return false }
+        let chain = Self.underlyingErrorChain(error as NSError)
+        return chain.contains { $0.domain == NSURLErrorDomain && $0.code == URLError.unsupportedURL.rawValue }
     }
 
     /// 发请求并采集 URLSessionTaskMetrics。
     /// timeout：单次请求总超时（秒，默认 12s，钳制在 3...30s）——这是真正的总预算，
     /// 用 deadline 任务赛跑实现；request.timeoutInterval 只作字节间空闲定时器，
     /// 慢速滴漏（tarpit）再也拖不到 25s。
+    /// 路由顺序：严格校验 → 强制 host/熔断 host（代理感知 NWConnection，
+    /// PAC-only 时回落 URLSession）→ DoH 偏好 host（仅无显式代理时）→
+    /// URLSession（残留 socket 一次重试）→ 传输兜底 / -1002 守卫救援。
     func data(
         for rawRequest: URLRequest,
         source: String,
         preservedHeaders: [String: String] = [:],
         timeout: TimeInterval? = nil
     ) async throws -> (Data, URLResponse) {
+        // 0. 严格 URL 校验（原生入口）：非法 URL 直接拒掉，不进 URLSession
+        // 冒充 -1002 网络失败。
+        guard let url = rawRequest.url, Self.isStrictlyValidHTTPURL(url) else {
+            throw URLError(.badURL)
+        }
         var request = rawRequest
         request.assumesHTTP3Capable = false
         request.allowsExpensiveNetworkAccess = true
@@ -462,81 +703,153 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
             request.timeoutInterval = 12
         }
         let totalDeadline = timeout ?? 12
+        let proxy = ActiveSystemProxy.current()
 
-        // DoH 偏好 host（之前走 DoH 成功过）：直接走 DoH，不再先浪费一次
-        // 系统 DNS（系统 DNS 给的是被污染的 Facebook IP，TCP 黑洞 12 秒）。
-        if DoHFallbackClient.shared.isDoHPreferred(for: request.url?.host),
-           let url = request.url, url.scheme?.lowercased() == "https" {
+        // 1. 强制 host（已知 URLSession 不可靠）与熔断 host：代理感知 NWConnection。
+        // PAC-only 时 NWConnection 执行不了 JS PAC，回落系统 URLSession。
+        // 只对 https（DoH 客户端只做 https；http 请求直接走 URLSession）。
+        if url.scheme?.lowercased() == "https",
+           Self.isForcedTransportHost(url.host) || isBreakerTripped(host: url.host) {
+            if proxy != .pacOnly {
+                return try await performViaProxyAwareTransport(
+                    request: request,
+                    source: source,
+                    preservedHeaders: preservedHeaders,
+                    timeout: totalDeadline,
+                    proxy: proxy
+                )
+            }
+        }
+
+        // 2. DoH 偏好 host（之前走 DoH 成功过）：仅无显式代理时直连 DoH；
+        // 代理开着时由代理做 DNS（远程解析本来就是干净的），走 URLSession。
+        //（系统 DNS 给的是被污染的 Facebook IP，TCP 黑洞 12 秒。）
+        if proxy == .none,
+           DoHFallbackClient.shared.isDoHPreferred(for: url.host),
+           url.scheme?.lowercased() == "https" {
             return try await performViaDoH(request: request, source: source, preservedHeaders: preservedHeaders, timeout: totalDeadline)
         }
 
-        let delegate = PerRequestDelegate(
-            originURL: request.url,
-            preservedHeaders: preservedHeaders
-        )
+        // 3. URLSession 尝试：残留 socket 一次重试 → 传输兜底 → -1002 守卫救援。
         let started = Date()
         // 网络类在请求开始时抓（完成时再读可能已经换网了）。
         let networkClassAtStart = PlaybackLedger.networkClass
-        do {
-            let (data, response): (Data, URLResponse) = try await withThrowingTaskGroup(of: (Data, URLResponse).self) { group in
-                group.addTask { try await self.session.data(for: request, delegate: delegate) }
-                group.addTask {
-                    try await Task.sleep(nanoseconds: UInt64(totalDeadline * 1_000_000_000))
-                    throw URLError(.timedOut)
+        var attempt = 0
+        while true {
+            let delegate = PerRequestDelegate(
+                originURL: request.url,
+                preservedHeaders: preservedHeaders
+            )
+            let remaining = max(3, totalDeadline - Date().timeIntervalSince(started))
+            do {
+                let (data, response) = try await runURLSessionOnce(
+                    request: request,
+                    delegate: delegate,
+                    timeout: remaining
+                )
+                let elapsedMs = Int(Date().timeIntervalSince(started) * 1000)
+                let event = NetworkDiagnostics.makeEvent(
+                    source: source,
+                    request: request,
+                    response: response,
+                    bodyData: data,
+                    error: nil,
+                    metrics: await delegate.takeMetricsSoon(),
+                    fallbackDurationMs: elapsedMs,
+                    networkClass: networkClassAtStart
+                )
+                NetworkDiagnostics.record(event)
+                return (data, response)
+            } catch {
+                let elapsedMs = Int(Date().timeIntervalSince(started) * 1000)
+                let metrics = await delegate.takeMetricsSoon()
+                let event = NetworkDiagnostics.makeEvent(
+                    source: source,
+                    request: request,
+                    response: nil,
+                    bodyData: nil,
+                    error: error,
+                    metrics: metrics,
+                    fallbackDurationMs: elapsedMs,
+                    networkClass: networkClassAtStart
+                )
+                NetworkDiagnostics.record(event)
+                // 残留死 socket：轮换会话重试一次，不跳闸（host 本身没坏）。
+                if attempt == 0, isStaleSocketReset(error: error, metrics: metrics) {
+                    attempt += 1
+                    rotateSession()
+                    continue
                 }
-                guard let first = try await group.next() else { throw URLError(.timedOut) }
-                group.cancelAll()
-                return first
+                // 系统 DNS/TCP/TLS/超时失败：传输兜底（只对 https + 有 host 的请求；
+                // HTTP 4xx/5xx 是服务端正常响应，不进 catch；离线/证书信任失败/
+                // 取消不走兜底，DoH 也救不了）。
+                if url.scheme?.lowercased() == "https",
+                   let host = url.host, !host.isEmpty,
+                   isTransportFallbackEligible(error) {
+                    if shouldTripBreaker(error: error, metrics: metrics) {
+                        tripBreaker(host: host)
+                    }
+                    if proxy != .pacOnly {
+                        return try await performViaProxyAwareTransport(
+                            request: request,
+                            source: source,
+                            preservedHeaders: preservedHeaders,
+                            timeout: totalDeadline,
+                            proxy: proxy
+                        )
+                    }
+                    throw error
+                }
+                // -1002 守卫救援：通过严格校验的 URL 仍报 -1002，救一次，不跳闸。
+                if isStrict1002Rescue(error: error, request: request), proxy != .pacOnly {
+                    return try await performViaProxyAwareTransport(
+                        request: request,
+                        source: source,
+                        preservedHeaders: preservedHeaders,
+                        timeout: totalDeadline,
+                        proxy: proxy
+                    )
+                }
+                throw error
             }
-            let elapsedMs = Int(Date().timeIntervalSince(started) * 1000)
-            let event = NetworkDiagnostics.makeEvent(
-                source: source,
-                request: request,
-                response: response,
-                bodyData: data,
-                error: nil,
-                metrics: await delegate.takeMetricsSoon(),
-                fallbackDurationMs: elapsedMs,
-                networkClass: networkClassAtStart
-            )
-            NetworkDiagnostics.record(event)
-            return (data, response)
-        } catch {
-            let elapsedMs = Int(Date().timeIntervalSince(started) * 1000)
-            let event = NetworkDiagnostics.makeEvent(
-                source: source,
-                request: request,
-                response: nil,
-                bodyData: nil,
-                error: error,
-                metrics: await delegate.takeMetricsSoon(),
-                fallbackDurationMs: elapsedMs,
-                networkClass: networkClassAtStart
-            )
-            NetworkDiagnostics.record(event)
-            // 系统 DNS/TCP/TLS/超时失败：DoH 兜底（只对 https + 有 host 的请求；
-            // HTTP 4xx/5xx 是服务端正常响应，不进 catch；离线/证书信任失败/
-            // 取消不走兜底，DoH 也救不了）。
-            if let url = request.url,
-               url.scheme?.lowercased() == "https",
-               let host = url.host, !host.isEmpty,
-               isDoHFallbackWorthy(error) {
-                return try await performViaDoH(request: request, source: source, preservedHeaders: preservedHeaders, timeout: totalDeadline)
-            }
-            throw error
         }
     }
 
-    /// 哪些失败值得走 DoH 兜底：DNS 查不到/污染、TCP 连不上/黑洞、
-    /// TLS 握手失败、超时。
-    private func isDoHFallbackWorthy(_ error: Error) -> Bool {
-        guard let urlErr = error as? URLError else { return false }
-        switch urlErr.code {
-        case .timedOut, .cannotFindHost, .cannotConnectToHost,
-             .networkConnectionLost, .dnsLookupFailed, .secureConnectionFailed:
-            return true
-        default:
-            return false
+    /// 单次 URLSession 尝试：deadline 赛跑（Task 取消立即取消底层任务，不滞留连接池）。
+    private func runURLSessionOnce(
+        request: URLRequest,
+        delegate: PerRequestDelegate,
+        timeout: TimeInterval
+    ) async throws -> (Data, URLResponse) {
+        let session = currentSession()
+        return try await withThrowingTaskGroup(of: (Data, URLResponse).self) { group in
+            group.addTask { try await session.data(for: request, delegate: delegate) }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                throw URLError(.timedOut)
+            }
+            guard let first = try await group.next() else { throw URLError(.timedOut) }
+            group.cancelAll()
+            return first
+        }
+    }
+
+    /// 代理感知 NWConnection：无代理时走 DoH 直连；显式代理时经代理协议；
+    /// PAC-only 不应调到这里（调用方已排除）。
+    private func performViaProxyAwareTransport(
+        request: URLRequest,
+        source: String,
+        preservedHeaders: [String: String],
+        timeout: TimeInterval,
+        proxy: ActiveSystemProxy
+    ) async throws -> (Data, URLResponse) {
+        switch proxy {
+        case .none:
+            return try await performViaDoH(request: request, source: source, preservedHeaders: preservedHeaders, timeout: timeout)
+        case .http, .socks5:
+            return try await performViaProxy(request: request, source: source, preservedHeaders: preservedHeaders, timeout: timeout, proxy: proxy)
+        case .pacOnly:
+            throw URLError(.unsupportedURL)
         }
     }
 
@@ -556,34 +869,61 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                 preservedHeaders: preservedHeaders,
                 timeout: timeout
             )
-            let elapsedMs = Int(Date().timeIntervalSince(started) * 1000)
-            let event = NetworkDiagnostics.makeEvent(
-                source: source,
-                request: request,
-                response: http,
-                bodyData: data,
-                error: nil,
-                metrics: nil,
-                fallbackDurationMs: elapsedMs,
-                networkClass: networkClassAtStart
-            )
-            NetworkDiagnostics.record(event)
+            recordTransportEvent(source: source, request: request, response: http, bodyData: data, error: nil, elapsedMs: Int(Date().timeIntervalSince(started) * 1000), networkClass: networkClassAtStart)
             return (data, http)
         } catch {
-            let elapsedMs = Int(Date().timeIntervalSince(started) * 1000)
-            let event = NetworkDiagnostics.makeEvent(
-                source: source,
-                request: request,
-                response: nil,
-                bodyData: nil,
-                error: error,
-                metrics: nil,
-                fallbackDurationMs: elapsedMs,
-                networkClass: networkClassAtStart
-            )
-            NetworkDiagnostics.record(event)
+            recordTransportEvent(source: source, request: request, response: nil, bodyData: nil, error: error, elapsedMs: Int(Date().timeIntervalSince(started) * 1000), networkClass: networkClassAtStart)
             throw error
         }
+    }
+
+    /// 经系统代理发请求（DoH 客户端 + ProxyConfiguration）：代理负责 DNS + TCP，
+    /// 成功不记 DoH 偏好（不是 DoH 的功劳），失败记一条诊断事件后把错抛回调用方。
+    private func performViaProxy(
+        request: URLRequest,
+        source: String,
+        preservedHeaders: [String: String],
+        timeout: TimeInterval,
+        proxy: ActiveSystemProxy
+    ) async throws -> (Data, URLResponse) {
+        let started = Date()
+        let networkClassAtStart = PlaybackLedger.networkClass
+        do {
+            let (data, http, _) = try await DoHFallbackClient.shared.perform(
+                request: request,
+                preservedHeaders: preservedHeaders,
+                timeout: timeout,
+                viaProxy: proxy
+            )
+            recordTransportEvent(source: source, request: request, response: http, bodyData: data, error: nil, elapsedMs: Int(Date().timeIntervalSince(started) * 1000), networkClass: networkClassAtStart)
+            return (data, http)
+        } catch {
+            recordTransportEvent(source: source, request: request, response: nil, bodyData: nil, error: error, elapsedMs: Int(Date().timeIntervalSince(started) * 1000), networkClass: networkClassAtStart)
+            throw error
+        }
+    }
+
+    /// 传输层（DoH/代理）尝试的诊断事件记录。
+    private func recordTransportEvent(
+        source: String,
+        request: URLRequest,
+        response: URLResponse?,
+        bodyData: Data?,
+        error: Error?,
+        elapsedMs: Int,
+        networkClass: String
+    ) {
+        let event = NetworkDiagnostics.makeEvent(
+            source: source,
+            request: request,
+            response: response,
+            bodyData: bodyData,
+            error: error,
+            metrics: nil,
+            fallbackDurationMs: elapsedMs,
+            networkClass: networkClass
+        )
+        NetworkDiagnostics.record(event)
     }
 }
 
@@ -632,6 +972,14 @@ private final class PerRequestDelegate: NSObject, URLSessionTaskDelegate, @unche
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
+        // 拒非 http(s) 重定向目标：直接交回 3xx 响应，别让 CFNetwork 对
+        // javascript:/file:///intent: 之类报 -1002。
+        guard let targetURL = request.url,
+              let scheme = targetURL.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            completionHandler(nil)
+            return
+        }
         var redirected = request
         redirected.assumesHTTP3Capable = false
         // 同源 = scheme + host + 端口全同：跨域或 HTTPS→HTTP 降级时，
@@ -641,7 +989,12 @@ private final class PerRequestDelegate: NSObject, URLSessionTaskDelegate, @unche
         for (key, value) in preservedHeaders {
             let lower = key.lowercased()
             if !sameOrigin && NetConstants.isSensitiveHeader(key) { continue }
-            if lower == "host" || lower == "content-length" { continue }
+            // Host/Content-Length 由 CFNetwork 自己管；跳步头（Connection/
+            // Transfer-Encoding/Keep-Alive/Proxy-Connection/Upgrade）上 H2/H3
+            // 会违反 RFC 9113/9114，直接 RST_STREAM。
+            if lower == "host" || lower == "content-length" || lower == "connection"
+                || lower == "transfer-encoding" || lower == "keep-alive"
+                || lower == "proxy-connection" || lower == "upgrade" { continue }
             if redirected.value(forHTTPHeaderField: key) == nil {
                 redirected.setValue(value, forHTTPHeaderField: key)
             }

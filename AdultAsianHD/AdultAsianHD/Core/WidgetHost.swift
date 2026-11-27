@@ -549,7 +549,7 @@ final class WidgetHost: @unchecked Sendable {
                             ok: res.status >= 200 && res.status < 300,
                             status: res.status,
                             headers: makeHeaders(res.headers),
-                            url: requestURL,
+                            url: (res.finalUrl ? res.finalUrl : requestURL),
                             text: function () { return Promise.resolve(textValue); },
                             json: function () {
                                 try {
@@ -589,7 +589,7 @@ final class WidgetHost: @unchecked Sendable {
                     if let taskID { httpRegistry.unregister(taskID) }
                 }
                 do {
-                    let (status, data, responseHeaders, rawData) = try await Self.fetchBridgeHTTP(
+                    let (status, data, responseHeaders, rawData, finalURL) = try await Self.fetchBridgeHTTP(
                         urlString: effectiveURL,
                         headers: headers,
                         timeout: timeout
@@ -600,6 +600,7 @@ final class WidgetHost: @unchecked Sendable {
                         result.setValue(status, forProperty: "status")
                         result.setValue(data, forProperty: "data")
                         result.setValue(JSValue(object: responseHeaders, in: ctx) ?? JSValue(newObjectIn: ctx)!, forProperty: "headers")
+                        result.setValue(finalURL, forProperty: "finalUrl")
                         if let buffer = WidgetHost.jsArrayBuffer(from: rawData, in: ctx) {
                             result.setValue(buffer, forProperty: "arrayBuffer")
                         }
@@ -652,7 +653,7 @@ final class WidgetHost: @unchecked Sendable {
                     if let taskID { httpRegistry.unregister(taskID) }
                 }
                 do {
-                    let (status, data, responseHeaders, rawData) = try await Self.fetchHTTP(
+                    let (status, data, responseHeaders, rawData, finalURL) = try await Self.fetchHTTP(
                         urlString: urlString,
                         method: "POST",
                         body: bodyData,
@@ -665,6 +666,7 @@ final class WidgetHost: @unchecked Sendable {
                         result.setValue(status, forProperty: "status")
                         result.setValue(data, forProperty: "data")
                         result.setValue(JSValue(object: responseHeaders, in: ctx) ?? JSValue(newObjectIn: ctx)!, forProperty: "headers")
+                        result.setValue(finalURL, forProperty: "finalUrl")
                         if let buffer = WidgetHost.jsArrayBuffer(from: rawData, in: ctx) {
                             result.setValue(buffer, forProperty: "arrayBuffer")
                         }
@@ -750,7 +752,7 @@ final class WidgetHost: @unchecked Sendable {
         body: Data? = nil,
         headers: [String: String],
         timeout: TimeInterval = 12
-    ) async throws -> (status: Int, data: Any, responseHeaders: [String: String], rawData: Data) {
+    ) async throws -> (status: Int, data: Any, responseHeaders: [String: String], rawData: Data, finalURL: String) {
         guard let url = URL(string: urlString) else {
             throw WidgetHostError.callFailed("链接格式不对：\(urlString)")
         }
@@ -768,7 +770,10 @@ final class WidgetHost: @unchecked Sendable {
             timeout: timeout
         )
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        return (status, httpDataObject(from: raw), responseHeaders(from: response), raw)
+        // finalUrl：重定向后的最终落点（URLSession 的 response.url 与 DoH 的
+        // 末跳 response.url 都是最终 URL）；javtiful 的钩子靠它切 R2 直链，
+        // 省掉 AVPlayer 在 mediaserverd 里重走 302 的 1–2 秒。
+        return (status, httpDataObject(from: raw), responseHeaders(from: response), raw, response.url?.absoluteString ?? "")
     }
 
     /// 桥里模块 GET 的统一入口（run #20）：
@@ -779,7 +784,7 @@ final class WidgetHost: @unchecked Sendable {
         urlString: String,
         headers: [String: String],
         timeout: TimeInterval
-    ) async throws -> (status: Int, data: Any, responseHeaders: [String: String], rawData: Data) {
+    ) async throws -> (status: Int, data: Any, responseHeaders: [String: String], rawData: Data, finalURL: String) {
         guard let bURL = WPQueryOptimizer.bRewrittenURL(for: urlString) else {
             return try await fetchHTTP(urlString: urlString, headers: headers, timeout: timeout)
         }
@@ -800,7 +805,7 @@ final class WidgetHost: @unchecked Sendable {
         urlString: String,
         headers: [String: String],
         timeout: TimeInterval
-    ) async throws -> (status: Int, data: Any, responseHeaders: [String: String], rawData: Data) {
+    ) async throws -> (status: Int, data: Any, responseHeaders: [String: String], rawData: Data, finalURL: String) {
         guard let url = URL(string: urlString) else {
             throw WidgetHostError.callFailed("链接格式不对：\(urlString)")
         }
@@ -812,7 +817,7 @@ final class WidgetHost: @unchecked Sendable {
         }
         let (raw, response) = try await WordPressHTTP.shared.fetch(request, source: "widget", timeout: timeout)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        return (status, httpDataObject(from: raw), responseHeaders(from: response), raw)
+        return (status, httpDataObject(from: raw), responseHeaders(from: response), raw, response.url?.absoluteString ?? "")
     }
 
     /// HTTPURLResponse.allHeaderFields 扁平成 [String: String]。

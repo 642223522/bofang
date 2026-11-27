@@ -1,6 +1,54 @@
 import Foundation
 import Network
 import Security
+import CFNetwork
+
+/// 系统代理状态（CFNetworkCopySystemProxySettings 字符串键；kCFNetworkProxiesHTTPSProxy
+/// 是 macOS-only，iOS 用字符串键）。显式 HTTP/SOCKS5 代理与包隧道 VPN 是两回事：
+/// 前者必须经代理协议连接，后者（Shadowrocket/Clash/Surge 的 Network Extension
+/// 隧道）下原始连接的包本就走 OS 路由进隧道，直连 IP 并不绕过隧道。
+enum ActiveSystemProxy: Equatable {
+    case none
+    case http(host: String, port: UInt16)
+    case socks5(host: String, port: UInt16)
+    case pacOnly(url: String)
+
+    static func current() -> ActiveSystemProxy {
+        guard let dict = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any] else {
+            return .none
+        }
+        if (dict["HTTPSEnable"] as? Int) == 1,
+           let host = dict["HTTPSProxy"] as? String, !host.isEmpty,
+           let port = dict["HTTPSPort"] as? Int, port > 0, port <= 65535 {
+            return .http(host: host, port: UInt16(port))
+        }
+        if (dict["HTTPEnable"] as? Int) == 1,
+           let host = dict["HTTPProxy"] as? String, !host.isEmpty,
+           let port = dict["HTTPPort"] as? Int, port > 0, port <= 65535 {
+            return .http(host: host, port: UInt16(port))
+        }
+        if (dict["SOCKSEnable"] as? Int) == 1,
+           let host = dict["SOCKSProxy"] as? String, !host.isEmpty,
+           let port = dict["SOCKSPort"] as? Int, port > 0, port <= 65535 {
+            return .socks5(host: host, port: UInt16(port))
+        }
+        if (dict["ProxyAutoConfigEnable"] as? Int) == 1,
+           let pac = dict["ProxyAutoConfigURLString"] as? String, !pac.isEmpty {
+            return .pacOnly(url: pac)
+        }
+        return .none
+    }
+
+    /// 诊断用的短标签（不含敏感信息）。
+    var label: String {
+        switch self {
+        case .none: return "none"
+        case .http: return "http-proxy"
+        case .socks5: return "socks5-proxy"
+        case .pacOnly: return "pac"
+        }
+    }
+}
 
 /// 无节点 DNS 污染兜底客户端（如 huangguoai.com 系统 DNS 污染到 66.220.147.11）：
 /// 1) DoH 解析商链（`resolvers` 表，顺序可配）：Google 8.8.8.8/8.8.4.4 →
@@ -115,10 +163,14 @@ final class DoHFallbackClient: @unchecked Sendable {
     }
 
     /// 走 DoH 解析商链解析并直连 IP 发 HTTPS 请求（最多跟随 5 次重定向）。
+    /// viaProxy：系统显式代理开着时传 .http/.socks5——每跳改走代理（代理负责
+    /// DNS + TCP，不做 DoH 解析、不记 DoH 偏好）；nil / .none 时走原 DoH 直连
+    /// 逻辑。.pacOnly 不应传进来（PAC 下走 URLSession，见调用方）。
     func perform(
         request rawRequest: URLRequest,
         preservedHeaders: [String: String],
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        viaProxy: ActiveSystemProxy? = nil
     ) async throws -> (data: Data, response: HTTPURLResponse, remoteIP: String) {
         var currentReq = rawRequest
         let originURL = rawRequest.url
@@ -128,55 +180,88 @@ final class DoHFallbackClient: @unchecked Sendable {
                   let host = url.host, !host.isEmpty else {
                 throw URLError(.badURL)
             }
-            let ips = await resolveIPs(host: host)
-            guard !ips.isEmpty else { throw URLError(.cannotFindHost) }
+            let perHopTimeout = min(max(timeout / 2, 4), 10)
+            let hop: (data: Data, response: HTTPURLResponse, remoteIP: String)
+            if let proxy = viaProxy, proxy != .none, proxy != .pacOnly {
+                // 经系统代理：不解析 DoH、不记偏好；代理做 DNS + TCP。
+                let res = try await fetchSingleHopViaProxy(
+                    url: url,
+                    host: host,
+                    proxy: proxy,
+                    request: currentReq,
+                    timeout: perHopTimeout
+                )
+                hop = (res.0, res.1, proxy.label)
+            } else {
+                let ips = await resolveIPs(host: host)
+                guard !ips.isEmpty else { throw URLError(.cannotFindHost) }
 
-            var lastError: Error = URLError(.cannotConnectToHost)
-            var succeeded: (Data, HTTPURLResponse, String)?
-            for ip in ips.prefix(4) {
-                if Task.isCancelled { throw CancellationError() }
-                do {
-                    let perIPTimeout = min(max(timeout / 2, 4), 10)
-                    let res = try await fetchSingleHop(
-                        url: url,
-                        host: host,
-                        ip: ip,
-                        request: currentReq,
-                        timeout: perIPTimeout
-                    )
-                    succeeded = (res.0, res.1, ip)
-                    markDoHPreferred(host: host)
-                    break
-                } catch {
-                    lastError = error
-                    continue
+                var lastError: Error = URLError(.cannotConnectToHost)
+                var succeeded: (Data, HTTPURLResponse, String)?
+                for ip in ips.prefix(4) {
+                    if Task.isCancelled { throw CancellationError() }
+                    do {
+                        let res = try await fetchSingleHop(
+                            url: url,
+                            host: host,
+                            ip: ip,
+                            request: currentReq,
+                            timeout: perHopTimeout
+                        )
+                        succeeded = (res.0, res.1, ip)
+                        markDoHPreferred(host: host)
+                        break
+                    } catch {
+                        lastError = error
+                        continue
+                    }
                 }
+                guard let s = succeeded else { throw lastError }
+                hop = s
             }
-            guard let (data, http, ip) = succeeded else { throw lastError }
 
             // 处理 301/302/303/307/308 重定向
-            if [301, 302, 303, 307, 308].contains(http.statusCode),
-               let location = http.value(forHTTPHeaderField: "Location"),
-               let nextURL = URL(string: location, relativeTo: url)?.absoluteURL {
-                // 只有 303 强制转 GET；301/302 保持原方法（RFC 7231：301/302 的
-                // 方法保留是允许的，POST 301/302 转 GET 是历史遗留行为，
-                // 对签名 POST（如黄果现铸）转 GET 会丢 body 导致失败）。
-                var nextReq = URLRequest(url: nextURL)
-                nextReq.httpMethod = (http.statusCode == 303) ? "GET" : (currentReq.httpMethod ?? "GET")
-                if nextReq.httpMethod != "GET" { nextReq.httpBody = currentReq.httpBody }
-                let sameOrigin = NetConstants.isSameOrigin(originURL, nextURL)
-                for (k, v) in preservedHeaders {
-                    let lower = k.lowercased()
-                    if !sameOrigin && NetConstants.isSensitiveHeader(k) { continue }
-                    if lower == "host" || lower == "content-length" { continue }
-                    nextReq.setValue(v, forHTTPHeaderField: k)
-                }
+            if let nextReq = Self.redirectRequest(
+                after: hop.response,
+                from: currentReq,
+                originURL: originURL,
+                preservedHeaders: preservedHeaders
+            ) {
                 currentReq = nextReq
                 continue
             }
-            return (data, http, ip)
+            return hop
         }
         throw URLError(.httpTooManyRedirects)
+    }
+
+    /// 3xx 重定向的下一跳请求（301/302/303/307/308 + Location）：无重定向返回 nil。
+    /// 只有 303 强制转 GET；301/302 保持原方法（RFC 7231：301/302 的方法保留是
+    /// 允许的，POST 301/302 转 GET 是历史遗留行为，对签名 POST（如黄果现铸）
+    /// 转 GET 会丢 body 导致失败）。跨域时凭据头不跟过去；Host/Content-Length 永不复制。
+    private static func redirectRequest(
+        after http: HTTPURLResponse,
+        from currentReq: URLRequest,
+        originURL: URL?,
+        preservedHeaders: [String: String]
+    ) -> URLRequest? {
+        guard [301, 302, 303, 307, 308].contains(http.statusCode),
+              let location = http.value(forHTTPHeaderField: "Location"),
+              let url = currentReq.url,
+              let nextURL = URL(string: location, relativeTo: url)?.absoluteURL else {
+            return nil
+        }
+        var nextReq = URLRequest(url: nextURL)
+        nextReq.httpMethod = (http.statusCode == 303) ? "GET" : (currentReq.httpMethod ?? "GET")
+        if nextReq.httpMethod != "GET" { nextReq.httpBody = currentReq.httpBody }
+        let sameOrigin = NetConstants.isSameOrigin(originURL, nextURL)
+        for (k, v) in preservedHeaders {
+            let lower = k.lowercased()
+            if !sameOrigin && NetConstants.isSensitiveHeader(k) { continue }
+            if lower == "host" || lower == "content-length" { continue }
+            nextReq.setValue(v, forHTTPHeaderField: k)
+        }
+        return nextReq
     }
 
     // MARK: - DoH 解析商链（Google → Cloudflare → Ali → DNSPod，逐家问，第一家给有效答案即停）
@@ -273,6 +358,49 @@ final class DoHFallbackClient: @unchecked Sendable {
     /// 单跳 HTTPS 请求（直连 IP 字面量 + SNI + 真实证书校验 + HTTP/1.1）。
     /// internal（非 private）：StagedNetworkProbe 的直连 IP 探针复用同一条
     /// HTTP 栈，探针测的就是业务侧实际走的路径。
+    /// TLS 选项：显式 SNI = 目标域名 + ALPN http/1.1 + 按目标真实域名校验证书
+    ///（而非 IP 字面量）。verify block 跑在独立 queue 上（与连接 queue 分开也无妨）。
+    private func makeTLSOptions(host: String) -> NWProtocolTLS.Options {
+        let tlsOpts = NWProtocolTLS.Options()
+        sec_protocol_options_set_tls_server_name(tlsOpts.securityProtocolOptions, host)
+        sec_protocol_options_add_tls_application_protocol(tlsOpts.securityProtocolOptions, "http/1.1")
+        let verifyQueue = DispatchQueue(label: "com.liudehen.xiaoshipin.doh.tlsverify")
+        sec_protocol_options_set_verify_block(tlsOpts.securityProtocolOptions, { _, secTrust, complete in
+            let trust = sec_trust_copy_ref(secTrust).takeRetainedValue()
+            let policy = SecPolicyCreateSSL(true, host as CFString)
+            SecTrustSetPolicies(trust, policy)
+            let ok = SecTrustEvaluateWithError(trust, nil)
+            complete(ok)
+        }, verifyQueue)
+        return tlsOpts
+    }
+
+    /// 带代理配置的 NWParameters（iOS 17+）：HTTP/SOCKS5 代理时把 ProxyConfiguration
+    /// 挂到 PrivacyContext 上，连接目标 hostname（代理负责 DNS + TCP）；直连/PAC
+    /// 时不挂代理（PAC 走 URLSession，NWParameters 执行不了 JS PAC）。
+    private func makeHTTP11TLSParameters(sniHost: String, proxy: ActiveSystemProxy) -> NWParameters {
+        let tlsOpts = makeTLSOptions(host: sniHost)
+        let params = NWParameters(tls: tlsOpts, tcp: NWProtocolTCP.Options())
+        switch proxy {
+        case .http(let host, let port):
+            // 端口已在 ActiveSystemProxy.current() 里验过 1...65535，不会为 nil。
+            let endpoint = NWEndpoint.hostPort(host: .init(host), port: .init(rawValue: port)!)
+            let cfg = ProxyConfiguration(httpCONNECTProxy: endpoint)
+            let ctx = NWParameters.PrivacyContext(description: "SystemHTTPProxy")
+            ctx.proxyConfigurations = [cfg]
+            params.setPrivacyContext(ctx)
+        case .socks5(let host, let port):
+            let endpoint = NWEndpoint.hostPort(host: .init(host), port: .init(rawValue: port)!)
+            let cfg = ProxyConfiguration(socksv5Proxy: endpoint)
+            let ctx = NWParameters.PrivacyContext(description: "SystemSOCKS5Proxy")
+            ctx.proxyConfigurations = [cfg]
+            params.setPrivacyContext(ctx)
+        case .none, .pacOnly:
+            break
+        }
+        return params
+    }
+
     func fetchSingleHop(
         url: URL,
         host: String,
@@ -285,22 +413,53 @@ final class DoHFallbackClient: @unchecked Sendable {
             throw URLError(.badURL)
         }
         let wireData = buildHTTP11Request(url: url, host: host, request: request)
-        let queue = DispatchQueue(label: "com.liudehen.xiaoshipin.doh.conn.\(UUID().uuidString)")
-
-        let tlsOpts = NWProtocolTLS.Options()
-        sec_protocol_options_set_tls_server_name(tlsOpts.securityProtocolOptions, host)
-        sec_protocol_options_add_tls_application_protocol(tlsOpts.securityProtocolOptions, "http/1.1")
-        // 按目标真实域名校验证书（而非 IP 字面量）
-        sec_protocol_options_set_verify_block(tlsOpts.securityProtocolOptions, { _, secTrust, complete in
-            let trust = sec_trust_copy_ref(secTrust).takeRetainedValue()
-            let policy = SecPolicyCreateSSL(true, host as CFString)
-            SecTrustSetPolicies(trust, policy)
-            let ok = SecTrustEvaluateWithError(trust, nil)
-            complete(ok)
-        }, queue)
-
+        let tlsOpts = makeTLSOptions(host: host)
         let params = NWParameters(tls: tlsOpts, tcp: NWProtocolTCP.Options())
-        let conn = NWConnection(host: NWEndpoint.Host(ip), port: nwPort, using: params)
+        let rawResponse = try await driveConnection(
+            endpoint: .hostPort(host: .init(ip), port: nwPort),
+            params: params,
+            wireData: wireData,
+            timeout: timeout
+        )
+        return try parseHTTP11Response(rawResponse, url: url)
+    }
+
+    /// 经系统代理的单跳 HTTPS（HTTP CONNECT / SOCKS5）：NWConnection 连目标
+    /// hostname（代理负责 DNS + TCP），TLS + ALPN http/1.1 在代理隧道内完成，
+    /// 零 H3、零绕代理。PAC-only 时不走这里（NWParameters 执行不了 JS PAC）。
+    func fetchSingleHopViaProxy(
+        url: URL,
+        host: String,
+        proxy: ActiveSystemProxy,
+        request: URLRequest,
+        timeout: TimeInterval
+    ) async throws -> (Data, HTTPURLResponse) {
+        let portNum = UInt16(url.port ?? 443)
+        guard let nwPort = NWEndpoint.Port(rawValue: portNum) else {
+            throw URLError(.badURL)
+        }
+        let wireData = buildHTTP11Request(url: url, host: host, request: request)
+        let params = makeHTTP11TLSParameters(sniHost: host, proxy: proxy)
+        let rawResponse = try await driveConnection(
+            endpoint: .hostPort(host: .name(host, nil), port: nwPort),
+            params: params,
+            wireData: wireData,
+            timeout: timeout
+        )
+        return try parseHTTP11Response(rawResponse, url: url)
+    }
+
+    /// 驱动一条 NWConnection：发 wireData、收完整个响应体、超时取消。
+    /// fetchSingleHop（直连 IP）与 fetchSingleHopViaProxy（经系统代理）共用，
+    /// 逻辑与旧 fetchSingleHop 内联版逐行一致，只抽出来复用。
+    private func driveConnection(
+        endpoint: NWEndpoint,
+        params: NWParameters,
+        wireData: Data,
+        timeout: TimeInterval
+    ) async throws -> Data {
+        let queue = DispatchQueue(label: "com.liudehen.xiaoshipin.doh.conn.\(UUID().uuidString)")
+        let conn = NWConnection(to: endpoint, using: params)
 
         final class ConnBox: @unchecked Sendable {
             private let lock = NSLock()
@@ -331,7 +490,7 @@ final class DoHFallbackClient: @unchecked Sendable {
         let box = ConnBox()
         box.connection = conn
 
-        let rawResponse: Data = try await withTaskCancellationHandler {
+        return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { cont in
                 box.set(cont)
                 if Task.isCancelled {
@@ -386,8 +545,6 @@ final class DoHFallbackClient: @unchecked Sendable {
         } onCancel: {
             box.finish(.failure(CancellationError()))
         }
-
-        return try parseHTTP11Response(rawResponse, url: url)
     }
 
     private func buildHTTP11Request(url: URL, host: String, request: URLRequest) -> Data {
