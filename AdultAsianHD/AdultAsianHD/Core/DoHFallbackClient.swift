@@ -162,8 +162,9 @@ final class DoHFallbackClient: @unchecked Sendable {
     /// 解析/请求绝不把旧 IP 写进新网的缓存与偏好表。
     private var networkGeneration: UInt64 = 0
 
-    /// 当前网络世代（lock 内读）。
-    private func currentGeneration() -> UInt64 {
+    /// 当前网络世代（lock 内读）。internal：performViaDoH 要在调 perform()
+    /// 前抓世代给 markDoHPreferred 做围栏（R6-2）。
+    func currentGeneration() -> UInt64 {
         lock.lock()
         defer { lock.unlock() }
         return networkGeneration
@@ -254,14 +255,16 @@ final class DoHFallbackClient: @unchecked Sendable {
         return preferredHosts.contains(host)
     }
 
-    /// DoH 偏好版本号快照（R5-5）：调用方在 performViaDoH 前抓，失败时
-    /// 凭它条件撤销。nil = 该 host 当前无偏好（不用撤销）。
-    func doHPreferenceSnapshot(for host: String?) -> UInt64? {
+    /// DoH 偏好快照（R5-5/R6-1）：调用方在 performViaDoH 前抓，失败时
+    /// 凭它条件撤销。nil = 该 host 当前无偏好（不用撤销）。世代 + 版本号
+    /// 在同一把锁内一次抓全——分开抓会有 ABA：reset 后重标会让版本号
+    /// 回到旧值（或恰好相同），旧快照误撤销新偏好。
+    func doHPreferenceSnapshot(for host: String?) -> (generation: UInt64, revision: UInt64)? {
         guard let host = host?.lowercased(), !host.isEmpty else { return nil }
         lock.lock()
         defer { lock.unlock() }
         guard preferredHosts.contains(host) else { return nil }
-        return preferredRevision[host, default: 0]
+        return (networkGeneration, preferredRevision[host, default: 0])
     }
 
     /// 原子围栏记偏好（R4-10）：同一把锁内校验 generation == expected 再插入——
@@ -276,16 +279,16 @@ final class DoHFallbackClient: @unchecked Sendable {
         preferredRevision[key, default: 0] &+= 1
     }
 
-    /// 撤销某 host 的 DoH 偏好（R4-4/R5-5）：DoH 一挂就摘掉，下次请求重新走
+    /// 撤销某 host 的 DoH 偏好（R4-4/R5-5/R6-1）：DoH 一挂就摘掉，下次请求重新走
     /// URLSession（偏好一旦建立永不撤销，会让一个站持续失败到切网）。
-    /// 只在版本号与调用方快照一致时删——快照之后若有并发请求成功重标了
-    /// 偏好（版本号已 +1），这次撤销是陈旧的，直接跳过。撤销成功时
-    /// 版本号也 +1，让更早的快照同样失效。
-    func removeDoHPreferred(host: String?, ifRevision expected: UInt64) {
+    /// 只在世代 + 版本号与调用方快照都一致时删——快照之后若有并发请求成功
+    /// 重标了偏好（版本号已 +1）或切了网（世代已 +1），这次撤销是陈旧的，
+    /// 直接跳过。撤销成功时版本号也 +1，让更早的快照同样失效。
+    func removeDoHPreferred(host: String?, ifGeneration expectedGeneration: UInt64, ifRevision expectedRevision: UInt64) {
         guard let host = host?.lowercased(), !host.isEmpty else { return }
         lock.lock()
         defer { lock.unlock() }
-        guard preferredRevision[host, default: 0] == expected else { return }
+        guard networkGeneration == expectedGeneration, preferredRevision[host, default: 0] == expectedRevision else { return }
         preferredHosts.remove(host)
         preferredRevision[host, default: 0] &+= 1
     }
@@ -294,6 +297,13 @@ final class DoHFallbackClient: @unchecked Sendable {
     /// viaProxy：系统显式代理开着时传 .http/.socks5——每跳改走代理（代理负责
     /// DNS + TCP，不做 DoH 解析、不记 DoH 偏好）；nil / .none 时走原 DoH 直连
     /// 逻辑。.pacOnly 不应传进来（PAC 下走 URLSession，见调用方）。
+    /// 包装契约（R6-12）：已收到响应头后 body 失败、或之前某跳已响应而后续
+    /// 跳失败时，抛 DoHResponseStartedFailure（原错在 underlying 里）。
+    /// 调用方必须 catch 它并解包成 underlying——绝不可当作普通失败重发
+    ///（非幂等请求会被复制）。包装绝不漏出 data() 边界：performViaDoH /
+    /// performViaProxy 在 preserveResponseStarted == false 时已解包；
+    /// 只有 Branch 1/2 在 preserveResponseStarted == true 时短暂持有它，
+    /// 且都在各自的 catch 里解包后重抛原错。
     func perform(
         request rawRequest: URLRequest,
         preservedHeaders: [String: String],
@@ -302,9 +312,6 @@ final class DoHFallbackClient: @unchecked Sendable {
     ) async throws -> (data: Data, response: HTTPURLResponse, remoteIP: String) {
         var currentReq = rawRequest
         let originURL = rawRequest.url
-        // R3-6：入口捕获网络世代；记 DoH 偏好前重新核对，变了就跳过这次
-        // 标记（不抛错——在途请求可能还能通；只是不污染新网的偏好表）。
-        let generation = currentGeneration()
         // 请求内 cookie jar：跳转时把上跳的 Set-Cookie 带到下跳（Cloudflare
         // 的 cf_clearance 就靠这个不断挑战循环；jar 只活在这一次请求里，
         // 不进共享存储，跨请求不持久化）。
@@ -319,6 +326,11 @@ final class DoHFallbackClient: @unchecked Sendable {
         if timeout <= 0 { throw URLError(.timedOut) }
         let absoluteDeadline = Date().addingTimeInterval(timeout)
         let remaining: () -> TimeInterval = { max(0, absoluteDeadline.timeIntervalSinceNow) }
+        // R6-9：多跳里只要任一跳收到过响应（哪怕只是 302），本次请求就
+        // 算已开始——后续跳建连失败时不能当作“没收到头”重发（非幂等
+        // POST 会被复制）。单跳内的 responseStarted 只覆盖本跳，
+        // sawResponse 覆盖跨跳。
+        var sawResponse = false
         for _ in 0..<6 {
             guard let url = currentReq.url,
                   url.scheme?.lowercased() == "https",
@@ -345,26 +357,42 @@ final class DoHFallbackClient: @unchecked Sendable {
                     // 代理标签不是 IP——返回空串，展示层空值即“经代理”。
                     hop = (res.0, res.1, "", res.2)
                 } catch let failure as DoHTransportFailure {
-                    // R5-4e：与 IP 循环一致——已收到响应头后 body 失败时包着原错
+                    // R5-4e/R6-9：与 IP 循环一致——已收到响应头后 body 失败时包着原错
                     // 抛（DoHResponseStartedFailure），让外层知道不可重发；
-                    // 未收到头时仍解包抛原错（R3-2：classify() 要看原错）。
-                    if failure.responseStarted { throw DoHResponseStartedFailure(underlying: failure.underlying) }
+                    // 之前某跳已响应过也一样（sawResponse）。未收到头时仍解包
+                    // 抛原错（R3-2：classify() 要看原错）。
+                    if failure.responseStarted || sawResponse { throw DoHResponseStartedFailure(underlying: failure.underlying) }
                     throw failure.underlying
                 }
             } else {
                 // F13：解析失败分三种信号，不再一律 .cannotFindHost。
+                // R6-9d：解析失败也可能发生在已响应过的重定向之后——
+                // 之前某跳已响应（sawResponse）时，解析失败同样算已开始，
+                // 包着抛，不可重发；取消原样抛，不包。
                 let ips: [String]
-                switch try await resolveIPs(host: host, deadline: absoluteDeadline) {
-                case .resolved(let resolvedIPs):
-                    ips = resolvedIPs
-                case .nxdomain:
-                    throw DoHResolutionError.nxdomain(host: host)
-                case .resolversUnreachable:
-                    throw DoHResolutionError.resolversUnreachable(host: host)
-                case .allCandidatesRejected:
-                    throw DoHResolutionError.allCandidatesRejected(host: host)
+                do {
+                    switch try await resolveIPs(host: host, deadline: absoluteDeadline) {
+                    case .resolved(let resolvedIPs):
+                        ips = resolvedIPs
+                    case .nxdomain:
+                        throw DoHResolutionError.nxdomain(host: host)
+                    case .resolversUnreachable:
+                        throw DoHResolutionError.resolversUnreachable(host: host)
+                    case .allCandidatesRejected:
+                        throw DoHResolutionError.allCandidatesRejected(host: host)
+                    }
+                } catch {
+                    if error is CancellationError { throw error }
+                    if sawResponse { throw DoHResponseStartedFailure(underlying: error) }
+                    throw error
                 }
-                guard !ips.isEmpty else { throw URLError(.cannotFindHost) }
+                guard !ips.isEmpty else {
+                    // R6-9e（复审补）：空 IP 列表也可能发生在已响应过的重定向之后——
+                    // 之前某跳已响应（sawResponse）时算已开始，包着抛，不可重发。
+                    let err = URLError(.cannotFindHost)
+                    if sawResponse { throw DoHResponseStartedFailure(underlying: err) }
+                    throw err
+                }
 
                 var lastError: Error = URLError(.cannotConnectToHost)
                 var succeeded: (Data, HTTPURLResponse, String, [String])?
@@ -385,13 +413,17 @@ final class DoHFallbackClient: @unchecked Sendable {
                             timeout: min(perIPTimeout, remaining())
                         )
                         succeeded = (res.0, res.1, ip, res.2)
-                        markDoHPreferred(host: host, ifGeneration: generation)
+                        // R6-2：perform() 内不再记偏好——逐跳记会把本次请求
+                        // 的版本号顶上去，导致本次失败时外层条件撤销静默失效。
+                        // 偏好只由 performViaDoH 在整次 perform() 成功后记一次。
                         break
                     } catch let failure as DoHTransportFailure {
-                        // F4/R5-4：该 IP 已收到最终响应头，body 失败不再换 IP；
+                        // F4/R5-4/R6-9：该 IP 已收到最终响应头，body 失败不再换 IP；
                         // 用 DoHResponseStartedFailure 包着原错抛，让外层 data()
                         // 知道已收到头、不可回退重发（原错仍在 underlying 里）。
-                        if failure.responseStarted { throw DoHResponseStartedFailure(underlying: failure.underlying) }
+                        // 之前某跳已响应过（sawResponse）也一样——本跳没收到头
+                        // 不代表请求没开始。
+                        if failure.responseStarted || sawResponse { throw DoHResponseStartedFailure(underlying: failure.underlying) }
                         lastError = failure.underlying
                         continue
                     } catch {
@@ -399,9 +431,18 @@ final class DoHFallbackClient: @unchecked Sendable {
                         continue
                     }
                 }
-                guard let s = succeeded else { throw lastError }
+                // R6-9b：本跳全 IP 失败，但之前某跳已响应过——算已开始，
+                // 包着原错抛，不可重发。取消原样抛，不包（与 R6-9d 同一原则）。
+                guard let s = succeeded else {
+                    if lastError is CancellationError { throw lastError }
+                    if sawResponse { throw DoHResponseStartedFailure(underlying: lastError) }
+                    throw lastError
+                }
                 hop = s
             }
+            // R6-9：本跳已收到响应（成功即收到头 + body），记下来——
+            // 下一跳建连失败时仍算已开始，不可重发。
+            sawResponse = true
 
             // 本跳的 Set-Cookie 收进 jar（每条原始头行单独解析——
             // parseHTTP11Response 的 [String: String] 会丢多值）。
@@ -557,16 +598,17 @@ final class DoHFallbackClient: @unchecked Sendable {
                 // R4-1：只删与 jar 条目 (name, domain, path) 身份相同的对——
                 // 不同 path/domain 的种子保留（同名不同 path 是两个合法 cookie，
                 // 按裸 name 全删会把种子的 sid=root 连同 jar 的 sid=admin 一起丢掉）。
-                // R5-1：域级 jar 条目（Domain=.thaiporntv.com）还覆盖同名同 path
-                // 且域名在其域范围内的对——Cookie 头不带 Domain 元数据，种子
+                // R5-1/R6-3：域级 jar 条目（Domain=.thaiporntv.com）还覆盖同名同 path
+                // 且域名在其域范围内的种子对——Cookie 头不带 Domain 元数据，种子
                 // 的域只是原始 host，父域新值就是同一 cookie 的更新值；不覆盖
                 // 会把旧值排在新值前面发出去（服务端读第一个，仍是旧值）。
+                // 域级覆盖只对种子（R6-3）：子域 jar 条目是独立 cookie，不删。
                 let jarDomain = Self.normalizedCookieDomain(entry.cookie.domain)
                 merged.removeAll {
                     guard $0.name == entry.cookie.name, $0.path == entry.cookie.path else { return false }
                     let mergedDomain = Self.normalizedCookieDomain($0.domain)
                     if mergedDomain == jarDomain { return true }
-                    return !entry.hostOnly && mergedDomain.hasSuffix("." + jarDomain)
+                    return $0.isSeed && !entry.hostOnly && mergedDomain.hasSuffix("." + jarDomain)
                 }
                 merged.append((
                     name: entry.cookie.name,
@@ -626,16 +668,19 @@ final class DoHFallbackClient: @unchecked Sendable {
         return d
     }
 
-    /// 过期键是否删种子 cookie（R4-3/R5-8，种子专用——全代码只有 redirectRequest
+    /// 过期键是否删种子 cookie（R4-3/R5-8/R6-10，种子专用——全代码只有 redirectRequest
     /// 的种子删除一个调用点；Set-Cookie 循环用身份 remove/insert，不走这里）。
-    /// 种子永远是 host-only：domain-scope（Domain=）的过期键不删种子；
-    /// domain 精确相等；path 精确相等——种子建模为 Path="/"，只有 Path="/"
-    /// 的删除键才删它。path 匹配决定 cookie“发不发给某路径”，不是“某 path
-    /// 的删除删不删另一 path 的 cookie”（Path=/app 的删除删的是 /app 的
-    /// cookie，不是 / 的种子；拿 nextURL.path 当身份是错的）。
+    /// 域名匹配与 R5-1 的域级覆盖一致：精确相等，或过期键是 domain-scope
+    /// （Domain=）且种子域名在其域范围内。种子没有域元数据（域只是原始
+    /// host），父域或同域的 Domain= 删除就是删它；host-only 要求是错的
+    ///（R5-8 的 hostOnly 守卫把 Domain= 的删除全挡掉了）。
+    /// path 精确相等——种子建模为 Path="/"，只有 Path="/" 的删除键才删它。
     private static func expiredKeyAppliesToSeed(_ key: ExpiredCookieKey, name: String, domain: String) -> Bool {
-        guard key.name == name, key.hostOnly else { return false }
-        guard Self.normalizedCookieDomain(domain) == key.domain else { return false }
+        guard key.name == name else { return false }
+        let seedDomain = Self.normalizedCookieDomain(domain)
+        let domainMatches = seedDomain == key.domain
+            || (!key.hostOnly && seedDomain.hasSuffix("." + key.domain))
+        guard domainMatches else { return false }
         return key.path == "/"
     }
 
