@@ -190,7 +190,8 @@ final class NetworkDiagnostics: ObservableObject {
         let http = (response as? HTTPURLResponse) ?? (tx?.response as? HTTPURLResponse)
         let statusCode = http?.statusCode
         // 重定向时 host/path 按最终落点记（tx 是最后一跳），原始 host 另存 originalHost。
-        let finalURL = tx?.request.url ?? request.url
+        // DoH/代理路径没有 metrics（tx 为 nil），最终 URL 从响应里取（F17）。
+        let finalURL = tx?.request.url ?? response?.url ?? request.url
         let originalHost: String? = {
             let o = request.url?.host, f = finalURL?.host
             return (o != nil && o != f) ? o : nil
@@ -227,11 +228,12 @@ final class NetworkDiagnostics: ObservableObject {
         let enrichedSummary: String? = {
             guard let error else { return summary }
             let nsErr = error as NSError
-            // code 1 必须先判域是 NSURLErrorDomain：CancellationError 的
-            // NSError 码也是 1（域是 Swift.CancellationError），不判域会把
-            // 取消误标成需要详情的 -1002/code 1 失败，metrics 又是 nil → tx=0 假象。
-            let needsDetail = nsErr.domain == NSURLErrorDomain
-                && (nsErr.code == URLError.unsupportedURL.rawValue || nsErr.code == 1)
+            // F8：NSURLErrorDomain 的码全是负数，+1 在该域里不存在——27c1c34
+            // 把 code==1 限到 NSURLErrorDomain 等于关掉了真正的 CFNetwork
+            // code 1 补强。真正的 +1 是 kCFErrorDomainCFNetwork 域的
+            // kCFHostErrorHostNotFound（DNS 解析失败），必须按域分开判。
+            let needsDetail = (nsErr.domain == NSURLErrorDomain && nsErr.code == URLError.unsupportedURL.rawValue)
+                || (nsErr.domain == (kCFErrorDomainCFNetwork as String) && nsErr.code == Self.cfHostErrorHostNotFound)
             guard needsDetail else { return summary }
             var parts: [String] = []
             if let failing = nsErr.userInfo[NSURLErrorFailingURLStringErrorKey] as? String,
@@ -289,6 +291,23 @@ final class NetworkDiagnostics: ObservableObject {
         error: Error?
     ) -> (NetworkDiagPhase, String?) {
         if let error {
+            // F13：DoH 解析失败分三种信号（NXDOMAIN / 解析商全不可达 /
+            // 答案全被污染过滤拒绝），不再一律判成 .cannotFindHost 的 DNS 失败。
+            if let dohErr = error as? DoHResolutionError {
+                switch dohErr {
+                case .nxdomain:
+                    return (.dns, "DNS 域名不存在 (NXDOMAIN)")
+                case .resolversUnreachable:
+                    return (.dns, "DoH 解析商均未返回可用 A 记录")
+                case .allCandidatesRejected:
+                    return (.dns, "DoH 解析答案全部被污染过滤拒绝")
+                }
+            }
+            // F16：Swift CancellationError 不是 URLError（.cancelled 码只认
+            // URLError）：不先判这里会被 inferPhaseFromMetrics 标成 unknown。
+            if error is CancellationError {
+                return (.cancelled, "请求被取消")
+            }
             let nsErr = error as NSError
             if let urlErr = error as? URLError {
                 switch urlErr.code {
@@ -455,7 +474,7 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
 
     private var session: URLSession
     private let sessionLock = NSLock()
-    /// 上次建会话时的代理状态：代理开关 NWPathMonitor 捕捉不到，currentSession()
+    /// 上次建会话时的代理状态：代理开关 NWPathMonitor 捕捉不到，resolveSessionLocked()
     /// 前的检查是兜底（隧道内换节点不触发 path 回调，靠失败重试兜底）。
     private var lastProxyState: ActiveSystemProxy
     /// 网络世代：切网/代理变化时 +1，熔断器按世代清零（旧网的失败不污染新网）。
@@ -472,7 +491,11 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
     private let pathMonitor = NWPathMonitor()
     private let pathMonitorQueue = DispatchQueue(label: "com.liudehen.xiaoshipin.netdiag.path")
     private var lastPathSignature = ""
-    /// 路径去抖：接口抖动时只排一次轮换（~1 秒内多次变化合并成一次）。
+    /// 上次已落地的路径签名（F10）：去抖窗口内抖回去（Wi-Fi→蜂窝→Wi-Fi）
+    /// 时，debounced 的 work item 带的签名与它相同，直接跳过，不触发轮换。
+    /// 只在 pathMonitorQueue 上读写。
+    private var lastSettledPathSignature = ""
+    /// 路径去抖：接口抖动时只排一次轮换（~0.5 秒内多次变化合并成一次）。
     /// 只在 pathMonitorQueue 上读写（path 回调的串行队列）。
     private var pathDebounceWorkItem: DispatchWorkItem?
 
@@ -494,64 +517,80 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         pathMonitor.start(queue: pathMonitorQueue)
     }
 
-    /// 去抖调度：1 秒内再有变化就取消重排，只执行最后一次。
+    /// 去抖调度：0.5 秒内再有变化就取消重排，只执行最后一次。
+    /// work item 里带上调度当时的路径签名，执行时若与上次已落地的签名相同
+    /// 则跳过（F10：窗口内抖回去不触发轮换）。
     private func scheduleNetworkTransition() {
         pathDebounceWorkItem?.cancel()
+        let signature = lastPathSignature
         let item = DispatchWorkItem { [weak self] in
-            self?.handleNetworkTransition()
+            self?.handleNetworkTransition(settledSignature: signature)
         }
         pathDebounceWorkItem = item
-        pathMonitorQueue.asyncAfter(deadline: .now() + 1.0, execute: item)
+        pathMonitorQueue.asyncAfter(deadline: .now() + 0.5, execute: item)
     }
 
     /// 网络切换：世代 +1、熔断器清零、DoH 缓存清、会话轮换、Cookie 清。
     /// 注意：隧道内换节点不改变接口签名，不触发这里——那种残留死连接靠
     /// data() 里的复用重置重试（rotate + 重试一次）兜底。
-    private func handleNetworkTransition() {
+    /// F10：epoch+1、breaker 清空、清 Cookie、轮换（preserveCookies: false，
+    /// 新 session 用空 Cookie Storage）在一次 sessionLock 内完成——
+    /// 否则并发的 makeDataTask 可能在清与轮换之间插进来，
+    /// 把未清的 Cookie 拷进新会话，清 Cookie 的动作就被架空了。
+    private func handleNetworkTransition(settledSignature: String) {
+        // 窗口内抖回去了：签名与上次已落地的相同，不触发轮换。
+        guard settledSignature != lastSettledPathSignature else { return }
+        lastSettledPathSignature = settledSignature
         sessionLock.lock()
         networkEpoch &+= 1
         breaker.removeAll()
+        // 先清当前会话的 Cookie 再轮换（轮换不继承 Cookie）。
+        session.configuration.httpCookieStorage?.removeCookies(since: .distantPast)
+        rotateSessionLocked(preserveCookies: false)
         sessionLock.unlock()
-        // 先清旧会话的 Cookie 再轮换：轮换会把旧 jar 拷进新会话（见
-        // rotateSessionLocked），不清就把直连时沾上的 WAF 坏 Cookie
-        // 带到新网络了；旧代码是先轮换后清，清的是刚建好的空会话（无效）。
-        resetCookies()
-        rotateSession()
         // 切网：DoH 解析出的 IP 与偏好表一起清空（新网络下
         // 旧 IP 可能不可达，下一请求重新解析）。
         DoHFallbackClient.shared.resetForNetworkChange()
     }
 
-    /// 取当前会话：代理状态变了就轮换（代理开关不触发 path 回调）。
-    /// 轮换是原子的：旧会话 finishTasksAndInvalidate()，在途任务跑完才释放；
-    /// 并发请求不会互相打断。
-    private func currentSession() -> URLSession {
+    /// 锁内解析当前 session（代理变化时轮换，与旧 currentSession() 同一套
+    /// 判定）。调用方必须已持有 sessionLock；F7 的 makeDataTask 在同一把
+    /// 锁内解析 session 并建任务，建任务与轮换之间插不进一次 rotate。
+    private func resolveSessionLocked() -> URLSession {
         let nowProxy = ActiveSystemProxy.current()
-        sessionLock.lock()
-        defer { sessionLock.unlock() }
         if nowProxy != lastProxyState {
             lastProxyState = nowProxy
             networkEpoch &+= 1
             breaker.removeAll()
-            rotateSessionLocked()
+            // F9：代理变化触发的轮换不清 Cookie 不行——代理后的网络与之前
+            // 是不同出口，直连时沾上的 WAF 坏 Cookie 不能带过去；同时清 DoH 缓存。
+            rotateSessionLocked(preserveCookies: false)
+            DoHFallbackClient.shared.resetForNetworkChange()
         }
         return session
     }
 
-    private func rotateSession() {
+    private func rotateSession(preserveCookies: Bool = true) {
         sessionLock.lock()
         defer { sessionLock.unlock() }
         lastProxyState = ActiveSystemProxy.current()
-        rotateSessionLocked()
+        rotateSessionLocked(preserveCookies: preserveCookies)
     }
 
-    private func rotateSessionLocked() {
+    private func rotateSessionLocked(preserveCookies: Bool) {
         let old = session
         // 轮换保留 Cookie：ephemeral 会话一轮换就丢掉全部 host 的 Cookie，
         // WAF 通行证（如 cf_clearance）没了就得重新过墙；只拷未过期的。
+        // preserveCookies == false 时新 session 用空 Cookie Storage
+        //（代理变化 / 网络切换：旧网的 Cookie 不许带到新网）。
         // 在途任务可能随后又写 Cookie，那几条丢了也无妨（下次请求重建）。
-        let carriedCookies = (old.configuration.httpCookieStorage?.cookies ?? [])
-            .filter { $0.expiresDate == nil || $0.expiresDate! > Date() }
+        let carriedCookies: [HTTPCookie]
+        if preserveCookies {
+            carriedCookies = (old.configuration.httpCookieStorage?.cookies ?? [])
+                .filter { $0.expiresDate == nil || $0.expiresDate! > Date() }
+        } else {
+            carriedCookies = []
+        }
         let newConfig = Self.makeSessionConfig()
         if let storage = newConfig.httpCookieStorage {
             for cookie in carriedCookies {
@@ -563,11 +602,12 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
     }
 
     /// 清掉会话的 Cookie（网络切换后调；也可以手动调）。
+    /// F10：清理时全程持锁——先抓 session 再解锁清的做法会让并发轮换
+    /// 把未清的 Cookie 拷进新会话。
     func resetCookies() {
         sessionLock.lock()
-        let s = session
-        sessionLock.unlock()
-        s.configuration.httpCookieStorage?.removeCookies(since: .distantPast)
+        defer { sessionLock.unlock() }
+        session.configuration.httpCookieStorage?.removeCookies(since: .distantPast)
     }
 
     // MARK: - 严格 URL 校验与错误分类
@@ -818,7 +858,7 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                 return (data, response)
             } catch {
                 let elapsedMs = Int(Date().timeIntervalSince(started) * 1000)
-                let metrics = await delegate.takeMetricsSoon()
+                let metrics = await delegate.takeMetricsSoon(for: error)
                 let event = NetworkDiagnostics.makeEvent(
                     source: source,
                     request: request,
@@ -830,18 +870,39 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                     networkClass: networkClassAtStart
                 )
                 NetworkDiagnostics.record(event)
+                // F11：剩余预算守门——<= 0.2s 时直接重抛原错，不重试、不 fallback、
+                // 不写假 DoH 事件、不跳闸（-1002 救援与 TTFB 保护在它之前判，
+                // 它们不依赖预算；下面的重试/fallback 路径共用这一道门）。
+                let remainingNow = deadline.timeIntervalSinceNow
+                // F12：-1002 救援先于 TTFB 保护判——-1002 是 URL 问题，不是传输
+                // 问题，不应被“已收到响应头”拦住。预算不够时不救，直接抛原错。
+                if isStrict1002Rescue(error: error, request: request), !proxy.isPACOnly {
+                    guard remainingNow > 0.2 else { throw error }
+                    return try await performViaProxyAwareTransport(
+                        request: request,
+                        source: source,
+                        preservedHeaders: preservedHeaders,
+                        timeout: max(0, remainingNow),
+                        proxy: proxy
+                    )
+                }
+                // F2：响应已开始（收到过任何一跳响应头）后再失败：不再回退到 DoH
+                // 传输——CDN 已应答、body 慢、被总超时杀掉时，兜底只会把请求踢进
+                // 另一条坏掉的路（jav.pub 那几条 0.6s TTFB 却 -1001 的记录
+                // 就是这么来的）。信号是 metrics 的全部 transaction
+                //（任一 transaction 的 responseStartDate 非空即算已收到响应头；
+                // completion-handler 任务的数据回调不走 task.delegate，
+                // delegate 标记这条路走不通，不再用它）。原错直接抛回，不跳闸熔断器。
+                let receivedAnyResponse = metrics?.transactionMetrics.contains { $0.responseStartDate != nil } ?? false
+                if receivedAnyResponse {
+                    throw error
+                }
+                guard remainingNow > 0.2 else { throw error }
                 // 残留死 socket：轮换会话重试一次，不跳闸（host 本身没坏）。
                 if attempt == 0, isStaleSocketReset(error: error, metrics: metrics) {
                     attempt += 1
                     rotateSession()
                     continue
-                }
-                // 响应已开始（收到响应头）后再失败：不再回退到 DoH 传输——
-                // CDN 已应答、body 慢、被总超时杀掉时，兜底只会把请求踢进
-                // 另一条坏掉的路（jav.pub 那几条 0.6s TTFB 却 -1001 的记录
-                // 就是这么来的）。原错直接抛回，不跳闸熔断器。
-                if metrics?.transactionMetrics.last?.responseStartDate != nil {
-                    throw error
                 }
                 // 系统 DNS/TCP/TLS/超时失败：传输兜底（只对 https + 有 host 的请求；
                 // HTTP 4xx/5xx 是服务端正常响应，不进 catch；离线/证书信任失败/
@@ -863,62 +924,75 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                     }
                     throw error
                 }
-                // -1002 守卫救援：通过严格校验的 URL 仍报 -1002，救一次，不跳闸。
-                if isStrict1002Rescue(error: error, request: request), !proxy.isPACOnly {
-                    return try await performViaProxyAwareTransport(
-                        request: request,
-                        source: source,
-                        preservedHeaders: preservedHeaders,
-                        timeout: max(0, deadline.timeIntervalSinceNow),
-                        proxy: proxy
-                    )
-                }
                 throw error
             }
         }
     }
 
-    /// 单次 URLSession 尝试：deadline 赛跑（Task 取消立即取消底层任务，不滞留连接池）。
+    /// 单次 URLSession 尝试：deadline 赛跑（超时/取消立即取消底层任务，不滞留连接池）。
     /// 旧实现用 withThrowingTaskGroup 赛跑——超时方先返回时，作用域退出还要
     /// 等被取消的 URLSession 子任务排空，12 秒超时能拖到 26 秒（run #33 回归）。
-    /// 这里用非结构化 worker + 锁保护的一次性完成盒：超时立即恢复调用方，
-    /// 不等 worker 慢慢死；PerRequestDelegate 照旧经 session.data(for:delegate:)
-    /// 挂（直接 dataTask 拿不到 per-task delegate，见 ChatGPT R2）。
+    /// 27c1c34 改成非结构化 worker + RaceBox，但 worker 里调 session.data(for:delegate:)
+    /// 仍有崩溃竞态：worker 取 session 与 async 取数之间若有轮换调用
+    /// finishTasksAndInvalidate()，async  machinery 与失效的会话抢状态会崩。
+    /// 这里改成同步建 dataTask（completion handler 调 box.finish）：建任务与
+    /// 会话解析在同一把 sessionLock 内完成（makeDataTask），建好后再轮换也
+    /// 安全——finishTasksAndInvalidate 只等在途任务跑完，不杀已建好的任务。
+    /// PerRequestDelegate（重定向拦截、metrics）经 task.delegate
+    /// 继续工作（task 级 delegate 方法会走到它；数据走 completion handler）。
     private func runURLSessionOnce(
         request: URLRequest,
         delegate: PerRequestDelegate,
         timeout: TimeInterval
     ) async throws -> (Data, URLResponse) {
-        let session = currentSession()
         let box = URLSessionRaceBox()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation {
                 (continuation: CheckedContinuation<(Data, URLResponse), Error>) in
-                box.installContinuation(continuation)
-                let worker = Task {
-                    do {
-                        let result = try await session.data(
-                            for: request,
-                            delegate: delegate
-                        )
-                        box.finish(.success(result), cancelWorker: false)
-                    } catch {
-                        box.finish(.failure(error), cancelWorker: false)
-                    }
-                }
-                box.installWorker(worker)
+                // F25：已 finish（父任务在进 continuation 前已被取消，onCancel
+                // 先跑）时 installContinuation 返回 false 并已把 pending 结果
+                // 补恢复——直接返回，什么都不创建、不排计时器。
+                guard box.installContinuation(continuation) else { return }
+                let task = makeDataTask(request: request, delegate: delegate, box: box)
+                box.installTask(task)
                 let timer = DispatchWorkItem {
-                    box.finish(.failure(URLError(.timedOut)), cancelWorker: true)
+                    box.finish(.failure(URLError(.timedOut)), cancelTask: true)
                 }
                 box.installTimer(timer)
                 DispatchQueue.global(qos: .utility).asyncAfter(
                     deadline: .now() + max(0, timeout),
                     execute: timer
                 )
+                task.resume()
             }
         } onCancel: {
-            box.finish(.failure(CancellationError()), cancelWorker: true)
+            box.finish(.failure(CancellationError()), cancelTask: true)
         }
+    }
+
+    /// 在 sessionLock 保护下解析当前 session（走 resolveSessionLocked 的代理
+    /// 判定）并同步创建 dataTask：delegate 挂 task 上，completion 里调 box.finish。
+    /// 建任务与轮换之间不能插进一次 rotate，否则任务挂在旧会话上还被
+    /// finishTasksAndInvalidate 拖住（F7 的崩溃竞态）。
+    private func makeDataTask(
+        request: URLRequest,
+        delegate: PerRequestDelegate,
+        box: URLSessionRaceBox
+    ) -> URLSessionDataTask {
+        sessionLock.lock()
+        let s = resolveSessionLocked()
+        let task = s.dataTask(with: request) { data, response, error in
+            if let error {
+                box.finish(.failure(error), cancelTask: false)
+            } else if let data, let response {
+                box.finish(.success((data, response)), cancelTask: false)
+            } else {
+                box.finish(.failure(URLError(.badServerResponse)), cancelTask: false)
+            }
+        }
+        task.delegate = delegate
+        sessionLock.unlock()
+        return task
     }
 
     /// 代理感知 NWConnection：无代理时走 DoH 直连；显式代理时经代理协议；
@@ -974,7 +1048,6 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         proxy: ActiveSystemProxy
     ) async throws -> (Data, URLResponse) {
         let started = Date()
-        let networkClassAtStart = PlaybackLedger.networkClass
         do {
             let (data, http, _) = try await DoHFallbackClient.shared.perform(
                 request: request,
@@ -982,10 +1055,13 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                 timeout: timeout,
                 viaProxy: proxy
             )
-            recordTransportEvent(source: source, request: request, response: http, bodyData: data, error: nil, elapsedMs: Int(Date().timeIntervalSince(started) * 1000), networkClass: networkClassAtStart)
+            // F18：明确经代理，网络类别直接记 "proxy"，不要依赖
+            // PlaybackLedger.networkClass 或 metrics 推断（NWConnection 路径
+            // 没有 metrics，tx 为 nil 时类别会被记错）。
+            recordTransportEvent(source: source, request: request, response: http, bodyData: data, error: nil, elapsedMs: Int(Date().timeIntervalSince(started) * 1000), networkClass: "proxy")
             return (data, http)
         } catch {
-            recordTransportEvent(source: source, request: request, response: nil, bodyData: nil, error: error, elapsedMs: Int(Date().timeIntervalSince(started) * 1000), networkClass: networkClassAtStart)
+            recordTransportEvent(source: source, request: request, response: nil, bodyData: nil, error: error, elapsedMs: Int(Date().timeIntervalSince(started) * 1000), networkClass: "proxy")
             throw error
         }
     }
@@ -1014,7 +1090,7 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
     }
 }
 
-/// runURLSessionOnce 的一次性完成盒（ChatGPT R2）：worker / 定时器 / 父取消
+/// runURLSessionOnce 的一次性完成盒（ChatGPT R2）：dataTask / 定时器 / 父取消
 /// 三路抢一个 continuation，只恢复一次；先到的结果在 continuation 还没装好
 /// 时暂存 pending，装好立刻补恢复。锁保护全部状态，调用方超时不等 worker 排空。
 private final class URLSessionRaceBox: @unchecked Sendable {
@@ -1024,27 +1100,39 @@ private final class URLSessionRaceBox: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: Completion?
     private var pending: Result<Output, Error>?
-    private var worker: Task<Void, Never>?
+    private var task: URLSessionTask?
     private var timer: DispatchWorkItem?
     private var finished = false
 
-    func installContinuation(_ value: Completion) {
+    /// 装 continuation；已 finish 时返回 false（调用方什么都不创建直接返回）。
+    /// false 时 pending 里的结果已在这里补恢复，continuation 不会悬空。
+    @discardableResult
+    func installContinuation(_ value: Completion) -> Bool {
         lock.lock()
-        let result = pending
-        if result == nil {
-            continuation = value
+        if finished {
+            let result = pending
+            lock.unlock()
+            if let result {
+                value.resume(with: result)
+            } else {
+                // 防御：finished 但 pending 为空不应发生（finish 总是把结果
+                // 写进 pending）；真发生了也别让 continuation 永久挂住。
+                value.resume(throwing: CancellationError())
+            }
+            return false
         }
+        continuation = value
         lock.unlock()
-        if let result {
-            value.resume(with: result)
-        }
+        return true
     }
 
-    func installWorker(_ value: Task<Void, Never>) {
+    /// 存 dataTask；已 finish 时立即取消它（调用方在 install 后 resume，
+    /// 已取消的任务 resume 后会立刻以 -999 完成，completion 里 finish 是 no-op）。
+    func installTask(_ value: URLSessionTask) {
         lock.lock()
         let cancel = finished
         if !cancel {
-            worker = value
+            task = value
         }
         lock.unlock()
         if cancel {
@@ -1064,7 +1152,9 @@ private final class URLSessionRaceBox: @unchecked Sendable {
         }
     }
 
-    func finish(_ result: Result<Output, Error>, cancelWorker: Bool) {
+    /// 完成：超时/取消时 cancelTask == true，同步取消底层 URLSessionTask
+    ///（F7：dataTask 的 cancel 是同步的，不像 async worker 那样要等排空）。
+    func finish(_ result: Result<Output, Error>, cancelTask: Bool) {
         lock.lock()
         guard !finished else {
             lock.unlock()
@@ -1073,8 +1163,8 @@ private final class URLSessionRaceBox: @unchecked Sendable {
         finished = true
         let continuation = self.continuation
         self.continuation = nil
-        let worker = self.worker
-        self.worker = nil
+        let task = self.task
+        self.task = nil
         let timer = self.timer
         self.timer = nil
         if continuation == nil {
@@ -1082,8 +1172,8 @@ private final class URLSessionRaceBox: @unchecked Sendable {
         }
         lock.unlock()
         timer?.cancel()
-        if cancelWorker {
-            worker?.cancel()
+        if cancelTask {
+            task?.cancel()
         }
         continuation?.resume(with: result)
     }
@@ -1094,6 +1184,9 @@ private final class PerRequestDelegate: NSObject, URLSessionTaskDelegate, @unche
     private let preservedHeaders: [String: String]
     private let lock = NSLock()
     private var metrics: URLSessionTaskMetrics?
+    // 注意：不要加 URLSessionDataDelegate 做 TTFB 标记——completion-handler
+    // 任务的数据回调（didReceive）由内部 delegate 接管，不会走到 task.delegate，
+    // 标记永远置不了位；TTFB 只靠 metrics 的 responseStartDate（见 F2）。
 
     init(originURL: URL?, preservedHeaders: [String: String]) {
         self.originURL = originURL
@@ -1107,13 +1200,16 @@ private final class PerRequestDelegate: NSObject, URLSessionTaskDelegate, @unche
     }
 
     /// 取消/超时时 didFinishCollecting 可能还没跑：用脱离取消上下文的 detached 任务
-    /// 等一小会儿（最多 ~300ms），把超时请求的 DNS/TCP/TLS 停滞指标也拿回来；
-    /// 已有 metrics 时立即返回，不多等。
-    func takeMetricsSoon() async -> URLSessionTaskMetrics? {
+    /// 等一小会儿（最多 ~150ms，F26：metrics 还负责 TTFB 判定，
+    /// 150ms 足够它到；不再等 300ms），把超时请求的 DNS/TCP/TLS 停滞指标也拿回来；
+    /// 已有 metrics 时立即返回，不多等。错误是 CancellationError 时同步拿现有的，
+    /// 不等（取消了就别拖着调用方）。
+    func takeMetricsSoon(for error: Error? = nil) async -> URLSessionTaskMetrics? {
         if let m = takeMetrics() { return m }
+        if error is CancellationError { return nil }
         return await Task.detached { [weak self] in
             guard let self else { return nil }
-            for _ in 0..<12 {
+            for _ in 0..<6 {
                 if let m = self.takeMetrics() { return m }
                 try? await Task.sleep(nanoseconds: 25_000_000)
             }
@@ -1197,7 +1293,8 @@ enum WordPressHTTPError: Error, LocalizedError {
 ///   （JSON 接口绝不该返回 HTML）；挑战不重试、不当 JSON、不当空列表；
 /// - 单次可控重试：429 遵 Retry-After（最多等 10 秒）重试 1 次；
 ///   5xx/超时退避 1 秒重试 1 次；挑战用断路器（同一 host 60 秒内直接报，不再发请求）；
-/// - 请求合并：同一 URL 在途时只发一次，后到的等同一结果；按等待者计数取消，
+/// - 请求合并：同一 method+URL+请求头+timeout 在途时只发一次，后到的等同一结果；
+///   按 waiter id 幂等释放（等待者取消只摘自己的 id，不直接断底层），
 ///   最后一个等待者走光才取消底层请求；
 /// - 底层仍是 DiagnosticHTTPClient（长寿命 URLSession + URLSessionTaskMetrics，
 ///   不另起会话；metrics 由它记进 NetworkDiagnostics）。
@@ -1207,7 +1304,9 @@ final class WordPressHTTP: @unchecked Sendable {
     private let lock = NSLock()
     private struct InFlight {
         var task: Task<(Data, HTTPURLResponse), Error>
-        var waiters: Int
+        /// 在途等待者 id 集合（waiter 取消时按 id 幂等释放，保证每个 waiter
+        /// 只减一次；计数归零时才取消底层 Task）。
+        var waiterIDs: Set<UUID>
     }
     private var inFlight: [String: InFlight] = [:]
     /// 断路器：host → 上次撞挑战的时间（60 秒内不再发请求）。
@@ -1220,30 +1319,43 @@ final class WordPressHTTP: @unchecked Sendable {
 
     private init() {}
 
-    /// 挑战判定：cf-mitigated 响应头含 challenge，或 Content-Type 是 text/html。
-    /// 只认这两个信号（规范定死）；body 不参与判定。
+    /// 挑战判定（G1，收紧）：cf-mitigated 含 challenge 即挑战；或
+    /// 403/503 + Content-Type 含 text/html + Cloudflare 信号（cf-ray 头
+    /// 或 server 头含 cloudflare）。WP 自身 500 HTML 错误页、nginx 默认页、
+    /// 维护页不再误判成挑战（以前任意 text/html 都算挑战并开 60 秒断路器）。
+    /// 其余一律不当挑战，走正常的 429/5xx 重试或直接返回响应。
     static func isChallenge(response: URLResponse?) -> Bool {
         guard let http = response as? HTTPURLResponse else { return false }
         if let mitigated = http.value(forHTTPHeaderField: "cf-mitigated")?.lowercased(),
            mitigated.contains("challenge") {
             return true
         }
-        if let contentType = http.value(forHTTPHeaderField: "Content-Type")?.lowercased(),
-           contentType.contains("text/html") {
-            return true
-        }
+        let status = http.statusCode
+        guard status == 403 || status == 503 else { return false }
+        guard let contentType = http.value(forHTTPHeaderField: "Content-Type")?.lowercased(),
+              contentType.contains("text/html") else { return false }
+        if http.value(forHTTPHeaderField: "cf-ray") != nil { return true }
+        if let server = http.value(forHTTPHeaderField: "server")?.lowercased(),
+           server.contains("cloudflare") { return true }
         return false
     }
 
     /// 发一个 WordPress GET（调用方已拼好 URL 与请求头；只用于 GET）。
     /// 返回原始 body 与 HTTP 响应；挑战/断路器抛 WordPressHTTPError。
+    /// 请求合并 key = method + URL + 影响响应的请求头 + timeout（F27/G2：
+    /// 不同头、不同方法、不同 timeout 的请求不合并）。
+    /// 等待者取消：裸 `await task.value` 不会因等待者被取消而抛错（Grok 最小
+    /// 复现钉死），所以包进 withTaskCancellationHandler，onCancel 里按 waiter
+    /// id 幂等 release；onCancel 只做 release、不直接 cancel 底层（可能还有
+    /// 别的 waiter 在等），只有最后一个 waiter 离开时才 cancel 底层。
     func fetch(_ request: URLRequest, source: String, timeout: TimeInterval = 12) async throws -> (Data, HTTPURLResponse) {
         guard let url = request.url else { throw URLError(.badURL) }
-        let key = url.absoluteString
+        let key = Self.dedupKey(for: request, timeout: timeout)
+        let waiterID = UUID()
         let task: Task<(Data, HTTPURLResponse), Error>
         lock.lock()
         if var entry = inFlight[key] {
-            entry.waiters += 1
+            entry.waiterIDs.insert(waiterID)
             inFlight[key] = entry
             task = entry.task
             lock.unlock()
@@ -1251,28 +1363,46 @@ final class WordPressHTTP: @unchecked Sendable {
             let created = Task<(Data, HTTPURLResponse), Error> {
                 try await self.perform(request, source: source, timeout: timeout)
             }
-            inFlight[key] = InFlight(task: created, waiters: 1)
+            inFlight[key] = InFlight(task: created, waiterIDs: [waiterID])
             task = created
             lock.unlock()
         }
         do {
-            let result = try await task.value
-            release(key: key)
+            let result = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                self.release(key: key, waiterID: waiterID)
+            }
+            release(key: key, waiterID: waiterID)
             return result
         } catch {
-            release(key: key)
+            release(key: key, waiterID: waiterID)
             throw error
         }
     }
 
-    /// 一个等待者离开：在途表里减数；减到 0 就从表里摘掉并取消底层请求
+    /// 去重 key：method + URL + 影响响应的请求头（全部请求头按小写名排序后
+    /// 拼起来；Cookie/Authorization/自定义头不同 → 不同响应，不能合并；
+    /// 合并方向只求不错合，不过合只是少省一次请求）+ timeout。
+    private static func dedupKey(for request: URLRequest, timeout: TimeInterval) -> String {
+        let method = request.httpMethod ?? "GET"
+        let url = request.url?.absoluteString ?? ""
+        let headers = (request.allHTTPHeaderFields ?? [:])
+            .sorted(by: { $0.key.lowercased() < $1.key.lowercased() })
+            .map { "\($0.key.lowercased())=\($0.value)" }
+            .joined(separator: "&")
+        return "\(method) \(url) | \(headers) | timeout=\(timeout)"
+    }
+
+    /// 一个等待者离开：按 waiter id 从集合里摘掉（已摘过则 no-op，保证
+    /// 每个 waiter 只减一次）；减到 0 就从表里摘掉并取消底层请求
     ///（还有等待者时底层请求继续跑，不因某一路取消而断）。
-    private func release(key: String) {
+    private func release(key: String, waiterID: UUID) {
         lock.lock()
         defer { lock.unlock() }
         guard var entry = inFlight[key] else { return }
-        entry.waiters -= 1
-        if entry.waiters <= 0 {
+        guard entry.waiterIDs.remove(waiterID) != nil else { return }
+        if entry.waiterIDs.isEmpty {
             inFlight.removeValue(forKey: key)
             entry.task.cancel()
         } else {
@@ -1281,8 +1411,25 @@ final class WordPressHTTP: @unchecked Sendable {
     }
 
     /// 真正发请求（含单次可控重试）。断路器打开时直接报，不发请求。
+    /// F6：一本 deadline——429/5xx/超时重试与 Retry-After/退避全部消耗
+    /// 同一个预算，不再每次调 data() 重起一份全额 timeout。
     private func perform(_ request: URLRequest, source: String, timeout: TimeInterval) async throws -> (Data, HTTPURLResponse) {
         let host = request.url?.host?.lowercased() ?? ""
+        let deadline = Date().addingTimeInterval(timeout)
+        /// 剩余预算；<= 0 时直接抛 .timedOut，不再重试。
+        func remaining() throws -> TimeInterval {
+            let value = deadline.timeIntervalSinceNow
+            guard value > 0 else { throw URLError(.timedOut) }
+            return value
+        }
+        /// 退避等待（受剩余预算约束）；等完预算没了就抛 .timedOut，不再重试。
+        func backoff(_ seconds: TimeInterval) async throws {
+            let wait = min(seconds, max(0, deadline.timeIntervalSinceNow))
+            if wait > 0 {
+                try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+            }
+            _ = try remaining()
+        }
         lock.lock()
         let lastChallenge = lastChallengeAt[host]
         lock.unlock()
@@ -1292,12 +1439,14 @@ final class WordPressHTTP: @unchecked Sendable {
         var attempt = 0
         while true {
             attempt += 1
+            // 预算到了就停，不再发起新尝试（直接抛 .timedOut，不进 catch 的重试分支）。
+            _ = try remaining()
             do {
                 let (data, response) = try await DiagnosticHTTPClient.shared.data(
                     for: request,
                     source: source,
                     preservedHeaders: request.allHTTPHeaderFields ?? [:],
-                    timeout: timeout
+                    timeout: try remaining()
                 )
                 guard let http = response as? HTTPURLResponse else {
                     throw URLError(.badServerResponse)
@@ -1306,16 +1455,21 @@ final class WordPressHTTP: @unchecked Sendable {
                     recordChallenge(host: host)
                     throw WordPressHTTPError.challenge(host: host)
                 }
-                recordSuccess(host: host)
                 let status = http.statusCode
                 if status == 429, attempt == 1 {
                     let wait = min(retryAfterSeconds(from: http) ?? retryBackoffSeconds, maxRetryAfterSeconds)
-                    try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                    try await backoff(wait)
                     continue
                 }
                 if (500...599).contains(status), attempt == 1 {
-                    try await Task.sleep(nanoseconds: UInt64(retryBackoffSeconds * 1_000_000_000))
+                    try await backoff(retryBackoffSeconds)
                     continue
+                }
+                // G3：只有最终 2xx 成功才清挑战记录——429/5xx/超时重试路径
+                // 不调，并发里一条重试路径的 recordSuccess 会把另一条刚记下
+                // 的挑战记录清掉；404 等非 2xx 也不清（没证明挑战已过）。
+                if (200...299).contains(status) {
+                    recordSuccess(host: host)
                 }
                 return (data, http)
             } catch {
@@ -1325,7 +1479,7 @@ final class WordPressHTTP: @unchecked Sendable {
                 // 超时/断连重试 1 次；别的传输错误不重试。
                 if attempt == 1, let urlError = error as? URLError,
                    urlError.code == .timedOut || urlError.code == .networkConnectionLost {
-                    try await Task.sleep(nanoseconds: UInt64(retryBackoffSeconds * 1_000_000_000))
+                    try await backoff(retryBackoffSeconds)
                     continue
                 }
                 throw error
