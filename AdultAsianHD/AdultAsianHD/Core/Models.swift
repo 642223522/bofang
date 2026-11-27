@@ -141,6 +141,46 @@ struct WidgetMeta {
     let author: String?
     /// 站点地址（WidgetMetadata.site / siteUrl / homepage，哪个有取哪个），没有为 nil
     let site: String?
+    /// 自检每步超时（毫秒），模块在 WidgetMetadata.checkTimeouts 里声明；
+    /// 没声明的步用默认 6000ms。
+    /// 注意：声明处不给默认值（默认值在下方显式 init 的参数里）——
+    /// 声明处给了 `= CheckTimeouts()` 又在 init 里赋值，Swift 会报
+    /// "immutable value may only be initialized once"（构建 #41 就是这么死的）。
+    let checkTimeouts: CheckTimeouts
+
+    /// 显式 init（不依赖编译器合成的 memberwise init，Xcode 27.2 上合成行为不可靠，
+    /// ModuleDescriptor/PlayLine 同款原因）。
+    init(id: String, title: String, description: String, version: String, searchFunctionName: String?, author: String?, site: String?, checkTimeouts: CheckTimeouts = CheckTimeouts()) {
+        self.id = id
+        self.title = title
+        self.description = description
+        self.version = version
+        self.searchFunctionName = searchFunctionName
+        self.author = author
+        self.site = site
+        self.checkTimeouts = checkTimeouts
+    }
+}
+
+/// 自检每步超时（毫秒），由模块在 WidgetMetadata.checkTimeouts 里声明。
+/// 没声明的步为 nil，宿主用默认 6000ms；朋友的模块不声明，行为与原来完全一致。
+/// 例子（javpub，竞速模块冷启动要 6–11 秒）：{ parseMs: 15000 }，其余默认。
+struct CheckTimeouts {
+    let listMs: Int?
+    let detailMs: Int?
+    let parseMs: Int?
+    let playlistMs: Int?
+    let firstFrameMs: Int?
+
+    /// 显式 init（不依赖编译器合成的 memberwise init，Xcode 27.2 上合成行为不可靠）：
+    /// 声明处不给默认值，默认值只放 init 参数里（构建 #41 的教训）。
+    init(listMs: Int? = nil, detailMs: Int? = nil, parseMs: Int? = nil, playlistMs: Int? = nil, firstFrameMs: Int? = nil) {
+        self.listMs = listMs
+        self.detailMs = detailMs
+        self.parseMs = parseMs
+        self.playlistMs = playlistMs
+        self.firstFrameMs = firstFrameMs
+    }
 }
 
 /// 一条播放线路（loadResource 返回的项）。

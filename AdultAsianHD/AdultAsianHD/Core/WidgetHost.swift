@@ -168,6 +168,16 @@ final class WidgetHost: @unchecked Sendable {
             return metaId
         }()
         let searchDict = metaDict["search"] as? [String: Any]
+        // 自检每步超时（毫秒）：模块在 WidgetMetadata.checkTimeouts 里声明，
+        // 没声明的步为 nil，宿主用默认 6000ms（见 SourceStore.stepTimeout）。
+        let checkDict = metaDict["checkTimeouts"] as? [String: Any]
+        let checkTimeouts = CheckTimeouts(
+            listMs: checkDict?["listMs"] as? Int,
+            detailMs: checkDict?["detailMs"] as? Int,
+            parseMs: checkDict?["parseMs"] as? Int,
+            playlistMs: checkDict?["playlistMs"] as? Int,
+            firstFrameMs: checkDict?["firstFrameMs"] as? Int
+        )
         let meta = WidgetMeta(
             id: metaId,
             title: metaTitle,
@@ -175,7 +185,8 @@ final class WidgetHost: @unchecked Sendable {
             version: metaDict["version"] as? String ?? "1.0.0",
             searchFunctionName: searchDict?["functionName"] as? String,
             author: (metaDict["author"] as? String)?.nilIfEmpty,
-            site: siteString(from: metaDict)
+            site: siteString(from: metaDict),
+            checkTimeouts: checkTimeouts
         )
 
         // 取模块清单（超集，三路，比 Rex 更宽松）：

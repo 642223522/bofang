@@ -521,7 +521,9 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     }
 
     /// 带超时的操作：超时即 throw CheckStepError.timeout。
-    /// 快扫每步默认 6000ms，超时判该步失败，不让一个慢源卡住整轮。
+    /// 每步超时默认 6000ms；模块可在 WidgetMetadata.checkTimeouts 里按步声明
+    /// 自己的毫秒数（stepTimeout 解析），没声明的步用默认。超时判该步失败，
+    /// 不让一个慢源卡住整轮。
     private func withStepTimeout<T>(_ milliseconds: Int = stepTimeoutMilliseconds, operation: @escaping () async throws -> T) async throws -> T {
         try await withThrowingTaskGroup(of: T.self) { group in
             group.addTask { try await operation() }
@@ -535,6 +537,13 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             group.cancelAll()
             return result
         }
+    }
+
+    /// 模块声明的自检步超时（毫秒）：没声明用默认 6000ms；钳制到 1000...60000ms，
+    /// 防止模块写错数字（1ms 或 10 分钟）把自检卡住或拖垮。
+    private func stepTimeout(_ declared: Int?) -> Int {
+        guard let ms = declared else { return Self.stepTimeoutMilliseconds }
+        return max(1000, min(60000, ms))
     }
 
     /// 把一步的 error 翻成人话原因：超时 / HTTP 状态 / 其他。
@@ -629,7 +638,8 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         data.range(of: Data("ftyp".utf8)) != nil
     }
 
-    /// 五步验真（对一个源）：列表→详情→解析→播单→首片，每步 6000ms 超时。
+    /// 五步验真（对一个源）：列表→详情→解析→播单→首片，每步超时按模块声明
+    /// （WidgetMetadata.checkTimeouts，没声明的步默认 6000ms）。
     /// 固定验线取样本；每个样本顺次跑详情→解析→播单→首片（列表步只做一次）。
     /// 全部样本走完五步才算 ok；任一样本死在某步即 failed，记死在哪步 + 原因。
     /// 返回 SourceCheckResult（steps = 决定本次结果的那个样本的五步；fingerprint = 当前 JS 指纹）。
@@ -637,6 +647,8 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     /// 取消时抛 CancellationError（不记失败结果，断点续跑时重测）。
     private func runFiveStepCheck(host: WidgetHost, source: SourceRecord) async throws -> SourceCheckResult {
         let fingerprint = self.fingerprint(for: source)
+        // 模块声明的自检步超时（没声明的步默认 6000ms，见 stepTimeout）。
+        let checkTimeouts = host.meta.checkTimeouts
         // 1. 列表：固定验线取样本
         let listStart = Date()
         let listElapsed = { Int(Date().timeIntervalSince(listStart) * 1000) }
@@ -646,7 +658,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         }
         let samples: [VideoItem]
         do {
-            samples = try await withStepTimeout { try await host.loadList(moduleId: probe.id, page: 1) }
+            samples = try await withStepTimeout(stepTimeout(checkTimeouts.listMs)) { try await host.loadList(moduleId: probe.id, page: 1) }
         } catch {
             try throwIfCancelled()
             let reason = checkReason(for: error)
@@ -681,7 +693,8 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         return SourceCheckResult(status: .ok, failedLines: [:], checkedAt: Date(), steps: decidingSteps, failedStep: nil, failedReason: nil, sourceFingerprint: fingerprint)
     }
 
-    /// 一个样本的详情→解析→播单→首片（四步顺次，每步 6000ms 超时，某步失败即停）。
+    /// 一个样本的详情→解析→播单→首片（四步顺次，每步超时按模块声明，
+    /// 没声明的步默认 6000ms，某步失败即停）。
     /// 详情：GET 帖子链接（详情页）要 200。
     /// 解析：loadResource 解出可播 URL（.m3u8/.mp4）。
     /// 播单：m3u8 取回并含 #EXTM3U；mp4 首字节可取。
@@ -689,11 +702,13 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     /// 取消时抛 CancellationError。
     private func runSampleSteps(host: WidgetHost, sample: VideoItem) async throws -> [CheckStepResult] {
         var steps: [CheckStepResult] = []
+        // 模块声明的自检步超时（没声明的步默认 6000ms，见 stepTimeout）。
+        let checkTimeouts = host.meta.checkTimeouts
 
         // 2. 详情
         let detailStart = Date()
         do {
-            let status = try await withStepTimeout { try await Self.httpStatus(of: sample.link) }
+            let status = try await withStepTimeout(stepTimeout(checkTimeouts.detailMs)) { try await Self.httpStatus(of: sample.link) }
             guard status == 200 else {
                 steps.append(CheckStepResult(name: "详情", passed: false, reason: "HTTP \(status)", milliseconds: Int(Date().timeIntervalSince(detailStart) * 1000)))
                 return steps
@@ -709,7 +724,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         let parseStart = Date()
         let playableURL: String
         do {
-            let lines = try await withStepTimeout { try await host.loadResource(link: sample.link, title: sample.title) }
+            let lines = try await withStepTimeout(stepTimeout(checkTimeouts.parseMs)) { try await host.loadResource(link: sample.link, title: sample.title) }
             guard let first = lines.first(where: { line in
                 let lower = line.url.lowercased()
                 return lower.contains(".m3u8") || lower.contains(".mp4")
@@ -732,7 +747,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             let playlistStart = Date()
             let playlistText: String
             do {
-                playlistText = try await withStepTimeout { try await Self.httpBody(of: playableURL, referer: sample.link) }
+                playlistText = try await withStepTimeout(stepTimeout(checkTimeouts.playlistMs)) { try await Self.httpBody(of: playableURL, referer: sample.link) }
                 guard playlistText.contains("#EXTM3U") else {
                     steps.append(CheckStepResult(name: "播单", passed: false, reason: "不是有效的 m3u8 播单", milliseconds: Int(Date().timeIntervalSince(playlistStart) * 1000)))
                     return steps
@@ -751,13 +766,13 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
                     return steps
                 }
                 if firstRef.lowercased().contains(".m3u8") {
-                    let variant = try await withStepTimeout { try await Self.httpBody(of: firstRef, referer: sample.link) }
+                    let variant = try await withStepTimeout(stepTimeout(checkTimeouts.firstFrameMs)) { try await Self.httpBody(of: firstRef, referer: sample.link) }
                     guard variant.contains("#EXTM3U") else {
                         steps.append(CheckStepResult(name: "首片", passed: false, reason: "变体播单无效", milliseconds: Int(Date().timeIntervalSince(firstFrameStart) * 1000)))
                         return steps
                     }
                 } else {
-                    let data = try await withStepTimeout { try await Self.httpRangeData(of: firstRef, length: 32768, referer: sample.link) }
+                    let data = try await withStepTimeout(stepTimeout(checkTimeouts.firstFrameMs)) { try await Self.httpRangeData(of: firstRef, length: 32768, referer: sample.link) }
                     guard !data.isEmpty else {
                         steps.append(CheckStepResult(name: "首片", passed: false, reason: "首片分片取不到数据", milliseconds: Int(Date().timeIntervalSince(firstFrameStart) * 1000)))
                         return steps
@@ -773,7 +788,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             // mp4：播单 = 首字节可取（Range 取前 1KB）；首片 = 前 64KB 含 ftyp
             let playlistStart = Date()
             do {
-                let data = try await withStepTimeout { try await Self.httpRangeData(of: playableURL, length: 1024, referer: sample.link) }
+                let data = try await withStepTimeout(stepTimeout(checkTimeouts.playlistMs)) { try await Self.httpRangeData(of: playableURL, length: 1024, referer: sample.link) }
                 guard !data.isEmpty else {
                     steps.append(CheckStepResult(name: "播单", passed: false, reason: "MP4 首字节取不到", milliseconds: Int(Date().timeIntervalSince(playlistStart) * 1000)))
                     return steps
@@ -786,7 +801,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             }
             let firstFrameStart = Date()
             do {
-                let data = try await withStepTimeout { try await Self.httpRangeData(of: playableURL, length: 65536, referer: sample.link) }
+                let data = try await withStepTimeout(stepTimeout(checkTimeouts.firstFrameMs)) { try await Self.httpRangeData(of: playableURL, length: 65536, referer: sample.link) }
                 guard Self.dataContainsFTYP(data) else {
                     steps.append(CheckStepResult(name: "首片", passed: false, reason: "MP4 首字节不是有效视频", milliseconds: Int(Date().timeIntervalSince(firstFrameStart) * 1000)))
                     return steps
