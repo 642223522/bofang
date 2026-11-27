@@ -606,6 +606,12 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         breaker[host] = (epoch: networkEpoch, until: Date().addingTimeInterval(600))
     }
 
+    /// kCFHostErrorHostNotFound 的数值（CFNetworkErrors：1 = DNS 解析失败）。
+    /// iOS 27 SDK 里 CFHost.h 的符号已不在 Swift 可见范围（run #32 构建报错
+    /// cannot find 'kCFHostErrorHostNotFound' in scope），只能用字面值；
+    /// 两处调用都先判了域是 kCFErrorDomainCFNetwork，所以 1 不会跟别的域撞。
+    private static let cfHostErrorHostNotFound = 1
+
     /// 传输兜底资格：域 + 码双查（顶层 + underlying 链）。
     /// 不进：-1002（URL/协议分发问题，见 -1002 守卫救援）、-999、CancellationError。
     /// 进：原 6 个 URLError、POSIX 54/53/60/61/1、kCFHostErrorHostNotFound
@@ -641,7 +647,7 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
                     break
                 }
             }
-            if e.code == Int(kCFHostErrorHostNotFound),
+            if e.code == Self.cfHostErrorHostNotFound,
                e.domain == (kCFErrorDomainCFNetwork as String) {
                 return true
             }
@@ -669,7 +675,7 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         let chain = Self.underlyingErrorChain(error as NSError)
         if chain.contains(where: { $0.domain == NSPOSIXErrorDomain && $0.code == Int(EPERM) }) { return true }
         if chain.contains(where: {
-            $0.domain == (kCFErrorDomainCFNetwork as String) && $0.code == Int(kCFHostErrorHostNotFound)
+            $0.domain == (kCFErrorDomainCFNetwork as String) && $0.code == Self.cfHostErrorHostNotFound
         }) { return true }
         let reused = txs.last?.isReusedConnection ?? false
         if !reused {
