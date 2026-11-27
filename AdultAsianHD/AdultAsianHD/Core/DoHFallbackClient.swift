@@ -122,6 +122,17 @@ private struct JarCookie {
     let hostOnly: Bool
 }
 
+/// 服务端删掉的 cookie 的范围键（R3-10）：过期按 (name, domain, path)
+/// 划范围，不再只记裸名——否则跨域的 Max-Age=0 会删掉别家的种子 cookie。
+/// domain 已归一化（小写、去前导 "."）；hostOnly=true 表示只匹配完全相同的 host，
+/// false 表示匹配该域及其子域；path 必须精确相等（种子的 path 视为 "/"）。
+private struct ExpiredCookieKey: Hashable {
+    let name: String
+    let domain: String
+    let hostOnly: Bool
+    let path: String
+}
+
 final class DoHFallbackClient: @unchecked Sendable {
     static let shared = DoHFallbackClient()
 
@@ -133,6 +144,17 @@ final class DoHFallbackClient: @unchecked Sendable {
     private let lock = NSLock()
     private var ipCache: [String: CachedIPs] = [:]
     private var preferredHosts: Set<String> = []
+    /// 网络世代（R3-6）：resetForNetworkChange() 时 +1。resolveIPs() 与
+    /// perform() 在入口捕获它，写缓存 / 记偏好前重新核对——旧网在途的
+    /// 解析/请求绝不把旧 IP 写进新网的缓存与偏好表。
+    private var networkGeneration: UInt64 = 0
+
+    /// 当前网络世代（lock 内读）。
+    private func currentGeneration() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return networkGeneration
+    }
 
     /// DoH 解析商表（顺序 = 询问顺序）：每家一个 JSON API 端点 + 直连 IP 字面量。
     /// endpointHost 同时是 TLS SNI 与 HTTP Host；path 是 JSON API 路径。
@@ -205,6 +227,7 @@ final class DoHFallbackClient: @unchecked Sendable {
 
     func resetForNetworkChange() {
         lock.lock()
+        networkGeneration &+= 1
         ipCache.removeAll()
         preferredHosts.removeAll()
         lock.unlock()
@@ -235,14 +258,18 @@ final class DoHFallbackClient: @unchecked Sendable {
     ) async throws -> (data: Data, response: HTTPURLResponse, remoteIP: String) {
         var currentReq = rawRequest
         let originURL = rawRequest.url
+        // R3-6：入口捕获网络世代；记 DoH 偏好前重新核对，变了就跳过这次
+        // 标记（不抛错——在途请求可能还能通；只是不污染新网的偏好表）。
+        let generation = currentGeneration()
         // 请求内 cookie jar：跳转时把上跳的 Set-Cookie 带到下跳（Cloudflare
         // 的 cf_clearance 就靠这个不断挑战循环；jar 只活在这一次请求里，
         // 不进共享存储，跨请求不持久化）。
-        // expiredNames：服务端用 Max-Age=0 / 过期时间删掉的 cookie 名——
-        // jar 里被删的条目已不在，过期名必须另记，否则种子里的旧 cookie
-        // 下一跳会被复活（F5）。fresh 同名 cookie 到达时撤销该名。
+        // expiredKeys：服务端用 Max-Age=0 / 过期时间删掉的 cookie 范围键——
+        // jar 里被删的条目已不在，过期键必须另记，否则种子里的旧 cookie
+        // 下一跳会被复活（F5）。fresh cookie 到达时按 (name, domain, path)
+        // 撤销对应的过期键（R3-10：只记裸名会跨域误删别家的种子 cookie）。
         var cookieJar: [JarCookie] = []
-        var expiredNames: Set<String> = []
+        var expiredKeys: Set<ExpiredCookieKey> = []
         // 绝对 deadline：data() 传进来的是剩余预算，perform 内部各阶段
         //（解析商链、每跳、每个 IP）共用这一本账，不再每层重起预算。
         if timeout <= 0 { throw URLError(.timedOut) }
@@ -259,14 +286,21 @@ final class DoHFallbackClient: @unchecked Sendable {
             let hop: (data: Data, response: HTTPURLResponse, remoteIP: String, setCookieValues: [String])
             if let proxy = viaProxy, proxy.isExplicitProxy {
                 // 经系统代理：不解析 DoH、不记偏好；代理做 DNS + TCP。
-                let res = try await fetchSingleHopViaProxyCore(
-                    url: url,
-                    host: host,
-                    proxy: proxy,
-                    request: currentReq,
-                    timeout: min(perHopTimeout, remaining())
-                )
-                hop = (res.0, res.1, proxy.label, res.2)
+                // R3-2：Core 会把非取消失败包成 DoHTransportFailure，这里
+                // 必须解包再抛原错——否则 classify() 误判成 .unknown，
+                // WordPress 的 .timedOut/.networkConnectionLost 重试也触发不了。
+                do {
+                    let res = try await fetchSingleHopViaProxyCore(
+                        url: url,
+                        host: host,
+                        proxy: proxy,
+                        request: currentReq,
+                        timeout: min(perHopTimeout, remaining())
+                    )
+                    hop = (res.0, res.1, proxy.label, res.2)
+                } catch let failure as DoHTransportFailure {
+                    throw failure.underlying
+                }
             } else {
                 // F13：解析失败分三种信号，不再一律 .cannotFindHost。
                 let ips: [String]
@@ -301,7 +335,9 @@ final class DoHFallbackClient: @unchecked Sendable {
                             timeout: min(perIPTimeout, remaining())
                         )
                         succeeded = (res.0, res.1, ip, res.2)
-                        markDoHPreferred(host: host)
+                        if generation == currentGeneration() {
+                            markDoHPreferred(host: host)
+                        }
                         break
                     } catch let failure as DoHTransportFailure {
                         // F4：该 IP 已收到最终响应头，body 失败不再换 IP。
@@ -320,8 +356,9 @@ final class DoHFallbackClient: @unchecked Sendable {
             // 本跳的 Set-Cookie 收进 jar（每条原始头行单独解析——
             // parseHTTP11Response 的 [String: String] 会丢多值）。
             // host-only 与否从原始头行看有没有 Domain 属性（F5a）；
-            // 过期 cookie 不进 jar，但名字记进 expiredNames（F5：种子里的
-            // 旧 cookie 下一跳要删掉）；fresh 同名 cookie 到达时撤销该名。
+            // 过期 cookie 不进 jar，但范围键记进 expiredKeys（F5/R3-10：
+            // 种子里的旧 cookie 下一跳要删掉，但只删范围匹配的）；
+            // fresh cookie 到达时按同样的 (name, domain, path) 撤销过期键。
             for rawValue in hop.setCookieValues {
                 let hasDomainAttr = Self.setCookieHasDomainAttribute(rawValue)
                 let parsed = HTTPCookie.cookies(
@@ -330,13 +367,21 @@ final class DoHFallbackClient: @unchecked Sendable {
                 )
                 for cookie in parsed {
                     cookieJar.removeAll {
-                        $0.cookie.name == cookie.name && $0.cookie.domain == cookie.domain && $0.cookie.path == cookie.path
+                        $0.cookie.name == cookie.name
+                            && Self.normalizedCookieDomain($0.cookie.domain) == Self.normalizedCookieDomain(cookie.domain)
+                            && $0.cookie.path == cookie.path
                     }
+                    let key = ExpiredCookieKey(
+                        name: cookie.name,
+                        domain: Self.normalizedCookieDomain(cookie.domain),
+                        hostOnly: !hasDomainAttr,
+                        path: cookie.path
+                    )
                     if cookie.expiresDate == nil || cookie.expiresDate! > Date() {
                         cookieJar.append(JarCookie(cookie: cookie, hostOnly: !hasDomainAttr))
-                        expiredNames.remove(cookie.name)
+                        expiredKeys.remove(key)
                     } else {
-                        expiredNames.insert(cookie.name)
+                        expiredKeys.insert(key)
                     }
                 }
             }
@@ -349,7 +394,7 @@ final class DoHFallbackClient: @unchecked Sendable {
                 originRequest: rawRequest,
                 preservedHeaders: preservedHeaders,
                 cookies: cookieJar,
-                expiredNames: expiredNames
+                expiredKeys: expiredKeys
             ) {
                 currentReq = nextReq
                 continue
@@ -366,8 +411,9 @@ final class DoHFallbackClient: @unchecked Sendable {
     /// 非 http(s) 的 Location 返回 nil（停住跳转、返回 3xx 响应，与
     /// PerRequestDelegate 的行为一致，不抛 .badURL）。
     /// 跨域时凭据头不跟过去；Host/Content-Length/Cookie 永不复制——Cookie 每次
-    /// 按目标 URL 重建：种子（原始请求的 Cookie 头，只同源继承）→ 删过期名 →
-    /// jar 按名覆盖（只按 name 去重；合并为空时删掉 Cookie 头）。
+    /// 按目标 URL 重建：种子（原始请求的 Cookie 头，只同源继承）→ 删过期键
+    ///（按 name/domain/path 划范围，R3-10）→ jar 覆盖（同名不同 Path 都保留，
+    /// 按 path 长度降序，R3-9；合并为空时删掉 Cookie 头）。
     /// cookies：perform 的请求内 jar——按目标 URL 匹配后带上（Cloudflare
     /// 的 cf_clearance 就靠这个不断挑战循环）。
     private static func redirectRequest(
@@ -377,7 +423,7 @@ final class DoHFallbackClient: @unchecked Sendable {
         originRequest: URLRequest,
         preservedHeaders: [String: String],
         cookies: [JarCookie] = [],
-        expiredNames: Set<String> = []
+        expiredKeys: Set<ExpiredCookieKey> = []
     ) -> URLRequest? {
         guard [301, 302, 303, 307, 308].contains(http.statusCode),
               let location = http.value(forHTTPHeaderField: "Location"),
@@ -418,10 +464,15 @@ final class DoHFallbackClient: @unchecked Sendable {
         // 303 转 GET：Content-Type 随 body 一起丢掉（Content-Length 已在
         // hopByHop 里，body 本来也不复制）。
         if is303 { nextReq.setValue(nil, forHTTPHeaderField: "Content-Type") }
-        // Cookie 重建（顺序必须是：种子 → 删过期名 → jar 覆盖）：
+        // Cookie 重建（顺序必须是：种子 → 删过期键 → jar 覆盖）：
         // 种子只从原始请求取（多跳回源 A→B→A 时 B 的 Cookie 不能跟着抄回 A），
         // 且只同源继承；jar 里活着的同名 cookie 能在删除后重新补回来。
-        var merged: [String: String] = [:]
+        // R3-9：merged 是有序的 (name, value) 对列表，不再按 name 唯一化——
+        // 同名不同 Path 的 cookie 都保留（同名 jar 条目按 path 长度降序排）。
+        // R3-10：每个对都带范围（domain/hostOnly/path），过期删除只删范围匹配的。
+        // 种子的范围是 (origin host, host-only, "/")。
+        var merged: [(name: String, value: String, domain: String, hostOnly: Bool, path: String)] = []
+        let originHost = originURL?.host?.lowercased() ?? ""
         if sameOrigin, let seedCookie = originRequest.value(forHTTPHeaderField: "Cookie") {
             for pair in seedCookie.split(separator: ";") {
                 let kv = pair.split(separator: "=", maxSplits: 1)
@@ -429,19 +480,38 @@ final class DoHFallbackClient: @unchecked Sendable {
                 let name = kv[0].trimmingCharacters(in: .whitespaces)
                 let value = kv[1].trimmingCharacters(in: .whitespaces)
                 guard !name.isEmpty else { continue }
-                merged[name] = value
+                merged.append((name: name, value: value, domain: originHost, hostOnly: true, path: "/"))
             }
         }
-        for name in expiredNames { merged.removeValue(forKey: name) }
+        merged.removeAll { pair in
+            expiredKeys.contains { Self.expiredKeyApplies($0, name: pair.name, domain: pair.domain, path: pair.path) }
+        }
         let matching = cookies.filter { Self.cookieMatches($0, url: nextURL) }
+        // 按 name 分组（保持首次出现顺序）；组内按 path 长度降序——最具体的在前。
+        var namesInOrder: [String] = []
+        var byName: [String: [JarCookie]] = [:]
         for entry in matching {
-            merged[entry.cookie.name] = entry.cookie.value
+            if byName[entry.cookie.name] == nil { namesInOrder.append(entry.cookie.name) }
+            byName[entry.cookie.name, default: []].append(entry)
+        }
+        for name in namesInOrder {
+            merged.removeAll { $0.name == name }
+            let entries = (byName[name] ?? []).sorted(by: { $0.cookie.path.count > $1.cookie.path.count })
+            for entry in entries {
+                merged.append((
+                    name: entry.cookie.name,
+                    value: entry.cookie.value,
+                    domain: Self.normalizedCookieDomain(entry.cookie.domain),
+                    hostOnly: entry.hostOnly,
+                    path: entry.cookie.path
+                ))
+            }
         }
         if merged.isEmpty {
             nextReq.setValue(nil, forHTTPHeaderField: "Cookie")
         } else {
-            let header = merged.sorted(by: { $0.key < $1.key })
-                .map { "\($0.key)=\($0.value)" }
+            let header = merged
+                .map { "\($0.name)=\($0.value)" }
                 .joined(separator: "; ")
             nextReq.setValue(header, forHTTPHeaderField: "Cookie")
         }
@@ -450,12 +520,32 @@ final class DoHFallbackClient: @unchecked Sendable {
 
     /// 原始 Set-Cookie 行是否带 Domain 属性（有 → domain cookie，可匹配子域；
     /// 无 → host-only）。第一段是 name=value，只看后面的属性段。
+    /// R3-11：空 Domain= 不算 domain 属性（RFC 6265 §5.2.3：空值忽略，
+    /// cookie 仍是 host-only）；裸 "domain"（无 "="）也不是。
     private static func setCookieHasDomainAttribute(_ rawValue: String) -> Bool {
         for seg in rawValue.split(separator: ";", omittingEmptySubsequences: false).dropFirst() {
             let attr = seg.trimmingCharacters(in: .whitespaces).lowercased()
-            if attr == "domain" || attr.hasPrefix("domain=") { return true }
+            if attr.hasPrefix("domain=") && !attr.dropFirst("domain=".count).isEmpty { return true }
         }
         return false
+    }
+
+    /// Cookie 域名归一化（小写、去前导 "."）：HTTPCookie.domain 对 domain
+    /// cookie 可能带前导 "."，比较前统一去掉，避免同域因写法不同判不等。
+    private static func normalizedCookieDomain(_ domain: String) -> String {
+        var d = domain.lowercased()
+        if d.hasPrefix(".") { d.removeFirst() }
+        return d
+    }
+
+    /// 过期键是否适用于目标 cookie 的范围（R3-10）：name 相同、path 相同、
+    /// 域匹配（host-only 的过期条目只匹配完全相同的 host；domain 的过期条目
+    /// 匹配该域及其子域）。
+    private static func expiredKeyApplies(_ key: ExpiredCookieKey, name: String, domain: String, path: String) -> Bool {
+        guard key.name == name, key.path == path else { return false }
+        let target = normalizedCookieDomain(domain)
+        if key.hostOnly { return target == key.domain }
+        return target == key.domain || target.hasSuffix("." + key.domain)
     }
 
     /// host 是否为 IP 字面量（IPv4 四段数字 / 含冒号的 IPv6）：IP 上后缀匹配
@@ -509,6 +599,9 @@ final class DoHFallbackClient: @unchecked Sendable {
     /// 不再返回空数组）；空结果分三种信号回（F13），不再一律 .cannotFindHost。
     func resolveIPs(host: String, deadline: Date) async throws -> DoHResolution {
         let key = host.lowercased()
+        // R3-6：入口捕获网络世代；写缓存前重新核对，变了就跳过这次写
+        //（不抛错——在途请求手里已有 IP，可能还能通；只是不污染新网缓存）。
+        let generation = currentGeneration()
         lock.lock()
         if let cached = ipCache[key], cached.expiresAt > Date() {
             lock.unlock()
@@ -526,12 +619,13 @@ final class DoHFallbackClient: @unchecked Sendable {
             var houseIPs: [String] = []
             var houseMinTTL = 180
             // F28：同家多个 IP 均分本家剩余预算（下限 1s），黑洞首 IP 不吃光整家预算。
+            // R3-4：再 clamp 到 houseRemaining——剩余不足 1s 时不许放大到 1s 跑出 deadline。
             let resolverIPs = resolver.ips
             for (ipIndex, ip) in resolverIPs.enumerated() {
                 let houseRemaining = houseDeadline.timeIntervalSinceNow
                 guard houseRemaining > 0 else { break }
                 let ipsLeft = resolverIPs.count - ipIndex
-                let timeout = min(Self.resolverTimeoutSeconds, max(1, houseRemaining / Double(max(ipsLeft, 1))))
+                let timeout = min(Self.resolverTimeoutSeconds, houseRemaining, max(1, houseRemaining / Double(max(ipsLeft, 1))))
                 guard let query = try await queryDoH(resolver: resolver, ip: ip, host: host, timeout: timeout) else { continue }
                 if query.0.isEmpty {
                     // ([], 0) 哨兵：NXDOMAIN 已确认，停链（G4）。
@@ -555,10 +649,16 @@ final class DoHFallbackClient: @unchecked Sendable {
             guard !cleanIPs.isEmpty else { continue }
             let clampedTTL = TimeInterval(min(max(houseMinTTL, 5), 300))
             lock.lock()
-            ipCache[key] = CachedIPs(ips: cleanIPs, expiresAt: Date().addingTimeInterval(clampedTTL))
+            if generation == networkGeneration {
+                ipCache[key] = CachedIPs(ips: cleanIPs, expiresAt: Date().addingTimeInterval(clampedTTL))
+            }
             lock.unlock()
             return .resolved(cleanIPs)
         }
+        // R3-5：deadline 在最后一个解析商查询中过期时，循环会正常结束——
+        // 这里补查一次，否则会被误报成 .resolversUnreachable（.dns 而非 .timeout）。
+        if Task.isCancelled { throw CancellationError() }
+        if Date() >= deadline { throw URLError(.timedOut) }
         // F13：三种空结果分开——有答案但全被污染过滤拒掉 vs 一家都没给出可用答案。
         if sawAnyAnswer { return .allCandidatesRejected }
         return .resolversUnreachable
@@ -844,6 +944,8 @@ final class DoHFallbackClient: @unchecked Sendable {
             }
             func appendData(_ data: Data) {
                 lock.lock()
+                // R3-14：finish() 之后迟到的 receive 回调不再往已清的 buffer 里写。
+                guard !done else { lock.unlock(); return }
                 buffer.append(data)
                 lock.unlock()
             }
@@ -866,7 +968,9 @@ final class DoHFallbackClient: @unchecked Sendable {
                 lock.lock()
                 let old = waitingTimer
                 let isDone = done
-                waitingTimer = item
+                // R3-14：done 后不再存 item——存下来会形成保留环（box →
+                // waitingTimer → item → fail → box），且 finish() 已把字段清成 nil。
+                if !isDone { waitingTimer = item }
                 lock.unlock()
                 old?.cancel()
                 if isDone { item?.cancel() }
@@ -875,7 +979,8 @@ final class DoHFallbackClient: @unchecked Sendable {
                 lock.lock()
                 let old = timeoutTimer
                 let isDone = done
-                timeoutTimer = item
+                // R3-14：同上（超时 item 捕获 fail，fail 捕获 box）。
+                if !isDone { timeoutTimer = item }
                 lock.unlock()
                 old?.cancel()
                 if isDone { item?.cancel() }

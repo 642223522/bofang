@@ -233,7 +233,7 @@ final class NetworkDiagnostics: ObservableObject {
             // code 1 补强。真正的 +1 是 kCFErrorDomainCFNetwork 域的
             // kCFHostErrorHostNotFound（DNS 解析失败），必须按域分开判。
             let needsDetail = (nsErr.domain == NSURLErrorDomain && nsErr.code == URLError.unsupportedURL.rawValue)
-                || (nsErr.domain == (kCFErrorDomainCFNetwork as String) && nsErr.code == Self.cfHostErrorHostNotFound)
+                || (nsErr.domain == (kCFErrorDomainCFNetwork as String) && nsErr.code == DiagnosticHTTPClient.cfHostErrorHostNotFound)
             guard needsDetail else { return summary }
             var parts: [String] = []
             if let failing = nsErr.userInfo[NSURLErrorFailingURLStringErrorKey] as? String,
@@ -507,6 +507,10 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
             let signature = "wifi=\(path.usesInterfaceType(.wifi))|cell=\(path.usesInterfaceType(.cellular))|wired=\(path.usesInterfaceType(.wiredEthernet))|other=\(path.usesInterfaceType(.other))|ok=\(path.status == .satisfied)"
             if self.lastPathSignature.isEmpty {
                 self.lastPathSignature = signature
+                // R3-8：首次回调同时初始化 lastSettledPathSignature，否则
+                // 第一次抖回（Wi-Fi→蜂窝→Wi-Fi）会拿 settledSignature 与 ""
+                // 比较，误触发一次轮换 + 清 Cookie + DoH 重置。
+                self.lastSettledPathSignature = signature
                 return
             }
             if signature != self.lastPathSignature {
@@ -571,10 +575,28 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
     }
 
     private func rotateSession(preserveCookies: Bool = true) {
+        // R3-7：代理变化不能在这里被吞掉——旧实现无条件更新 lastProxyState，
+        // 导致 stale-socket 重试时（唯一调用方）把代理变化藏起来：直连 Cookie
+        // 被拷进新代理会话，且下次 resolveSessionLocked() 看不到变化，F9
+        //（epoch+1、清 breaker、DoH 重置）永远不触发。
+        let nowProxy = ActiveSystemProxy.current()
+        var proxyChanged = false
+        var effectivePreserveCookies = preserveCookies
         sessionLock.lock()
-        defer { sessionLock.unlock() }
-        lastProxyState = ActiveSystemProxy.current()
-        rotateSessionLocked(preserveCookies: preserveCookies)
+        if nowProxy != lastProxyState {
+            proxyChanged = true
+            lastProxyState = nowProxy
+            networkEpoch &+= 1
+            breaker.removeAll()
+            effectivePreserveCookies = false
+        } else {
+            lastProxyState = nowProxy
+        }
+        rotateSessionLocked(preserveCookies: effectivePreserveCookies)
+        sessionLock.unlock()
+        if proxyChanged {
+            DoHFallbackClient.shared.resetForNetworkChange()
+        }
     }
 
     private func rotateSessionLocked(preserveCookies: Bool) {
@@ -679,8 +701,10 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
     /// kCFHostErrorHostNotFound 的数值（CFNetworkErrors：1 = DNS 解析失败）。
     /// iOS 27 SDK 里 CFHost.h 的符号已不在 Swift 可见范围（run #32 构建报错
     /// cannot find 'kCFHostErrorHostNotFound' in scope），只能用字面值；
-    /// 两处调用都先判了域是 kCFErrorDomainCFNetwork，所以 1 不会跟别的域撞。
-    private static let cfHostErrorHostNotFound = 1
+    /// 三处调用都先判了域是 kCFErrorDomainCFNetwork，所以 1 不会跟别的域撞。
+    /// internal（非 private）：NetworkDiagnostics.makeEvent 也要引用它
+    ///（R3-1：private 会让 makeEvent 的 Self.cfHostErrorHostNotFound 编译不过）。
+    static let cfHostErrorHostNotFound = 1
 
     /// 传输兜底资格：域 + 码双查（顶层 + underlying 链）。
     /// 不进：-1002（URL/协议分发问题，见 -1002 守卫救援）、-999、CancellationError。
@@ -767,7 +791,7 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
     }
 
     /// 发请求并采集 URLSessionTaskMetrics。
-    /// timeout：单次请求总超时（秒，默认 12s，钳制在 3...30s）——这是真正的总预算，
+    /// timeout：单次请求总超时（秒，默认 12s；显式值钳制在 0.2...30s，nil 时默认 12s）——这是真正的总预算，
     /// 用 deadline 任务赛跑实现；request.timeoutInterval 只作字节间空闲定时器，
     /// 慢速滴漏（tarpit）再也拖不到 25s。
     /// 路由顺序：严格校验 → 强制 host/熔断 host（代理感知 NWConnection，
@@ -788,14 +812,21 @@ final class DiagnosticHTTPClient: @unchecked Sendable {
         request.assumesHTTP3Capable = false
         request.allowsExpensiveNetworkAccess = true
         request.allowsConstrainedNetworkAccess = true
+        // R3-3：3 秒下限只在 timeout == nil 时用（外部默认 12s）。显式传进来
+        // 的 timeout 是上层算好的剩余预算（WordPress 的 remaining()），绝不能
+        // 再放大——否则整条 WP 请求会超总预算（0.5s 剩 → 3s，超约 2.5s）。
+        let totalDeadline: TimeInterval
         if let timeout {
-            request.timeoutInterval = min(max(timeout, 3), 30)
-        } else if request.timeoutInterval <= 0 || request.timeoutInterval >= 60 {
-            request.timeoutInterval = 12
+            totalDeadline = min(max(timeout, 0.2), 30)
+            request.timeoutInterval = totalDeadline
+        } else {
+            totalDeadline = 12
+            if request.timeoutInterval <= 0 || request.timeoutInterval >= 60 {
+                request.timeoutInterval = 12
+            }
         }
         // 绝对 deadline：一本账，整条请求链（URLSession + 兜底 + 救援）共用；
         // 各层只拿剩余时间，不再每层重起一份全额预算（26.238s 就是这么来的）。
-        let totalDeadline = min(max(timeout ?? 12, 3), 30)
         let deadline = Date().addingTimeInterval(totalDeadline)
         let proxy = ActiveSystemProxy.current()
 
@@ -1307,6 +1338,9 @@ final class WordPressHTTP: @unchecked Sendable {
         /// 在途等待者 id 集合（waiter 取消时按 id 幂等释放，保证每个 waiter
         /// 只减一次；计数归零时才取消底层 Task）。
         var waiterIDs: Set<UUID>
+        /// 条目 id（R3-15）：底层 Task 完成时按 id 摘条目，绝不摘掉复用
+        /// 同一 key 的新条目。
+        let id: UUID
     }
     private var inFlight: [String: InFlight] = [:]
     /// 断路器：host → 上次撞挑战的时间（60 秒内不再发请求）。
@@ -1360,10 +1394,14 @@ final class WordPressHTTP: @unchecked Sendable {
             task = entry.task
             lock.unlock()
         } else {
+            // R3-15：条目带 id，底层 Task 完成时（defer）在恢复等待者之前
+            // 就把条目摘掉——新调用方不再挂到已完成的 Task 上拿陈旧结果。
+            let entryID = UUID()
             let created = Task<(Data, HTTPURLResponse), Error> {
-                try await self.perform(request, source: source, timeout: timeout)
+                defer { self.completeInFlight(key: key, id: entryID) }
+                return try await self.perform(request, source: source, timeout: timeout)
             }
-            inFlight[key] = InFlight(task: created, waiterIDs: [waiterID])
+            inFlight[key] = InFlight(task: created, waiterIDs: [waiterID], id: entryID)
             task = created
             lock.unlock()
         }
@@ -1387,10 +1425,15 @@ final class WordPressHTTP: @unchecked Sendable {
     private static func dedupKey(for request: URLRequest, timeout: TimeInterval) -> String {
         let method = request.httpMethod ?? "GET"
         let url = request.url?.absoluteString ?? ""
+        // R3-12：长度前缀编码——"&"/"=" 拼接会碰撞（X: a&y=b 与 X: a + Y: b
+        // 拼出来都是 x=a&y=b），不同请求会错合并。
         let headers = (request.allHTTPHeaderFields ?? [:])
             .sorted(by: { $0.key.lowercased() < $1.key.lowercased() })
-            .map { "\($0.key.lowercased())=\($0.value)" }
-            .joined(separator: "&")
+            .map { pair -> String in
+                let name = pair.key.lowercased()
+                return "\(name.utf8.count):\(name)\(pair.value.utf8.count):\(pair.value)"
+            }
+            .joined()
         return "\(method) \(url) | \(headers) | timeout=\(timeout)"
     }
 
@@ -1410,10 +1453,22 @@ final class WordPressHTTP: @unchecked Sendable {
         }
     }
 
+    /// 底层 Task 完成时摘条目（id 匹配才摘，绝不摘掉复用同一 key 的新条目）：
+    /// 新调用方不再挂到已完成的 Task 上拿陈旧结果（R3-15）。幂等，与
+    /// release() 的空集摘除互不冲突（release 在条目已摘时直接 no-op）。
+    private func completeInFlight(key: String, id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = inFlight[key], entry.id == id else { return }
+        inFlight.removeValue(forKey: key)
+    }
+
     /// 真正发请求（含单次可控重试）。断路器打开时直接报，不发请求。
     /// F6：一本 deadline——429/5xx/超时重试与 Retry-After/退避全部消耗
     /// 同一个预算，不再每次调 data() 重起一份全额 timeout。
     private func perform(_ request: URLRequest, source: String, timeout: TimeInterval) async throws -> (Data, HTTPURLResponse) {
+        // R3-13：请求开始时间——recordSuccess 只清这个时间点之前记的挑战。
+        let startedAt = Date()
         let host = request.url?.host?.lowercased() ?? ""
         let deadline = Date().addingTimeInterval(timeout)
         /// 剩余预算；<= 0 时直接抛 .timedOut，不再重试。
@@ -1469,7 +1524,7 @@ final class WordPressHTTP: @unchecked Sendable {
                 // 不调，并发里一条重试路径的 recordSuccess 会把另一条刚记下
                 // 的挑战记录清掉；404 等非 2xx 也不清（没证明挑战已过）。
                 if (200...299).contains(status) {
-                    recordSuccess(host: host)
+                    recordSuccess(host: host, requestStartedAt: startedAt)
                 }
                 return (data, http)
             } catch {
@@ -1494,10 +1549,14 @@ final class WordPressHTTP: @unchecked Sendable {
         lock.unlock()
     }
 
-    private func recordSuccess(host: String) {
+    /// R3-13：只清掉本请求开始之前记的挑战——慢请求 A 的 2xx 不能清掉
+    /// 后发的请求 B 刚记下的挑战（否则断路器被慢并发打穿）。
+    private func recordSuccess(host: String, requestStartedAt: Date) {
         guard !host.isEmpty else { return }
         lock.lock()
-        lastChallengeAt.removeValue(forKey: host)
+        if let challengeAt = lastChallengeAt[host], challengeAt <= requestStartedAt {
+            lastChallengeAt.removeValue(forKey: host)
+        }
         lock.unlock()
     }
 
