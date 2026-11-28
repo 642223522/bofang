@@ -75,6 +75,10 @@ enum AdBlockRules {
 /// 规则编译与安装：编译一次后复用；编译是异步的，没编好时先加载页面，
 /// 编好后装到 userContentController 上（后续导航生效；首屏由第三层 CSS/JS 兜底）。
 /// 豆包的兜底：验证卡死时关掉规则重载（见 EmbedProbeState 的 challengeStuck 处理）。
+/// 整体 @MainActor：cached/compiling/pending 是跨多次 install 共享的可变静态状态，
+/// 调用方全在主线程（EmbedWebViewController.viewDidLoad / loadIfNeeded），
+/// 隔离钉死，避免后台回调与主线程同时改 pending 表。
+@MainActor
 enum AdBlockRuleStore {
     private static var cached: WKContentRuleList?
     private static var compiling = false
@@ -152,7 +156,12 @@ enum AdStripScript {
     /// run #23 (v13): diagBadgeEnabled 在每个 frame 的 document-start 就置位，
     /// 这样嵌页 iframe 里的清理器也能装诊断浮层（didFinish 只够得到主框架）。
     static func source(diagBadgeEnabled: Bool) -> String {
-        (diagBadgeEnabled ? "window.__xspDiagBadge = true;\n" : "") + """
+        // NONCE 按实例替换：每次调 source() 生成一个新 UUID，同一块 WKWebView 的
+        // 各帧共用它（子帧上报、父帧校验）；字面量 '__XSP_SESSION_NONCE__' 全网
+        // 都一样，页内任意帧都能伪造上报消息让父帧去裁别的 iframe。
+        // v13 的注释早写了“Swift 替换”，实现一直漏了，这次补上。
+        let nonce = UUID().uuidString
+        return ((diagBadgeEnabled ? "window.__xspDiagBadge = true;\n" : "") + """
     // XSP shared prologue (run #23, v13) — runs BEFORE the v5 and v10 IIFEs in the same
     // injected script, so both IIFEs call these instead of keeping their own copies.
     // Lives inside a Swift triple-quote string: NO backticks, NO dollar-brace sequences.
@@ -2255,7 +2264,7 @@ enum AdStripScript {
         if (!document.hidden) scanOnce();
       }, 1200);
     })();
-    """
+    """).replacingOccurrences(of: "__XSP_SESSION_NONCE__", with: nonce)
     }
 }
 
@@ -2287,7 +2296,7 @@ private let findVideoJS = """
 /// 嵌页自己的播放控制不动（页内播放器照常用）；外层底条只是多一套统一外观的操作入口。
 /// 底条显隐也放这里管（@MainActor 类，Task 写起来安全；View struct 里写 Task 容易踩并发坑）。
 /// 另管 CF 卡死兜底：所有质询信号（标题 "Just a moment"、挑战 iframe、
-/// cf- 标记、turnstile）统一等 12 秒，让挑战 JS 自己完成；12 秒还没出
+/// 挑战标记、turnstile）统一等 12 秒，让挑战 JS 自己完成；12 秒还没出
 /// video 才关规则重载一次。只重载一次。
 /// challengeRunning：质询在跑且还没出 video 时为 true，WebViewPlayerView 用它
 /// 盖一层原生 Loading 遮罩（WebView 本身保持全尺寸在屏，只盖住不隐藏，
@@ -2357,6 +2366,13 @@ final class EmbedProbeState: ObservableObject {
     private var reloadAt: Date?
     private var failedReported = false
 
+    deinit {
+        // 兜底：stop() 没调到就释放时，把跑着的 Timer 停掉（Timer 被 RunLoop 强持有，
+        // 不停会一直空转；闭包是 [weak self] 不成环，但 Timer 本身会泄漏）。
+        timer?.invalidate()
+        hideTask?.cancel()
+    }
+
     func start() {
         stop()
         loadStartedAt = Date()
@@ -2405,12 +2421,23 @@ final class EmbedProbeState: ObservableObject {
               var cf = false;
               var cfTitle = false;
               try {
+                // 挑战判定与 AdStripScript v13 的 xspIsCloudflareChallengeDocument 对齐
+                //（同一文件里的共享门）：标题信号必须配挑战脚本才算数，裸 [id*="cf-"]
+                // 与“您是真人吗”一律不算——假真人验证卡自己就带“您是真人吗”，
+                // v13 明确说了它绝不能当触发词；裸 cf- 会误伤带 cf 前缀的普通元素。
+                // 标题 alone 不够：要 titleSignal && scriptSignal（或 url/marker/global 强信号）。
+                var href = (document.location && document.location.href || '').toLowerCase();
                 var t = (document.title || '').toLowerCase();
-                if (t.indexOf('just a moment') >= 0 || t.indexOf('checking your browser') >= 0
-                    || t.indexOf('请稍候') >= 0 || t.indexOf('正在验证') >= 0 || t.indexOf('您是真人吗') >= 0) { cf = true; cfTitle = true; }
+                var titleSignal = /just a moment|checking your browser|verify you are human|正在验证|请稍候/.test(t);
+                var scriptSignal = !!document.querySelector('script[src*="/cdn-cgi/challenge-platform/"]');
+                var urlSignal = href.indexOf('challenges.cloudflare.com') >= 0 ||
+                  href.indexOf('/cdn-cgi/challenge-platform/') >= 0;
+                var globalSignal = !!(window._cf_chl_opt);
+                if (titleSignal) { cfTitle = true; }
+                if ((titleSignal && scriptSignal) || urlSignal || globalSignal) { cf = true; }
                 if (document.querySelector('iframe[src*="challenges.cloudflare.com"]')) cf = true;
                 if (document.querySelector('iframe[src*="turnstile"]')) cf = true;
-                if (document.querySelector('[id*="cf-"], [class*="cf-challenge"], [class*="challenge-running"], [class*="turnstile"]')) cf = true;
+                if (document.querySelector('#challenge-form, #challenge-running, #challenge-stage, #cf-wrapper, #cf-spinner, #cf-browser-verification, [id*="cf-chl-"], [class*="cf-challenge"], [class*="challenge-running"], [class*="turnstile"]')) cf = true;
               } catch(e){}
               if (!v) return JSON.stringify({cf: cf, cfTitle: cfTitle});
               return JSON.stringify({t: v.currentTime, d: v.duration, p: v.paused, cf: cf, cfTitle: cfTitle});
@@ -2505,7 +2532,12 @@ final class EmbedProbeState: ObservableObject {
     private func checkWatchdog(challengeRunning cfRunning: Bool) {
         guard !hasVideo, !failedReported, loadStartedAt != nil else { return }
         if cfRunning {
-            if let since = challengeSince,
+            // 挑战在跑：重载后 15 秒仍没 video 也算失败（以前这里直接 return，
+            // reloadAt 的 15 秒窗口在挑战期永远跑不到，注释写的行为没实现）。
+            if let reloadedAt = reloadAt,
+               Date().timeIntervalSince(reloadedAt) >= 15 {
+                failEmbed("嵌页重载后 15 秒仍没出画面（验证还在跑），请开节点或点重试")
+            } else if let since = challengeSince,
                Date().timeIntervalSince(since) >= 45 {
                 failEmbed("Cloudflare 验证一直没通过（45 秒），请开节点或点重试")
             }
@@ -2673,14 +2705,19 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
     /// “重试嵌入播放”，即使 URL 相同也要强制重载（以前 guard loadedURL != url
     /// 直接早退，重试按钮是摆设）。
     private var lastRetryNonce: Int?
+    /// 建 VC 时的重试计数（run #36 R2）：viewDidLoad 的首载就用它，
+    /// 不能写死 0——retryNonce > 0 时重建 VC，首载用 0、updateUIViewController
+    /// 再传 >0 会触发二次重载 + 二次 CloudflareWarmup。
+    private let initialRetryNonce: Int
     private var navigationStartAt: Date?
     /// CF 兜底已关过广告规则：为 true 后不再装规则（堵异步编译完成又把规则装回去的竞态）。
     private var adRulesDisabled = false
 
-    init(url: URL, probe: EmbedProbeState, adStrip: Bool = true) {
+    init(url: URL, probe: EmbedProbeState, adStrip: Bool = true, initialRetryNonce: Int = 0) {
         self.url = url
         self.probe = probe
         self.adStrip = adStrip
+        self.initialRetryNonce = initialRetryNonce
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -2743,7 +2780,7 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
         tap.delegate = self
         webView.addGestureRecognizer(tap)
 
-        loadIfNeeded(url: url)
+        loadIfNeeded(url: url, retryNonce: initialRetryNonce)
     }
 
     @objc private func handleWebViewTap() {
@@ -2766,16 +2803,20 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
     /// 暖完才加载——白屏 10–30 秒就是这么来的。
     func loadIfNeeded(url: URL, retryNonce: Int = 0) {
         let nonceChanged = lastRetryNonce != nil && lastRetryNonce != retryNonce
+        // 本次调用前已载过一页（hadLoadedBefore）：上一页可能走 reloadWithoutRules()
+        // 清空了规则，切到新 URL 时也要把规则重装回去——只认 nonceChanged 的话，
+        // 换 URL（nonce 不变）就永远不重装，第一层广告拦截永久失效。
+        let hadLoadedBefore = loadedURL != nil
         guard loadedURL != url || nonceChanged else { return }
         lastRetryNonce = retryNonce
         loadedURL = url
         navigationStartAt = Date()
         // 上一页关掉广告规则后换了新 URL：规则重新开，新的一页重新评估。
         adRulesDisabled = false
-        // 强制重试时：上一页可能走 reloadWithoutRules() 清空了规则，
+        // 强制重试 / 换页时：上一页可能走 reloadWithoutRules() 清空了规则，
         // 只把 adRulesDisabled 置回 false 不够（规则已从 userContentController
         // 里摘掉），要把缓存的规则重新装回去，否则后续嵌页第一层广告拦截永久失效。
-        if nonceChanged, adStrip, let webView {
+        if (nonceChanged || hadLoadedBefore), adStrip, let webView {
             webView.configuration.userContentController.removeAllContentRuleLists()
             AdBlockRuleStore.install(into: webView.configuration.userContentController, siteHost: url.host ?? "") { [weak self] in
                 !(self?.adRulesDisabled ?? true)
@@ -2911,11 +2952,17 @@ struct EmbedWebView: UIViewControllerRepresentable {
     var retryNonce: Int = 0
 
     func makeUIViewController(context: Context) -> EmbedWebViewController {
-        EmbedWebViewController(url: url, probe: probe, adStrip: adStrip)
+        EmbedWebViewController(url: url, probe: probe, adStrip: adStrip, initialRetryNonce: retryNonce)
     }
 
     func updateUIViewController(_ uiViewController: EmbedWebViewController, context: Context) {
-        uiViewController.loadIfNeeded(url: url, retryNonce: retryNonce)
+        // loadIfNeeded 会同步写 probe 的 @Published（pageLoaded / warmingUp），
+        // 不能在 SwiftUI 视图更新期内调（会撞“Publishing changes from within
+        // view updates”）；挪到下一个 runloop 再跑。重复调也没事，
+        // loadIfNeeded 的 loadedURL/nonce 去重会拦住。
+        DispatchQueue.main.async {
+            uiViewController.loadIfNeeded(url: url, retryNonce: retryNonce)
+        }
     }
 
     static func dismantleUIViewController(_ uiViewController: EmbedWebViewController, coordinator: Coordinator) {

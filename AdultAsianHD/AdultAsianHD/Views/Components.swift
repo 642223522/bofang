@@ -304,13 +304,22 @@ struct CoverImage: View {
                 if Task.isCancelled { return }
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if (400..<500).contains(status) { return }
-                guard status == 200 else { continue }
-                guard let decoded = CryptoImage.decodeCover(data) else { continue }
-                let uiImage = await Task.detached(priority: .userInitiated) { () -> UIImage? in
-                    guard let img = UIImage(data: decoded) else { return nil }
-                    return img.preparingForDisplay() ?? img
+                // 非 200（5xx/网络错的响应）：500ms 退避后再重试一次——
+                // 以前 continue 直接重发，等于无退避连打两下。
+                guard status == 200 else {
+                    if attempt == 0 {
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                    }
+                    continue
+                }
+                // 解密放后台：CryptoImage.decodeCover 是 AES 解密，.task 在主线程跑，
+                // 原来直接调等于主线程解密；解完再预渲染（同一次 detached，少一次 hop）。
+                let decodedImage = await Task.detached(priority: .userInitiated) { () -> (Data, UIImage)? in
+                    guard let decoded = CryptoImage.decodeCover(data),
+                          let img = UIImage(data: decoded) else { return nil }
+                    return (decoded, img.preparingForDisplay() ?? img)
                 }.value
-                guard let uiImage else { continue }
+                guard let (decoded, uiImage) = decodedImage else { continue }
                 CoverImageCache.shared.store(uiImage, rawDecodedData: decoded, for: urlString)
                 if !Task.isCancelled { image = uiImage }
                 return

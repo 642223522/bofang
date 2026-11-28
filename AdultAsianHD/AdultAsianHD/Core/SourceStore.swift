@@ -36,8 +36,9 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
 
     /// Gitee 同步专用会话：.ephemeral（无持久化磁盘缓存）且 urlCache = nil——
     /// 带 access_token 查询参数的 URL 绝不进 URLCache/日志（P0-2）。
-    /// 只供 syncFromGitee 链路（列表 / contents 单文件 / raw 下载）用；
-    /// 上传账本等其他 Gitee 请求不在本次修法范围，不动。
+    /// 供全部 Gitee 链路用：syncFromGitee（列表 / contents 单文件 / raw 下载）
+    /// 与上传账本链路（ensureBranch / uploadFileToGitee，P1-9：原来走
+    /// URLSession.shared，会读共享缓存）。
     private static let giteeSession: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.urlCache = nil
@@ -195,6 +196,8 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     // MARK: - 删除 / 导出 / 取用
 
     /// 删文件 + 清单 + 该源的竞速记录。文件删不掉也不报错，清单照样清。
+    /// 本会话竞速状态（已竞标记 + 首选线）也一并清掉，否则删了重装同 id
+    /// 的源会沿用旧会话的首选线、且不再自动竞速（P1-9）。
     func delete(_ source: SourceRecord) {
         try? fileManager.removeItem(at: sourcesDirectory.appendingPathComponent(source.fileName))
         let update = {
@@ -202,6 +205,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             self.saveManifest()
             self.raceResults.removeValue(forKey: source.id)
             self.saveRaceResults()
+            self.clearSessionRaceState(for: source.id)
         }
         if Thread.isMainThread {
             update()
@@ -235,7 +239,9 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         guard let text = jsSource(for: source) else {
             throw ImportError.unreadable
         }
-        return try WidgetHost(jsSource: text, fallbackTitle: source.fileName, sourceGeneration: Self.fingerprint(of: text))
+        // P1-2：SourceRecord.id 就是可信的模块 id，build 之前预填，
+        // 模块顶层代码调 storage 不再经过空串前缀。
+        return try WidgetHost(jsSource: text, fallbackTitle: source.fileName, sourceGeneration: Self.fingerprint(of: text), preknownModuleID: source.id)
     }
 
     /// 按模块 title/description 猜国家（主页按国家分框用）。
@@ -324,14 +330,21 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
                     // 下载也要带 Token：仓库是私有的，裸 GET 拉 raw 文件会被码云 403 拦。
                     // 两处都带：Authorization 头（直连时用）+ access_token 查询参数
                     // （URLSession 跨域重定向会丢 Authorization 头，查询参数能活下来）。
+                    // 兜底 raw 路径里的文件名先百分号编码（含中文/空格的文件名
+                    // 不编码会让 URLComponents 拼不出 URL）；拼不出时记 firstError，
+                    // 不再静默跳过（P1-9）。
+                    let encodedName = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))) ?? name
                     let rawURLString = Self.validatedGiteeDownloadURL(from: entry)
-                        ?? "https://gitee.com/individual-freedom/ziyong-ziliao-beifang/raw/js/\(name)"
+                        ?? "https://gitee.com/individual-freedom/ziyong-ziliao-beifang/raw/js/\(encodedName)"
                     var rawComponents = URLComponents(string: rawURLString)
                     var rawQueryItems = rawComponents?.queryItems ?? []
                     rawQueryItems.removeAll { $0.name == "access_token" }
                     rawQueryItems.append(URLQueryItem(name: "access_token", value: effectiveToken))
                     rawComponents?.queryItems = rawQueryItems
-                    guard let rawURL = rawComponents?.url else { continue }
+                    guard let rawURL = rawComponents?.url else {
+                        if firstError == nil { firstError = "下载 \(name) 失败（地址拼不出来）" }
+                        continue
+                    }
                     var downloadRequest = URLRequest(url: rawURL)
                     downloadRequest.cachePolicy = .reloadIgnoringLocalCacheData
                     downloadRequest.setValue("token \(effectiveToken)", forHTTPHeaderField: "Authorization")
@@ -345,24 +358,12 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
                     data = rawData
                 }
 
-                // 2. 先校验新文件合法性，校验不通过保留旧源不动
-                guard let text = String(data: data, encoding: .utf8),
-                      !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    if firstError == nil { firstError = "\(name) 不是有效文本文件" }
-                    continue
-                }
-                let validation = WidgetHost.validate(jsSource: text, fallbackTitle: name)
-                // meta 由 importDataCore 在写盘时再取，这里只验合法性
-                // （不绑定 meta，避免未使用警告）。
-                guard validation.ok, validation.meta != nil else {
-                    if firstError == nil { firstError = validation.error ?? "\(name) 不是有效模块" }
-                    continue
-                }
-
-                // 3. 确认下载+校验全部通过，走 importDataCore 写盘+更新清单
+                // 2. 下载到的 data 直接走 importDataCore 写盘+更新清单；
+                // 校验（文本有效 + WidgetHost.validate）在 importDataCore
+                // 里做，不在这里再验一次（P2-6：同一段文本验两遍是重复，
+                // 结果一致；校验失败时 importDataCore 的 .failure 照样记
+                // firstError，旧源不动）。
                 // （源唯一身份只认 meta.id；不去重：同站不同模块也是独立的源）。
-                // 注意 validation 在上面第 2 步已做过，importDataCore 里还会再验一次
-                // （同一段文本，结果一致），只为复用同一套写清单逻辑、不留两套。
                 switch await importDataCore(data, fileName: name, origin: "gitee") {
                 case .success:
                     imported += 1
@@ -506,6 +507,15 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         sessionPreferredLines[sourceId] = preferredLine
     }
 
+    /// 删源时清掉该源的本会话竞速状态（已竞标记 + 首选线）：
+    /// 删了重装同 id 的源，本会话要能重新自动竞速、不用旧首选线。
+    private func clearSessionRaceState(for sourceId: String) {
+        sessionRaceLock.lock()
+        defer { sessionRaceLock.unlock() }
+        racedThisSession.remove(sourceId)
+        sessionPreferredLines.removeValue(forKey: sourceId)
+    }
+
     // MARK: - 上传播放账本（reports 分支）
 
     /// 归一化 Token：去首尾空白与换行；传入非空返回传入值，传入为空则读 Keychain。
@@ -591,7 +601,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         getRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
         getRequest.timeoutInterval = 30
         do {
-            let (data, response) = try await URLSession.shared.data(for: getRequest)
+            let (data, response) = try await Self.giteeSession.data(for: getRequest)
             if let http = response as? HTTPURLResponse {
                 if (200...299).contains(http.statusCode) {
                     return .success(()) // 分支已在
@@ -621,7 +631,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         repoRequest.timeoutInterval = 30
         let defaultBranch: String
         do {
-            let (data, response) = try await URLSession.shared.data(for: repoRequest)
+            let (data, response) = try await Self.giteeSession.data(for: repoRequest)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             if status == 401 || status == 403 {
                 let detail = Self.giteeErrorMessage(from: data).map { "：\($0)" } ?? ""
@@ -657,7 +667,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         }
         createRequest.httpBody = bodyData
         do {
-            let (data, response) = try await URLSession.shared.data(for: createRequest)
+            let (data, response) = try await Self.giteeSession.data(for: createRequest)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             if (200...299).contains(status) {
                 return .success(())
@@ -668,7 +678,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             }
             // 422：只有重新 GET 确认分支真的存在，才按并发已建好放行；否则把码云报错原样透出。
             if status == 422 {
-                if let (_, recheck) = try? await URLSession.shared.data(for: getRequest),
+                if let (_, recheck) = try? await Self.giteeSession.data(for: getRequest),
                    let recheckHTTP = recheck as? HTTPURLResponse,
                    (200...299).contains(recheckHTTP.statusCode) {
                     return .success(())
@@ -714,7 +724,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             getRequest.setValue("token \(token)", forHTTPHeaderField: "Authorization")
             getRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
             getRequest.timeoutInterval = 30
-            let (data, response) = try await URLSession.shared.data(for: getRequest)
+            let (data, response) = try await Self.giteeSession.data(for: getRequest)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             if status == 401 || status == 403 {
                 let detail = Self.giteeErrorMessage(from: data).map { "：\($0)" } ?? ""
@@ -757,7 +767,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         writeRequest.httpBody = bodyData
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: writeRequest)
+            let (data, response) = try await Self.giteeSession.data(for: writeRequest)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             if (200...299).contains(status) {
                 return .success(())

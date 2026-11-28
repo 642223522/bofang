@@ -142,8 +142,12 @@ final class WidgetHost: @unchecked Sendable {
     /// 建 context、注入 Widget 桥接、evaluate 模块源码、取出元数据与模块清单。
     /// 取不到或格式不对就 throw（中文人话）。本方法只 evaluate，不发任何请求。
     /// fallbackTitle：WidgetMetadata 缺标题时用的兜底（一般传文件名），再没有用 id。
-    init(jsSource: String, fallbackTitle: String? = nil, sourceGeneration: String = "") throws {
-        let built = try Self.buildOnMainThread(jsSource: jsSource, fallbackTitle: fallbackTitle)
+    /// preknownModuleID：调用方已知的可信模块 id（SourceStore.loadHost 传
+    /// SourceRecord.id），evaluateScript 之前就预填进 ModuleIDBox，
+    /// 模块顶层代码调 storage 走的就是本模块前缀（P1-2）；导入校验没有可信
+    /// id 时传 nil，build 里用一次性临时命名空间，绝不共用空串。
+    init(jsSource: String, fallbackTitle: String? = nil, sourceGeneration: String = "", preknownModuleID: String? = nil) throws {
+        let built = try Self.buildOnMainThread(jsSource: jsSource, fallbackTitle: fallbackTitle, preknownModuleID: preknownModuleID)
         self.context = built.context
         self.meta = built.meta
         self.modules = built.modules
@@ -179,20 +183,20 @@ final class WidgetHost: @unchecked Sendable {
         let nativePromiseConstructor: JSValue?
     }
 
-    private static func buildOnMainThread(jsSource: String, fallbackTitle: String? = nil) throws -> BuiltHost {
+    private static func buildOnMainThread(jsSource: String, fallbackTitle: String? = nil, preknownModuleID: String? = nil) throws -> BuiltHost {
         if Thread.isMainThread {
-            return try build(jsSource: jsSource, fallbackTitle: fallbackTitle)
+            return try build(jsSource: jsSource, fallbackTitle: fallbackTitle, preknownModuleID: preknownModuleID)
         }
         // 不在主线程时同步切过去建（init 是同步的，没法 await；
         // 主线程调进来时走上面那条，不会死锁）。
         var result: Result<BuiltHost, Error>?
         DispatchQueue.main.sync {
-            result = Result { try build(jsSource: jsSource, fallbackTitle: fallbackTitle) }
+            result = Result { try build(jsSource: jsSource, fallbackTitle: fallbackTitle, preknownModuleID: preknownModuleID) }
         }
         return try result!.get()
     }
 
-    private static func build(jsSource: String, fallbackTitle: String? = nil) throws -> BuiltHost {
+    private static func build(jsSource: String, fallbackTitle: String? = nil, preknownModuleID: String? = nil) throws -> BuiltHost {
         guard let context = JSContext() else {
             throw WidgetHostError.invalidFormat("创建 JS 环境失败")
         }
@@ -213,10 +217,18 @@ final class WidgetHost: @unchecked Sendable {
         let nativePromiseConstructor = context.objectForKeyedSubscript("Promise")
         let promiseStore = NativePromiseStore()
         promiseStore.constructor = nativePromiseConstructor
-        // P1-11：模块 id 的盒子——桥安装时 id 还不知道（id 在 WidgetMetadata 里，
-        // evaluateScript 之后才取得到），桥里的 storage/localStorage block 只拿
-        // 这个盒子、每次调用现算前缀；取到 meta.id 后立刻填进去（见下面 metaId 处）。
+        // P1-11：模块 id 的盒子——桥里的 storage/localStorage block 只拿
+        // 这个盒子、每次调用现算前缀。P1-2：调用方已知的可信 id 在装桥之前
+        // 就预填进去，模块顶层代码调 storage 走的就是本模块前缀；
+        // 导入校验没有可信 id 时用一次性临时命名空间（"__import__.<随机>"），
+        // 校验阶段的读写落在独立前缀下，绝不共用空串前缀；
+        // meta.id 到手后下面再以它为准（临时 host 随即丢弃）。
         let moduleIDBox = ModuleIDBox()
+        if let preknownModuleID, !preknownModuleID.isEmpty {
+            moduleIDBox.id = preknownModuleID
+        } else {
+            moduleIDBox.id = "__import__." + UUID().uuidString
+        }
         installWidgetBridge(in: context, interceptor: interceptor, httpRegistry: httpRegistry, timerRegistry: timerRegistry, promiseStore: promiseStore, exceptionBox: box, moduleIDBox: moduleIDBox)
 
         context.evaluateScript(jsSource)
@@ -234,9 +246,12 @@ final class WidgetHost: @unchecked Sendable {
         guard !metaId.isEmpty else {
             throw WidgetHostError.invalidFormat("这个脚本不是 ForwardWidget 模块格式（模块信息不完整，缺 id）")
         }
-        // P1-11：id 一到手就填进盒子，之后模块调 Widget.storage / localStorage
-        // 用的就是带本模块 id 的前缀（fw.storage.<moduleId>. / fw.localstorage.<moduleId>.）。
-        moduleIDBox.id = metaId
+        // P1-11 + P1-2：id 以模块自报的 meta.id 为准。正常与预填一致
+        //（预填的 id 本就是上次导入时从同一个模块的 meta 取的），
+        // 不一致时信模块、不信旧记录；导入校验时这里把临时命名空间换成真 id。
+        if moduleIDBox.id != metaId {
+            moduleIDBox.id = metaId
+        }
         // 标题缺失不整文件报错：先用调用方给的文件名，再退回 id。
         let metaTitle: String = {
             if let t = metaDict["title"] as? String, !t.isEmpty { return t }
@@ -418,8 +433,9 @@ final class WidgetHost: @unchecked Sendable {
 
         // Widget.storage.get(key) / set(key, value)：同步，UserDefaults，按模块 id 隔离，
         // 前缀 fw.storage.<moduleId>.（P1-11：原来是固定前缀 fw.storage.，任何模块都能
-        // 读写别家模块存的 token）。id 在 build() 里 evaluateScript 之后才取到，桥必须
-        // 先装，所以前缀不在安装时拼死——block 每次调用现算（盒子里的 id 在 meta 取到后填）。
+        // 读写别家模块存的 token）。id 在装桥之前已预填（loadHost 传 SourceRecord.id，
+        // 导入校验用临时命名空间），evaluateScript 之后再以 meta.id 为准校正一次；
+        // 前缀不在安装时拼死——block 每次调用现算（盒子里的 id 可能被校正）。
         // 前缀末尾带 "."：clear() 按前缀枚举删键时，"user.pornjav" 不会误删 "user.pornjav2" 的键。
         // get 不存在返回 JS null（模块里 `if (raw)` 判空能正常工作）。
         let storagePrefix: () -> String = { "fw.storage." + moduleIDBox.id + "." }
@@ -449,6 +465,10 @@ final class WidgetHost: @unchecked Sendable {
             UserDefaults.standard.removeObject(forKey: storagePrefix() + key)
         }
         let storageClear: @convention(block) () -> Void = {
+            // P2-4：顶层求值期 id 还没定（空串）时不执行——空前缀
+            // "fw.storage.." 会把别的模块顶层求值期落下的键一并清掉。
+            // 正常加载已预填真 id、校验用临时命名空间，这行只是防卫。
+            guard !moduleIDBox.id.isEmpty else { return }
             clearKeysWithPrefix(storagePrefix())
         }
         storage.setValue(storageGet, forProperty: "get")
@@ -478,6 +498,8 @@ final class WidgetHost: @unchecked Sendable {
             UserDefaults.standard.removeObject(forKey: localStoragePrefix() + key)
         }
         let localStorageClear: @convention(block) () -> Void = {
+            // P2-4：与 Widget.storage.clear 同款，id 为空时不执行。
+            guard !moduleIDBox.id.isEmpty else { return }
             clearKeysWithPrefix(localStoragePrefix())
         }
         localStorage.setValue(localStorageGetItem, forProperty: "getItem")
@@ -520,6 +542,9 @@ final class WidgetHost: @unchecked Sendable {
                 g.console = c;
             })(this);
             """)
+        // 内部 eval 的异常也要清掉（同 URL 胶水那处）：console 安装脚本
+        // 抛错时不留给模块求值，takeException 不会误算到模块头上。
+        exceptionBox.message = nil
 
         // setTimeout / clearTimeout：裸 JavaScriptCore 没有这两个（浏览器才有），
         // 但模块里常用来做超时兜底（比如 onlybokep 封面补全的 8 秒封顶）；
@@ -572,37 +597,10 @@ final class WidgetHost: @unchecked Sendable {
         let setInterval: @convention(block) (JSValue, Double) -> Int = { [weak context] callback, delayMs in
             // delay 非数/没传时按 4ms 算（JSC 传过来的 NaN 与 setTimeout 同款处理，只是下限不同）。
             let delay = delayMs.isFinite ? max(delayMs, 4) : 4
-            var scheduleNext: ((Int) -> Void)!
-            // 一个 tick 的 work：检查、回调、（id 还在表里就）排下一次。
-            // 首个 tick 与后续 tick 共用这一份，不再各写一份。
-            let makeTickWork: (Int) -> DispatchWorkItem = { id in
-                DispatchWorkItem {
-                    // 已被 clear（注册表里没这个 id）就停，不触发也不重排。
-                    guard timerRegistry.contains(id) else { return }
-                    guard let context, !callback.isUndefined, !callback.isNull else {
-                        timerRegistry.remove(id)
-                        return
-                    }
-                    callback.call(withArguments: [])
-                    // P1-4c：同 setTimeout，读完即清。
-                    if let message = exceptionBox.message, !message.isEmpty {
-                        #if DEBUG
-                        print("[WidgetHost] setInterval 回调抛错：\(message)")
-                        #endif
-                        exceptionBox.message = nil
-                    }
-                    // 回调里可能调了 clearInterval；只有 id 还在表里才排下一次。
-                    if timerRegistry.contains(id) {
-                        scheduleNext(id)
-                    }
-                }
-            }
-            scheduleNext = { id in
-                let work = makeTickWork(id)
-                timerRegistry.store(work, for: id)
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay / 1000.0, execute: work)
-            }
-            guard let registered = timerRegistry.register(makeTickWork) else {
+            guard let context else { return 0 }
+            guard let registered = timerRegistry.register({ id in
+                Self.makeIntervalTickWork(id: id, delayMs: delay, callback: callback, context: context, timerRegistry: timerRegistry, exceptionBox: exceptionBox)
+            }) else {
                 #if DEBUG
                 print("[WidgetHost] setInterval 已达上限（\(TimerRegistry.maxTimers) 个），本次调用忽略")
                 #endif
@@ -1541,6 +1539,48 @@ final class WidgetHost: @unchecked Sendable {
                 };
             })(this);
             """)
+        // 内部 eval 的异常也要清掉（同 console 安装那处）：fetch 与
+        // __fwArrayBufferFromBytes 两段安装脚本的异常不留给模块求值。
+        exceptionBox.message = nil
+    }
+
+    /// setInterval 一个 tick 的 work（P1-1）：静态方法，不捕获可变 var，
+    /// 不与 setInterval 的 block 相互强捕获。work 闭包只弱持 context
+    ///（[weak context]，context 释放后 tick 自停）；callback 必须强持，
+    /// 否则 JS 函数会被 GC 收掉、tick 再也调不到它。
+    /// tick 触发时先看 id 是否还在表里（clearInterval 已把它拿掉就不触发
+    /// 也不重排），回调完、id 还在表里才经 scheduleIntervalTick 排下一次，
+    /// 所以回调里调 clearInterval（包括自己清自己）能停。
+    private static func makeIntervalTickWork(id: Int, delayMs: Double, callback: JSValue, context: JSContext, timerRegistry: TimerRegistry, exceptionBox: ExceptionBox) -> DispatchWorkItem {
+        DispatchWorkItem { [weak context] in
+            // 已被 clear（注册表里没这个 id）就停，不触发也不重排。
+            guard timerRegistry.contains(id) else { return }
+            guard let context, !callback.isUndefined, !callback.isNull else {
+                timerRegistry.remove(id)
+                return
+            }
+            callback.call(withArguments: [])
+            // P1-4c：同 setTimeout，读完即清。
+            if let message = exceptionBox.message, !message.isEmpty {
+                #if DEBUG
+                print("[WidgetHost] setInterval 回调抛错：\(message)")
+                #endif
+                exceptionBox.message = nil
+            }
+            // 回调里可能调了 clearInterval；只有 id 还在表里才排下一次。
+            if timerRegistry.contains(id) {
+                Self.scheduleIntervalTick(id: id, delayMs: delayMs, callback: callback, context: context, timerRegistry: timerRegistry, exceptionBox: exceptionBox)
+            }
+        }
+    }
+
+    /// 排 setInterval 的下一次 tick（P1-1）：静态递归，不捕获可变 var。
+    /// timerRegistry.store 在 id 已被取消时返回 false，这时不再 asyncAfter，
+    /// 防取消后僵尸 tick。
+    private static func scheduleIntervalTick(id: Int, delayMs: Double, callback: JSValue, context: JSContext, timerRegistry: TimerRegistry, exceptionBox: ExceptionBox) {
+        let work = makeIntervalTickWork(id: id, delayMs: delayMs, callback: callback, context: context, timerRegistry: timerRegistry, exceptionBox: exceptionBox)
+        guard timerRegistry.store(work, for: id) else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delayMs / 1000.0, execute: work)
     }
 
     /// 从 context 取 Promise 构造器，用 executor block 造一个 JS Promise。
@@ -1595,12 +1635,14 @@ final class WidgetHost: @unchecked Sendable {
             let box = JSCallbackBox(resolve: resolve, reject: reject)
             // executor Task 是 detached 的：记进登记表，完事自己注销；
             // host 释放时由 cancelAll 统一取消。
-            // 注意：Task 体内第一个 await（fetchHTTP）才会挂起，register
-            // 一定在 Task 跑完之前执行到，defer 里的 unregister 不会漏。
-            var taskID: UUID?
+            // P1-2：taskID 在建 Task 之前就定好（不跨线程读写 var），
+            // defer 用同一个 id 注销；Task 若在 register 之前已跑完，
+            // unregister 先记 finishedIDs，register 在锁内看到就不再登记，
+            // 不会漏注销、不会滞留。
+            let taskID = UUID()
             let task = Task {
                 defer {
-                    if let taskID { httpRegistry.unregister(taskID) }
+                    httpRegistry.unregister(taskID)
                 }
                 do {
                     let (status, data, responseHeaders, rawData, finalURL) = try await Self.fetchBridgeHTTP(
@@ -1639,7 +1681,7 @@ final class WidgetHost: @unchecked Sendable {
                     }
                 }
             }
-            taskID = httpRegistry.register(task)
+            httpRegistry.register(task, id: taskID)
         }
         // P1-3：构造器是建桥时从全新 context 上取下的原生构造器（不是现取的全局
         // Promise，模块改写全局 Promise 也影响不到它）；construct 失败也不
@@ -1660,10 +1702,12 @@ final class WidgetHost: @unchecked Sendable {
             let box = JSCallbackBox(resolve: resolve, reject: reject)
             // executor Task 是 detached 的：记进登记表，完事自己注销；
             // host 释放时由 cancelAll 统一取消（与 GET 同理）。
-            var taskID: UUID?
+            // P1-2：taskID 在建 Task 之前就定好（与 GET 同款，不跨线程读写 var）；
+            // 提前跑完的注销见 GET 处的注释，锁内对齐。
+            let taskID = UUID()
             let task = Task {
                 defer {
-                    if let taskID { httpRegistry.unregister(taskID) }
+                    httpRegistry.unregister(taskID)
                 }
                 do {
                     let (status, data, responseHeaders, rawData, finalURL) = try await Self.fetchHTTP(
@@ -1704,7 +1748,7 @@ final class WidgetHost: @unchecked Sendable {
                     }
                 }
             }
-            taskID = httpRegistry.register(task)
+            httpRegistry.register(task, id: taskID)
         }
         // P1-3：与 GET 同款——原生构造器 + construct 失败返回已拒绝的 Promise，不 fatalError。
         guard let promiseConstructor = nativePromiseConstructor,
@@ -1876,11 +1920,21 @@ final class WidgetHost: @unchecked Sendable {
     /// ≤1 MiB 直接急切构造（装箱量可接受，行为与原来一致）；
     /// 1–16 MiB 装惰性 getter，JS 第一次读 .arrayBuffer 时才构造——
     /// fetch().arrayBuffer() 与模块直接读 res.arrayBuffer 都是按需读，
-    /// 平时不付装箱钱；建好后把 getter 换成普通值属性，后续访问不再经过
-    /// getter，getter 连同它捕获的 raw 一起释放。
+    /// 平时不付装箱钱；首次访问后用 defineProperty 把访问器覆写成普通
+    /// 数据属性，后续访问不再经过 getter。
     /// >16 MiB 不装（与原来一致，属性缺省）。16 MiB 上限阈值保持不变。
     /// 只在主线程调（调用点都在 MainActor.run 里）。
     /// JS 侧契约不变：res.arrayBuffer 仍是 ArrayBuffer（或缺省），只是什么时候构造变了。
+    /// P0-1：getter block 不捕获 raw / context / result——getter 挂在 result
+    /// 上又强捕获 result/context 会形成跨边界强引用环（JS GC 看不到 Swift
+    /// 侧的边），每条大响应永久泄漏 Data + 整个 JSContext；且原来 getter 内
+    /// 调 result.setValue 走 [[Set]]，只读访问器（无 set）不会被替换成数据
+    /// 属性，每次访问都重复全量装箱、严格模式下还抛 TypeError 污染 exceptionBox。
+    /// 所以 Data 按 token 存在下面的弱键登记表里，getter 运行时用
+    /// JSContext.current() 取 context、JSContext.currentThis() 取 result，
+    /// 从 result 的不可枚举 __fwArrayBufferToken 属性读 token 再取 Data；
+    /// 首次访问后删登记，并用 defineProperty（带 JSPropertyDescriptorValueKey）
+    /// 把属性覆写成普通数据属性，不再走 setValue。
     private static func installArrayBuffer(from raw: Data, in context: JSContext, on result: JSValue) {
         guard raw.count <= 16 * 1024 * 1024 else { return }
         if raw.count <= 1 * 1024 * 1024 {
@@ -1889,12 +1943,53 @@ final class WidgetHost: @unchecked Sendable {
             }
             return
         }
-        let getter: @convention(block) () -> JSValue = {
-            guard let buffer = WidgetHost.jsArrayBuffer(from: raw, in: context) else {
-                return JSValue(undefinedIn: context)!
-            }
-            // 建好就换成普通值属性：后续访问零开销，getter 连同它捕获的 raw 一起释放。
-            result.setValue(buffer, forProperty: "arrayBuffer")
+        // Data 登记（token → Data），与 result 的 JSValue 生命周期解耦：
+        // 表按 context 弱键，context 释放时整条消失，从没被读过的 Data
+        // 也随之释放，不永久滞留。
+        let token = UUID().uuidString
+        arrayBufferPendingLock.lock()
+        var pending = arrayBufferPending.object(forKey: context)
+        if pending == nil {
+            pending = NSMutableDictionary()
+            arrayBufferPending.setObject(pending, forKey: context)
+        }
+        pending?.setObject(raw as NSData, forKey: token as NSString)
+        arrayBufferPendingLock.unlock()
+        // token 存在 result 的不可枚举内部属性上（getter 运行时从 this 上读）；
+        // 不可枚举：模块 for..in / Object.keys / JSON.stringify 看不到它。
+        guard let tokenValue = JSValue(object: token, in: context) else { return }
+        result.defineProperty(
+            "__fwArrayBufferToken",
+            descriptor: [
+                JSPropertyDescriptorValueKey: tokenValue,
+                JSPropertyDescriptorWritableKey: true,
+                JSPropertyDescriptorEnumerableKey: false,
+                JSPropertyDescriptorConfigurableKey: true,
+            ]
+        )
+        // getter 不捕获任何东西（空捕获列表）：raw / context / result 全在
+        // 运行时取，block 与 result 之间没有强引用环。
+        let getter: @convention(block) () -> JSValue? = {
+            guard let context = JSContext.current(),
+                  let this = JSContext.currentThis(),
+                  let token = this.objectForKeyedSubscript("__fwArrayBufferToken")?.toString() else { return nil }
+            arrayBufferPendingLock.lock()
+            let raw = arrayBufferPending.object(forKey: context)?.object(forKey: token) as? Data
+            arrayBufferPendingLock.unlock()
+            guard let raw, let buffer = WidgetHost.jsArrayBuffer(from: raw, in: context) else { return nil }
+            // 首次访问：删登记，再用 defineProperty 把访问器覆写成普通数据属性。
+            arrayBufferPendingLock.lock()
+            arrayBufferPending.object(forKey: context)?.removeObject(forKey: token)
+            arrayBufferPendingLock.unlock()
+            this.defineProperty(
+                "arrayBuffer",
+                descriptor: [
+                    JSPropertyDescriptorValueKey: buffer,
+                    JSPropertyDescriptorWritableKey: true,
+                    JSPropertyDescriptorEnumerableKey: true,
+                    JSPropertyDescriptorConfigurableKey: true,
+                ]
+            )
             return buffer
         }
         guard let getterValue = JSValue(object: getter, in: context) else { return }
@@ -1907,6 +2002,12 @@ final class WidgetHost: @unchecked Sendable {
             ]
         )
     }
+
+    /// 惰性 arrayBuffer 的待装箱 Data 登记表（P0-1，见 installArrayBuffer）：
+    /// 弱键是 JSContext（context 释放时条目自动消失），值是 token → Data 的字典。
+    /// NSMapTable 弱键依赖零化弱引用，JSContext 是 NSObject，可用。
+    private static let arrayBufferPendingLock = NSLock()
+    private static let arrayBufferPending = NSMapTable<JSContext, NSMutableDictionary>.weakToStrongObjects()
 
     /// 响应体能解析成 JSON 就给对象/数组，否则给文本。
     /// 模块里 `typeof data === "object"` 时直接当 JSON 用，文本时 JSON.parse。
@@ -2305,6 +2406,8 @@ final class WidgetHost: @unchecked Sendable {
     }
 
     /// 导入时做格式校验：新建一个临时 WidgetHost（只 evaluate + 取元数据，不发请求）。
+    /// 没有可信 id 可预填，build 里用一次性临时命名空间，顶层求值期的
+    /// storage 读写不落到任何真实模块前缀下；校验完 host 即丢弃。
     static func validate(jsSource: String, fallbackTitle: String? = nil) -> (ok: Bool, meta: WidgetMeta?, error: String?) {
         do {
             let host = try WidgetHost(jsSource: jsSource, fallbackTitle: fallbackTitle)
@@ -2919,12 +3022,15 @@ private final class TimerRegistry: @unchecked Sendable {
     }
 
     /// 换掉某个 id 的 work（setInterval 每 tick 建新的 work 时用）。
-    /// id 已被 cancel 时不复活——清掉后不重排。
-    func store(_ work: DispatchWorkItem, for id: Int) {
+    /// id 已被 cancel 时不复活——清掉后不重排。返回 false = id 已不在表里，
+    /// 调用方不得再排这个定时器（见 scheduleIntervalTick）。
+    @discardableResult
+    func store(_ work: DispatchWorkItem, for id: Int) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard timers[id] != nil else { return }
+        guard timers[id] != nil else { return false }
         timers[id] = work
+        return true
     }
 
     /// 该 id 是否还在表里（setInterval 的 tick 触发时查，决定停不停）。
@@ -2966,18 +3072,25 @@ private final class TimerRegistry: @unchecked Sendable {
 private final class HTTPRequestRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var tasks: [UUID: Task<Void, Never>] = [:]
+    /// 已跑完（defer 里的 unregister 先于 register 到达）的任务 id：
+    /// Task 建好就可能在别的线程先跑完，register 时查这里，已跑完的
+    /// 不再登记——否则 unregister 漏掉、已完成的任务永久滞留表里。
+    /// cancelAll 时一并清掉（host 释放后旧 id 不再有意义）。
+    private var finishedIDs: Set<UUID> = []
 
-    func register(_ task: Task<Void, Never>) -> UUID {
-        let id = UUID()
+    /// 建 Task 之前先定 id（调用方 `let taskID = UUID()`），再把同一个 id
+    /// 传进来登记；defer 里的 unregister 用同一个 id，锁内对齐。
+    func register(_ task: Task<Void, Never>, id: UUID) {
         lock.lock()
+        defer { lock.unlock() }
+        guard !finishedIDs.contains(id) else { return }
         tasks[id] = task
-        lock.unlock()
-        return id
     }
 
     func unregister(_ id: UUID) {
         lock.lock()
         tasks.removeValue(forKey: id)
+        finishedIDs.insert(id)
         lock.unlock()
     }
 
@@ -2985,6 +3098,7 @@ private final class HTTPRequestRegistry: @unchecked Sendable {
         lock.lock()
         let current = tasks
         tasks.removeAll()
+        finishedIDs.removeAll()
         lock.unlock()
         for task in current.values { task.cancel() }
     }
@@ -2992,7 +3106,9 @@ private final class HTTPRequestRegistry: @unchecked Sendable {
 
 /// 防 continuation 被两个回调各 resume 一次（Promise 正常只调一个，但防一手，
 /// 重复 resume 会直接 crash）。
-private final class OnceBox {
+/// @unchecked Sendable：内部状态全在 NSLock 后，跨 Task/onCancel 闭包用安全
+///（与 ContinuationBox 同款）；加这个标注只是让严格并发检查放行。
+private final class OnceBox: @unchecked Sendable {
     private let lock = NSLock()
     private var done = false
 

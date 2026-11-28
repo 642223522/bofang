@@ -70,6 +70,12 @@ final class CloudflareWarmup {
                 return
             }
             let outcome = await self.runWarmup(host: host, playbackWebView: webView, container: container)
+            // P1-8：被取消的会话不是 WAF 拦截——不记 .waf / 403 诊断，
+            // 否则检测页会把一次主动取消误报成一次 CF 拦截。
+            if outcome.cancelled {
+                completion()
+                return
+            }
             let event = NetworkDiagEvent(
                 id: UUID(),
                 at: Date(),
@@ -101,8 +107,9 @@ final class CloudflareWarmup {
     }
 
     /// 预热并返回结果：cleared=有没有拿到并同步 cf_clearance，
-    /// attempts=实际跑了几次，seconds=总耗时秒数。
-    private func runWarmup(host: String, playbackWebView: WKWebView, container: UIView?) async -> (cleared: Bool, attempts: Int, seconds: Double) {
+    /// attempts=实际跑了几次，seconds=总耗时秒数，
+    /// cancelled=是不是中途被取消（取消不算预热失败，不记 .waf / 403）。
+    private func runWarmup(host: String, playbackWebView: WKWebView, container: UIView?) async -> (cleared: Bool, attempts: Int, seconds: Double, cancelled: Bool) {
         let started = Date()
         let elapsed: () -> Double = { Date().timeIntervalSince(started) }
         let config = WKWebViewConfiguration()
@@ -127,24 +134,27 @@ final class CloudflareWarmup {
         track(session)
         defer {
             untrack(session.id)
+            // P1-8：defer 里必须停掉预热 WebView 的加载——只 removeFromSuperview
+            // 不 stopLoading 的话，返回后它还在后台继续跑 CF 挑战、占着会话。
+            warmView.stopLoading()
             warmView.removeFromSuperview()
         }
-        guard let url = URL(string: "https://\(host)/") else { return (false, 0, elapsed()) }
+        guard let url = URL(string: "https://\(host)/") else { return (false, 0, elapsed(), false) }
         for attempt in 1...maxAttempts {
-            if Task.isCancelled || session.cancelled { return (false, attempt - 1, elapsed()) }
+            if Task.isCancelled || session.cancelled { return (false, attempt - 1, elapsed(), true) }
             warmView.load(URLRequest(url: url, timeoutInterval: 15))
             // 轮询等 cf_clearance 出现（Task sleep，不用 Timer）。
             let deadline = Date().addingTimeInterval(perAttemptWait)
             while Date() < deadline {
-                if Task.isCancelled || session.cancelled { return (false, attempt - 1, elapsed()) }
+                if Task.isCancelled || session.cancelled { return (false, attempt - 1, elapsed(), true) }
                 try? await Task.sleep(nanoseconds: pollInterval)
                 if await hasValidClearance(for: host, in: warmView) {
                     await syncClearance(from: warmView, to: playbackWebView, host: host)
-                    return (true, attempt, elapsed())
+                    return (true, attempt, elapsed(), false)
                 }
             }
         }
-        return (false, maxAttempts, elapsed())
+        return (false, maxAttempts, elapsed(), false)
     }
 
     /// 把预热 WebView 里的 cf_clearance 同步进播放 WebView 的 cookie store。

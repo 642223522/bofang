@@ -65,7 +65,14 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     var onKeyAuthFailed: (@Sendable () async -> Bool)?
 
     /// 播单里见到了 skd://（FairPlay）：拦截器处理不了，上层据此报明确错误。
-    private(set) var encounteredFairPlay = false
+    /// 锁保护的读写：后台 Task 写（setFairPlayFlag）、主线程读（Playback /
+    /// CustomPlayerView），旧 private(set) var 是只锁写不锁读的数据竞争（P1-4）。
+    private var _encounteredFairPlay = false
+    var encounteredFairPlay: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _encounteredFairPlay
+    }
 
     /// delegate 回调跑的队列（AVAssetResourceLoader.setDelegate 用）。
     let delegateQueue = DispatchQueue(label: "com.liudehen.xiaoshipin.hlsloader", qos: .userInitiated)
@@ -115,18 +122,45 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     /// 预检结果：拦截器第一次拉 playlist 的结果本身就是预检（直接用、不丢弃；
     /// 一次性 URL 不做额外 GET，额外 GET 会消费一次性 token）。
     /// 首次播单请求的 HTTP 状态码；nil = 还没拉过播单。
-    private(set) var preflightPlaylistStatusCode: Int?
+    /// 锁保护的读写（P1-4）：后台写（recordPreflight）、主线程读（Playback），
+    /// 与 encounteredFairPlay 同款私有底层存储 + 加锁只读计算属性，调用方零改动。
+    private var _preflightPlaylistStatusCode: Int?
+    var preflightPlaylistStatusCode: Int? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _preflightPlaylistStatusCode
+    }
     /// 首次播单响应体是不是 M3U8。
-    private(set) var preflightPlaylistIsM3U8: Bool?
+    private var _preflightPlaylistIsM3U8: Bool?
+    var preflightPlaylistIsM3U8: Bool? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _preflightPlaylistIsM3U8
+    }
     /// 最近一次失败的分层与状态码（供 markFailed 组分层错误上报，账本复用）。
-    private(set) var lastFailureStage: PlaybackFailureStage?
-    private(set) var lastFailureStatusCode: Int?
+    private var _lastFailureStage: PlaybackFailureStage?
+    var lastFailureStage: PlaybackFailureStage? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _lastFailureStage
+    }
+    private var _lastFailureStatusCode: Int?
+    var lastFailureStatusCode: Int? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _lastFailureStatusCode
+    }
     /// 播单里见过的 #EXT-X-TARGETDURATION（秒）：seek 容差/看门狗预算的
     /// 分片时长来源 1（最准）。rewritePlaylist 逐行改写时顺带记录；
     /// 变体播单与媒体播单都可能带它，取最后一次见到的值。
-    /// 写统一走 setTargetDurationSeconds（stateLock）；读在主线程直接读
-    ///（与 encounteredFairPlay / preflight 同款写法，调用方在别的文件）。
-    private(set) var targetDurationSeconds: Double?
+    /// 锁保护的读写（P1-4）：写走 setTargetDurationSeconds（stateLock），
+    /// 读（CustomPlayerView 主线程）走这里的加锁计算属性，不再直接读 var。
+    private var _targetDurationSeconds: Double?
+    var targetDurationSeconds: Double? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _targetDurationSeconds
+    }
 
     /// 首个入口 URL（第一次 fetch 的 URL，一般是播单）：跨源判定锚点。
     /// 跨源子请求（第三方 CDN 分片/密钥/变体）不带 Cookie/Authorization
@@ -153,7 +187,7 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     private func setTargetDurationSeconds(_ seconds: Double) {
         stateLock.lock()
         defer { stateLock.unlock() }
-        targetDurationSeconds = seconds
+        _targetDurationSeconds = seconds
     }
 
     /// headers：已合并好的子请求头（iPhone UA + Referer + 模块自定义头 + Cookie）。
@@ -401,11 +435,24 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     /// .ts 请求不经过 delegate，改 scheme 只会 404 / -12881）。
     /// TODO(备选)：key 可内联成 data: URI（多 key 轮换时需内联多个），本轮不实现。
     private func rewritePlaylist(_ text: String, baseURL: URL) -> String {
-        let lines = text.components(separatedBy: .newlines)
+        // P1-3：先归一化行尾再拆行。text.components(separatedBy: .newlines)
+        // 会把 "\r\n" 拆成 "\r" + "\n" 两个分隔符、中间多出一个空串 ""，
+        // 空串落入 else 分支会把 nextLineIsVariant 清零，导致
+        // #EXT-X-STREAM-INF: 下一行的无扩展名变体播单绕过拦截器。
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let lines = normalized.components(separatedBy: .newlines)
         var out: [String] = []
         out.reserveCapacity(lines.count)
         var nextLineIsVariant = false
         for line in lines {
+            // 纯空白行（真空行）不重置 nextLineIsVariant：变体标记行与
+            // 变体 URI 行之间夹空行时，空行不能把“下一行是变体”吃掉。
+            if line.trimmingCharacters(in: .whitespaces).isEmpty {
+                out.append(line)
+                continue
+            }
             // 分片时长：seek 容差/看门狗预算用（见 CustomPlayerView.seekSegmentDurationSeconds）。
             if line.hasPrefix("#EXT-X-TARGETDURATION:") {
                 let value = line.dropFirst("#EXT-X-TARGETDURATION:".count)
@@ -617,24 +664,24 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     private func setFairPlayFlag() {
         stateLock.lock()
         defer { stateLock.unlock() }
-        encounteredFairPlay = true
+        _encounteredFairPlay = true
     }
 
     /// 分层失败记录（供 markFailed 组分层错误上报，账本复用）。
     private func recordFailure(stage: PlaybackFailureStage, statusCode: Int?) {
         stateLock.lock()
         defer { stateLock.unlock() }
-        lastFailureStage = stage
-        lastFailureStatusCode = statusCode
+        _lastFailureStage = stage
+        _lastFailureStatusCode = statusCode
     }
 
     /// 预检记录：只记第一次拉 playlist 的结果（直接用、不丢弃）。
     private func recordPreflight(statusCode: Int, isM3U8: Bool) {
         stateLock.lock()
         defer { stateLock.unlock() }
-        if preflightPlaylistStatusCode == nil {
-            preflightPlaylistStatusCode = statusCode
-            preflightPlaylistIsM3U8 = isM3U8
+        if _preflightPlaylistStatusCode == nil {
+            _preflightPlaylistStatusCode = statusCode
+            _preflightPlaylistIsM3U8 = isM3U8
         }
     }
 

@@ -205,6 +205,11 @@ final class LoopbackProxyServer: NSObject {
 
     private func ephemeralConfiguration() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
+        // P1-6：显式关掉缓存与“等网络恢复”——ephemeral 默认无持久缓存，
+        // 但 urlCache 不写死 nil 仍可能被上游响应写盘；waitsForConnectivity
+        // 默认 false，写死防以后默认值变了把 AVPlayer 的首字节预算拖死。
+        config.urlCache = nil
+        config.waitsForConnectivity = false
         // 上游慢就早点死，别让 AVPlayer 在首字节预算里空等。
         config.timeoutIntervalForRequest = 15
         config.timeoutIntervalForResource = 60
@@ -246,6 +251,13 @@ final class LoopbackProxyServer: NSObject {
     /// 只绑回环接口（requiredInterfaceType = .loopback）：不占局域网地址，
     /// 不触发 iOS 本地网络权限提示；AVPlayer 只连 127.0.0.1，本来就不需要别的接口。
     private func bindListener() {
+        // P1-6：stop() 后 1 秒重试的 asyncAfter 可能还排着——stop 之后
+        // 才跑到这里必须直接收手，不然会起一个没人管的僵尸监听
+        //（onListenerFailed 只在失败那一刻查 stopped，1 秒窗口里 stop 拦不住）。
+        stateLock.lock()
+        let isStopped = stopped
+        stateLock.unlock()
+        guard !isStopped else { return }
         let listener: NWListener
         do {
             let params = NWParameters.tcp
@@ -619,6 +631,11 @@ final class LoopbackProxyServer: NSObject {
             if !sameOrigin && NetConstants.isSensitiveHeader(key) { continue }
             request.setValue(value, forHTTPHeaderField: key)
         }
+        // P1-5：显式要原样字节（Accept-Encoding: identity）。不写的话
+        // URLSession 会自动发 gzip 并透明解压：上游 Content-Length 是压缩后
+        // 的长度，解压后实际字节更多，按压缩长度发会截断流。放 headers 循环
+        // 之后写死，模块自定义头里的 Accept-Encoding 也盖不掉它。
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         if let range = context.requestRange {
             request.setValue(range, forHTTPHeaderField: "Range")
         }
@@ -695,16 +712,38 @@ final class LoopbackProxyServer: NSObject {
     /// data: 内联密钥不动（AVPlayer 自己处理）。
     /// 返回改写后的文本；改写出的映射已记进期望账本。
     private func rewritePlaylist(_ text: String, baseURL: URL) -> String {
-        let lines = text.components(separatedBy: .newlines)
+        // P1-3 同款归一化：CRLF 播单用 .newlines 拆会多出空串 ""，
+        // 空串不能把 nextLineIsVariant 清零（见下）。
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let lines = normalized.components(separatedBy: .newlines)
         var out: [String] = []
         out.reserveCapacity(lines.count)
+        // P1-6：跟踪 #EXT-X-STREAM-INF:——下一行裸 URI 就是变体播单，
+        // 哪怕没有 .m3u8 扩展名也必须记成 .variant（走缓冲模式改写）。
+        // 不跟踪时它会被判成 .segment 走 streamMode：变体播单被原样流式
+        // 转发、里面的内层 URI 不改写，AVPlayer 会直取上游、绕过代理。
+        var nextLineIsVariant = false
         for line in lines {
+            if line.trimmingCharacters(in: .whitespaces).isEmpty {
+                // 纯空白行不重置 nextLineIsVariant（同 HLSResourceLoader）。
+                out.append(line)
+                continue
+            }
+            if line.hasPrefix("#EXT-X-STREAM-INF:") {
+                nextLineIsVariant = true
+                out.append(rewriteURIAttributes(in: line, baseURL: baseURL))
+                continue
+            }
             if line.hasPrefix("#") {
                 out.append(rewriteURIAttributes(in: line, baseURL: baseURL))
+                nextLineIsVariant = false
             } else if !line.trimmingCharacters(in: .whitespaces).isEmpty {
                 let trimmed = line.trimmingCharacters(in: .whitespaces)
                 let absolute = absoluteURL(trimmed, base: baseURL)
-                let kind: BookKind = isPlaylistURL(absolute) ? .variant : .segment
+                let kind: BookKind = (nextLineIsVariant || isPlaylistURL(absolute)) ? .variant : .segment
+                nextLineIsVariant = false
                 if let loopback = loopbackURL(for: absolute, kind: kind) {
                     out.append(loopback.absoluteString)
                 } else {
@@ -893,6 +932,15 @@ final class LoopbackProxyServer: NSObject {
     /// 200 常有）；206 无 Content-Length 时从 Content-Range
     /// "bytes a-b/total" 取 b-a+1。拿不到则 nil（走 chunked）。
     private func streamContentLength(for response: HTTPURLResponse) -> Int? {
+        // P1-5：上游若无视 Accept-Encoding: identity 仍返回 gzip（或别的
+        // Content-Encoding），URLSession 透明解压后实际字节会大于这里读到的
+        // 压缩 Content-Length——按它发 Content-Length 会截断流。编码非空且
+        // 非 identity 时返回 nil，走 chunked，不再信这个长度。
+        if let encoding = response.value(forHTTPHeaderField: "Content-Encoding")?
+            .trimmingCharacters(in: .whitespaces).lowercased(),
+           !encoding.isEmpty, encoding != "identity" {
+            return nil
+        }
         if let raw = response.value(forHTTPHeaderField: "Content-Length")?.trimmingCharacters(in: .whitespaces),
            let n = Int(raw), n >= 0 {
             return n
@@ -1063,10 +1111,12 @@ extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
         }
         var redirected = request
         redirected.assumesHTTP3Capable = false
-        // 同源锚点是原始请求 URL（task.originalRequest），不是上一跳
-        // response.url：A→B→B2（B 与 B2 同源）时按上一跳判会把源站 A 的
-        // 凭据泄漏给第三方域 B2（P1-3）。
-        let sameOrigin = NetConstants.isSameOrigin(task.originalRequest?.url, redirected.url)
+        // P1-5：同源锚点是入口 URL（首个注册的上游，snapshotOriginURL()），
+        // 不是本次请求的原始 URL（task.originalRequest）：跨源 CDN 分片 B
+        // 302 到同域 B2 时，按 task.originalRequest（B）判会判同源、把源站 A
+        // 的 Cookie / Authorization 重新发给第三方 CDN B2；按入口 A 判
+        // 才是跨源，凭据头不跟过去。task.originalRequest 只作入口未记时的兜底。
+        let sameOrigin = NetConstants.isSameOrigin(snapshotOriginURL() ?? task.originalRequest?.url, redirected.url)
         for (key, value) in headers {
             let lower = key.lowercased()
             if !sameOrigin && NetConstants.isSensitiveHeader(key) { continue }
@@ -1142,6 +1192,13 @@ extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
             if context.body.count > Self.maxCacheableBytes {
                 context.cacheable = false
                 context.body = Data()
+                // P1-6：缓冲模式（播单/变体/密钥）超 8MB 时 body 已丢，
+                // 不取消的话 didComplete 会按 200 空体发出去。直接取消上游
+                // 拉取，走 didCompleteWithError 的 502 路径；流式模式
+                // （分片/MAP）大分片本来就是边收边发，不取消。
+                if !context.streamMode {
+                    dataTask.cancel()
+                }
             }
         }
     }
@@ -1240,6 +1297,14 @@ extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
             return
         }
         // 2xx：播单/变体改写后发，密钥原样发；可缓存的进缓存（供重试原样服务）。
+        // P1-6 兜底：缓冲模式超 8MB 时 body 已在 didReceive 里清空丢弃
+        //（cacheable=false），取消若没生效、走到这里也绝不能发 200 空体。
+        if !context.cacheable {
+            recordActual(mapping: context.mapping, status: nil, bytes: context.receivedBytes, servedFromCache: false)
+            sendSimpleResponse(connection: context.connection, queue: context.queue, status: 502, body: "Bad Gateway")
+            serveWaiters(context: context, error: NSError(domain: "LoopbackProxy", code: -1, userInfo: [NSLocalizedDescriptionKey: "响应超 8MB 缓冲上限"]))
+            return
+        }
         let outBody: Data
         if context.mapping.kind == .playlist || context.mapping.kind == .variant {
             let text = String(decoding: context.body, as: UTF8.self)

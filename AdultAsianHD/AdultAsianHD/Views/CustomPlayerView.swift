@@ -321,6 +321,12 @@ final class CustomPlayerController: ObservableObject {
         didMarkPlayingURL = nil
         didMarkFailedURL = nil
         shouldPlay = false
+        // 全屏开着时引擎切走：全屏模态是顶层 present 的，视图卸载不会自动关；
+        // 不主动关会留黑屏模态（与软解 teardown 调 dismissActive 同款）。
+        if isFullscreen {
+            isFullscreen = false
+            FullscreenPlayerPresenter.dismissActive()
+        }
         replaceItem(nil, headers: nil, resumeAt: nil)
     }
 
@@ -721,6 +727,12 @@ final class CustomPlayerController: ObservableObject {
     /// 播到片尾：停在 0:00（不循环、不续播），控制条常显，等用户再点播放。
     private func handleDidPlayToEnd() {
         invalidateSeekOperation()
+        // 播完即用户意图 = 不播：不清 shouldPlay 的话，复位 seek 后一旦进
+        // waiting，2 秒 stallKick 会按 shouldPlay 补 play()，违背“不自动续播”铁律。
+        shouldPlay = false
+        player.pause()
+        stallKickTask?.cancel()
+        stallKickTask = nil
         isPlaying = false
         isLoading = false
         controlsVisible = true
@@ -854,11 +866,13 @@ final class CustomPlayerController: ObservableObject {
             player.currentItem?.cancelPendingSeeks()
         }
 
-        // 看门狗基线：seek 发起时采样，供进展判断作起点；
-        // 最近进展时刻初值 = 发起时刻（此后 2 秒采样发现增长才刷新）。
+        // 看门狗基线：seek 发起时采样，供进展判断作起点。
+        // 最近进展时刻初值 = 0（“还没观测到进展”）：2 秒采样发现增长才刷新。
+        // 绝不能初值 = 发起时刻——远落点 3 秒重武/踢活 2.5 秒重武到期时，
+        // 距发起还不到 4 秒，看门狗会误判“最近 4 秒有进展”白延 10 秒。
         seekProgressBaseline = captureProgressSnapshot()
         seekPreviousProgressSnapshot = seekProgressBaseline
-        seekLastProgressUptime = ProcessInfo.processInfo.systemUptime
+        seekLastProgressUptime = 0
         seekExtensionCount = 0
 
         startSeekWatchdog(operation: operation, token: token, timeout: adaptiveSeekTimeout())
@@ -1557,6 +1571,10 @@ final class FullscreenPlayerViewController: UIViewController {
 /// .onChange（SwiftUI 主线程上下文）与本文件内，无非隔离调用方受影响。
 @MainActor
 enum FullscreenPlayerPresenter {
+    /// 正在呈现的全屏 VC（弱引用）：全屏期引擎切走时 CustomPlayerView 卸载，
+    /// 没人持有这个模态——不主动关会飘在详情页上面播黑屏。
+    private static weak var activeVC: FullscreenPlayerViewController?
+
     @MainActor
     static func present(player: AVPlayer, controller: CustomPlayerController, viewModel: PlayerViewModel, onExit: @escaping () -> Void) {
         guard let top = topViewController(), !(top is FullscreenPlayerViewController) else {
@@ -1566,7 +1584,17 @@ enum FullscreenPlayerPresenter {
             return
         }
         let vc = FullscreenPlayerViewController(player: player, controller: controller, viewModel: viewModel, onExit: onExit)
+        activeVC = vc
         top.present(vc, animated: true, completion: nil)
+    }
+
+    /// 引擎切走/离页时主动关掉还开着的全屏（CustomPlayerController.unloadCurrentItem 调；
+    /// 退出按钮走 VC 自己的 onExit，不走这里，不会重复关）。
+    @MainActor
+    static func dismissActive() {
+        guard let vc = activeVC else { return }
+        activeVC = nil
+        vc.dismiss(animated: true, completion: nil)
     }
 
     private static func topViewController() -> UIViewController? {

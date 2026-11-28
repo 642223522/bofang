@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 import WebKit
 
@@ -79,6 +80,13 @@ final class DASHPlayerController: ObservableObject {
     private var levels: [WebPlayerLevel] = []
     /// 当前是不是自动档（JS 侧 __dashAuto 旗，由 levels 消息同步）。
     private var isAutoQuality = true
+    /// 拖动中（PlayerControlBar 每帧调 scrub）：拖动时只改本地 currentTime，
+    /// 不向页内狂发 seek；timeupdate 回写也暂停，松手 endScrub 一次 seek。
+    private var isScrubbing = false
+    /// 加载超时兜底：15 秒未出帧即按失败走切线（与软解同款；dash.js 有些失败
+    /// 只停住不报 ERROR，不能让界面永远卡在“正在解析播放线路…”）。
+    private var loadTimeoutTask: Task<Void, Never>?
+    private var cancellables = Set<AnyCancellable>()
 
     /// WKWebView 的持有者（EmbedProbeState.webView 同款写法：VC 建好后指回来，
     /// 弱引用，不成环；Swift 侧的 play/pause/seek/画质/全屏都经它 evaluateJavaScript）。
@@ -92,10 +100,26 @@ final class DASHPlayerController: ObservableObject {
 
     init(viewModel: PlayerViewModel) {
         self.viewModel = viewModel
+        // 引擎监听（与 CustomPlayerController.init 同款）：currentEngine 一变就跟进。
+        // 同一 URL 换引擎时 .onChange(of: currentURL) 不触发，全靠这里重建；
+        // 同 URL 手动重试/重播也靠它把 playGeneration 的变化送进来（load 的去重
+        // 条件认代际与失败态，见 load()）。
+        // .receive(on:) 让回调异步跑：setCurrent 里先建拦截器、再设 URL、最后设引擎，
+        // 回调跑到时拦截器与新 URL 都已就位。
+        viewModel.$currentEngine
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.load(url: self.viewModel.currentURL, headers: self.viewModel.currentHeaders)
+                }
+            }
+            .store(in: &cancellables)
     }
 
     deinit {
         hideTask?.cancel()
+        loadTimeoutTask?.cancel()
     }
 
     // MARK: - 换片与自动播
@@ -107,7 +131,7 @@ final class DASHPlayerController: ObservableObject {
             lastURL = nil
             lastHeaders = nil
             lastResumeAt = 0
-            webViewController?.load(url: nil, headers: nil, resumeAt: 0)
+            webViewController?.load(url: nil, headers: nil, resumeAt: 0, forceReload: true)
             return
         }
         // run #36 P0-12：去重条件须纳入代际与失败态，否则同 URL/头的
@@ -137,7 +161,21 @@ final class DASHPlayerController: ObservableObject {
         qualityOptions = []
         currentQualityLabel = "自动"
         isAutoQuality = true
-        webViewController?.load(url: url, headers: headers, resumeAt: resumeAt)
+        webViewController?.load(url: url, headers: headers, resumeAt: resumeAt, forceReload: true)
+        scheduleLoadTimeout()
+    }
+
+    /// 15 秒未出帧即按失败走切线（与软解同款）。只认当前 URL（换片后旧任务不烧新片）。
+    private func scheduleLoadTimeout() {
+        loadTimeoutTask?.cancel()
+        guard let url = lastURL else { return }
+        loadTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            if self.didMarkPlayingURL != url, self.lastURL == url {
+                self.handleFatalError("DASH 播放器加载超时（15 秒未出帧）")
+            }
+        }
     }
 
     // MARK: - JS 消息（WKScriptMessageHandler 转交）
@@ -148,7 +186,9 @@ final class DASHPlayerController: ObservableObject {
         guard let type = message["type"] as? String else { return }
         switch type {
         case "timeupdate", "progress":
-            if let t = Self.doubleValue(message["t"]) { currentTime = t }
+            // 拖动中不回写 currentTime（页内 video 还没 seek 完，回写会把用户
+            // 刚拖到的时间又 snap 回旧时间；与原生 isScrubbing 门控同源）。
+            if !isScrubbing, let t = Self.doubleValue(message["t"]) { currentTime = t }
             if let d = Self.doubleValue(message["d"]), d.isFinite, d > 0 { duration = d }
             if let b = Self.doubleValue(message["buffered"]), b.isFinite, b >= 0 {
                 bufferedEnd = max(bufferedEnd, b)
@@ -156,6 +196,7 @@ final class DASHPlayerController: ObservableObject {
         case "playing":
             isPlaying = true
             isLoading = false
+            loadTimeoutTask?.cancel()
             // 真正出帧 → markPlaying（“正在解析播放线路…”由此消失）。
             if let url = lastURL, didMarkPlayingURL != url {
                 didMarkPlayingURL = url
@@ -163,7 +204,9 @@ final class DASHPlayerController: ObservableObject {
             }
             showControlsTemporarily()
         case "play":
-            isPlaying = true
+            // 'play' 只表示调了 play()、未出帧：不等同在播，不提前置 isPlaying；
+            // 真正出帧的 'playing' 事件才置 true（按钮据此显示暂停/播放）。
+            break
         case "paused":
             isPlaying = false
             controlsVisible = true
@@ -280,8 +323,9 @@ final class DASHPlayerController: ObservableObject {
             showControlsTemporarily()
             return
         }
-        // 按 label 找回档位（rebuild 时同一 label 只留一档，label 唯一）。
-        guard let level = levels.first(where: { videoQualityLabel(height: $0.height) == option.label }) else { return }
+        // 按 label 找回档位：同一高度常有多码率变体，first 会撞上低码率档；
+        // 取同 label 里码率最高的那档（与 rebuildQualityOptions 的去重一致）。
+        guard let level = levels.filter({ videoQualityLabel(height: $0.height) == option.label }).max(by: { $0.bitrate < $1.bitrate }) else { return }
         isAutoQuality = false
         currentQualityLabel = option.label
         evaluate("if (window.__webplayer) { window.__webplayer.setLevel(\(level.index)); }")
@@ -312,16 +356,20 @@ final class DASHPlayerController: ObservableObject {
 
     /// 开始拖进度条：记下拖之前用户是不是想播，拖动期间先停播（seek 干净不卡）。
     func beginScrub() {
+        isScrubbing = true
         wasPlayingBeforeScrub = shouldPlay
+        hideTask?.cancel()
+        controlsVisible = true
         evaluate("if (window.__webplayer) { window.__webplayer.pause(); }")
     }
 
-    /// 拖动中：实时 seek（dash.js 跳转到该位置），进度条跟手。
+    /// 拖动中：只改本地 currentTime（进度条跟手），不向页内发 seek——
+    /// 拖动是 60Hz 的连续调用，每帧都 seek 会把 dash.js 轰炸到卡死；
+    /// 真正的 seek 只在松手时发一次（与原生/嵌页探针同款）。
     func scrub(to seconds: Double) {
         guard duration > 0 else { return }
         let clamped = min(max(seconds, 0), duration)
         currentTime = clamped
-        evaluate("if (window.__webplayer) { window.__webplayer.seek(\(clamped)); }")
     }
 
     /// 松手：精确定位到拖到的位置；拖之前在播就恢复播放（不拖完停在暂停态）。
@@ -329,6 +377,7 @@ final class DASHPlayerController: ObservableObject {
         guard duration > 0 else { return }
         let clamped = min(max(seconds, 0), duration)
         currentTime = clamped
+        isScrubbing = false
         let resume = wasPlayingBeforeScrub
         evaluate("if (window.__webplayer) { window.__webplayer.seek(\(clamped)); }")
         if resume {
@@ -370,6 +419,8 @@ final class DASHPlayerController: ObservableObject {
         webViewController = nil
         hideTask?.cancel()
         hideTask = nil
+        loadTimeoutTask?.cancel()
+        loadTimeoutTask = nil
         isPlaying = false
         isLoading = false
         currentTime = 0
@@ -400,7 +451,7 @@ final class DASHPlayerController: ObservableObject {
 
 /// DASH 播放器的 UIViewController：WKWebView 全铺，不带任何按钮。
 /// 按钮/底条都在外层 SwiftUI（和直链自定义播放器同一套 PlayerControlBar）。
-final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, UIGestureRecognizerDelegate {
     let controller: DASHPlayerController
     private var webView: WKWebView?
     private var loadedURL: URL?
@@ -444,6 +495,13 @@ final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUID
             webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
         ])
         self.webView = webView
+        // 原生点按手势（系统级）：点画面切换底条显隐。
+        // 绝不用 SwiftUI .onTapGesture——WKWebView 的内层手势会把它整个吃掉
+        //（与 WebViewPlayer 同款做法）；两个手势同时识别，不抢播放器按钮。
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleWebViewTap))
+        tap.cancelsTouchesInView = false
+        tap.delegate = self
+        webView.addGestureRecognizer(tap)
         // controller.load() 可能比 VC 建好更早（onAppear 先跑）：补一次，避免丢首播；
         // onAppear 随后还会调一次 load()，URL 相同、VC 侧 guard 会拦住，不重复建页。
         if let url = controller.pendingURL {
@@ -451,11 +509,23 @@ final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUID
         }
     }
 
+    @objc private func handleWebViewTap() {
+        Task { @MainActor in self.controller.toggleControls() }
+    }
+
+    // 绝不抢 WKWebView 内层手势（播放器按钮/进度条照常用）：两个手势同时识别。
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        true
+    }
+
     /// 换片/换线：URL 或请求头变了才重建页（同 URL 不重建，避免 SwiftUI 刷新打断播放）。
     /// resumeAt 只在同 generation 切线时 > 0，新片/新一集为 0，从 0:00 起播。
-    func load(url: URL?, headers: [String: String]?, resumeAt: Double) {
+    func load(url: URL?, headers: [String: String]?, resumeAt: Double, forceReload: Bool = false) {
         guard !isTornDown else { return }
-        guard url != loadedURL || headers != loadedHeaders else { return }
+        // forceReload：controller.load() 校验通过后的重建（同 URL 重试/重播），
+        // 跳过这层 URL/头去重——否则 controller 已把 isLoading 置 true，
+        // 这里早退不调 loadHTMLString，页面永久卡死在转圈。
+        guard forceReload || url != loadedURL || headers != loadedHeaders else { return }
         loadedURL = url
         loadedHeaders = headers
         guard let url else {
@@ -476,7 +546,48 @@ final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUID
         // ① manifest/分片请求与文档同源，不触发 CORS 预检；
         // ② 文档 URL 就是子请求带上的 Referer（Referer 是禁设头，改不了）；
         // ③ https baseURL 保证安全上下文（MSE 要求）。
-        webView?.loadHTMLString(html, baseURL: url)
+        loadHTMLWithCookies(html, baseURL: url, headers: headers)
+    }
+
+    /// Cookie 注入：模块给的 Cookie 头是 XHR 禁设头，RequestModifier 里
+    /// setRequestHeader 发不出去；拆成 HTTPCookie 写进 WebView 的 cookie jar，
+    /// xhr.withCredentials 才能带上（只认 Cookie 头，不管 Set-Cookie）。
+    /// 先把 Cookie 写完再建页，否则首个 manifest 请求可能赶在写 Cookie 之前发出；
+    /// 写完后 URL 已换就不再建旧页。
+    private func loadHTMLWithCookies(_ html: String, baseURL: URL, headers: [String: String]?) {
+        guard let webView else { return }
+        let cookies = Self.cookies(from: headers, for: baseURL)
+        guard !cookies.isEmpty else {
+            webView.loadHTMLString(html, baseURL: baseURL)
+            return
+        }
+        let store = webView.configuration.websiteDataStore.httpCookieStore
+        let group = DispatchGroup()
+        for cookie in cookies {
+            group.enter()
+            store.setCookie(cookie) { group.leave() }
+        }
+        group.notify(queue: .main) { [weak self, weak webView] in
+            guard let self, !self.isTornDown, self.loadedURL == baseURL else { return }
+            webView?.loadHTMLString(html, baseURL: baseURL)
+        }
+    }
+
+    private static func cookies(from headers: [String: String]?, for url: URL) -> [HTTPCookie] {
+        guard let host = url.host else { return [] }
+        let raw = headers?["Cookie"] ?? headers?["cookie"] ?? ""
+        guard !raw.isEmpty else { return [] }
+        var out: [HTTPCookie] = []
+        for pair in raw.split(separator: ";") {
+            let parts = pair.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            let name = parts[0].trimmingCharacters(in: .whitespaces)
+            let value = parts[1].trimmingCharacters(in: .whitespaces)
+            guard !name.isEmpty else { continue }
+            let props: [HTTPCookiePropertyKey: Any] = [.domain: host, .path: "/", .name: name, .value: value]
+            if let cookie = HTTPCookie(properties: props) { out.append(cookie) }
+        }
+        return out
     }
 
     func evaluate(_ script: String) {
@@ -491,6 +602,10 @@ final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUID
         evaluate("if (window.__webplayer) { window.__webplayer.teardown(); }")
         webView?.stopLoading()
         webView?.loadHTMLString("", baseURL: nil)
+        // 断开强引用环：WKUserContentController 强持有 message handler（即 self），
+        // VC → webView → configuration → userContentController → self；
+        // 不摘掉这个 handler，teardown 后 VC 永远走不到 deinit（真泄漏）。
+        webView?.configuration.userContentController.removeScriptMessageHandler(forName: "dashjs")
         webView?.navigationDelegate = nil
         webView?.uiDelegate = nil
         webView?.removeFromSuperview()
@@ -520,6 +635,12 @@ final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUID
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         guard !isTornDown else { return }
         Task { @MainActor in self.controller.handleFatalError("页面加载失败（\(error.localizedDescription)）") }
+    }
+
+    /// 内容进程崩掉（MSE/内存压力下会发生）：页已死，不静默转圈，按失败走切线。
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        guard !isTornDown else { return }
+        Task { @MainActor in self.controller.handleFatalError("播放页面进程异常终止") }
     }
 
     // MARK: - WKUIDelegate
@@ -700,8 +821,9 @@ struct DASHPlayerView: View {
 
     var body: some View {
         ZStack {
+            // 点画面切底条显隐走 VC 里的原生 UITapGestureRecognizer，
+            // 不用 SwiftUI .onTapGesture（WKWebView 内层手势会把它吃掉）。
             DASHWebView(controller: controller)
-                .onTapGesture { controller.toggleControls() }
             if controller.isLoading {
                 ProgressView()
                     .tint(.white)

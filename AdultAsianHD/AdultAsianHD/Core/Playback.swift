@@ -102,6 +102,10 @@ enum PlaybackEngine {
         }
         guard let url = URL(string: urlString),
               url.scheme == "http" || url.scheme == "https" else { return false }
+        // 墙后嵌页家族（dood/playmogo 系）：无 hint、无嵌页路径、无扩展名
+        // 的 /d/xxx、/v/xxx 也认成嵌页（P0-2）。直链（.m3u8/.mp4）优先排除，
+        // 墙后家族的直链仍按媒体走，不误判。
+        if !isDirectMediaURL(urlString), isWalledEmbedHost(url.host) { return true }
         let path = url.path.lowercased()
         if path.contains("/e/") || path.contains("/embed/") || path.contains("/player/") {
             return true
@@ -244,26 +248,11 @@ enum PlaybackEngine {
         if ["mkv", "flv", "avi", "webm"].contains(ext) {
             return PlaybackCapabilities.hasSoftwareDecoder ? .softDecoder : .nativeIntercepted
         }
-        // 3a. 显式直链 hint（classifyPlayableLine 的既有映射：exact "mp4"/
-        //     "direct"/"avplayer" → 直链文件，"hls"/"m3u8" → HLS，"native" 同直链）。
-        //     无扩展名直链（如 /media/video/<id>/720p + hint "mp4"）在此认出，
-        //     不再掉进 Step 4 被 isEmbedURL 误判成嵌页（P0-6：javtiful 回归）。
-        //     hint 含 hlsjs 不走这里：classify 把它归为嵌页，hlsjs+媒体 URL
-        //     由下面 Step 3 的 hlsjs 分支处理，hlsjs+嵌页 URL 走 Step 4。
-        //     带签名/自定义头/Cookie 或无扩展名 → .nativeIntercepted；
-        //     明文带扩展名 → .native（与 Step 3 的同类分支一致）。
-        let directHint = hint.trimmingCharacters(in: .whitespacesAndNewlines)
-        if ["mp4", "direct", "avplayer", "hls", "m3u8", "native"].contains(directHint) {
-            let needsIntercept = isSignedURL(line.url)
-                || line.headers?.isEmpty == false
-                || line.cookie?.isEmpty == false
-                || ext.isEmpty
-            if needsIntercept { return .nativeIntercepted }
-            return .native
-        }
         // 3. 媒体形态（m3u8/mp4/mov）：内容优先，hint 只调起手路线。
         //    hint=embed/webview + 媒体 URL 不再直接进 WebView（Q5：内容优先，是 HLS 先走 D/P；
         //    “须在页上下文里取”的含义记到不匹配日志里，梯度里再考虑 WebView）。
+        //    （P0-2：Step 3 移到 Step 3a 之前——媒体形态先判，显式直链 hint
+        //    不再能把带扩展名的媒体 URL 从 Step 3 手里抢走。）
         let isMediaForm = ["m3u8", "mp4", "mov"].contains(ext)
             || lower.contains(".m3u8") || lower.contains(".mp4")
         if isMediaForm {
@@ -281,6 +270,28 @@ enum PlaybackEngine {
             if hint.contains("native") || hint.isEmpty { return .native }
             // 未知 hint 的媒体 URL：形态判得出，走拦截器试播。
             return .nativeIntercepted
+        }
+        // 3a. 显式直链 hint（classifyPlayableLine 的既有映射：exact "mp4"/
+        //     "direct"/"avplayer" → 直链文件，"hls"/"m3u8" → HLS）。
+        //     （P0-2：① "native" 已从这里移除——hint=native 不再强制直链，
+        //     嵌页形态（"…/e/xyz" + hint "native"）不再被劫持进 .nativeIntercepted，
+        //     由 Step 4 按形态判进 WebView；② 前置 guard !isEmbedURL：.html +
+        //     hint "mp4" 这类嵌页形态不再错走 .native。）
+        //     无扩展名直链（如 /media/video/<id>/720p + hint "mp4"）在此认出，
+        //     不再掉进 Step 4 被 isEmbedURL 误判成嵌页（P0-6：javtiful 回归）。
+        //     hint 含 hlsjs 不走这里：classify 把它归为嵌页，hlsjs+媒体 URL
+        //     由上面 Step 3 的 hlsjs 分支处理，hlsjs+嵌页 URL 走 Step 4。
+        //     带签名/自定义头/Cookie 或无扩展名 → .nativeIntercepted；
+        //     明文带扩展名 → .native（与 Step 3 的同类分支一致）。
+        let directHint = hint.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !isEmbedURL(line.url, playerHint: nil),
+           ["mp4", "direct", "avplayer", "hls", "m3u8"].contains(directHint) {
+            let needsIntercept = isSignedURL(line.url)
+                || line.headers?.isEmpty == false
+                || line.cookie?.isEmpty == false
+                || ext.isEmpty
+            if needsIntercept { return .nativeIntercepted }
+            return .native
         }
         // 4. 嵌页形态 → WebView（isEmbedURL 已收紧：只认 embed/webview hint
         //    或嵌页路径形态；无 hint 的不透明 URL 不再误判，在 Step 5 兜底）。
@@ -811,6 +822,9 @@ final class PlayerViewModel: ObservableObject {
         guard let recast = try? await host.loadResource(link: link, title: currentRecastTitle ?? ""),
               let first = recast.first else { return false }
         guard playGeneration == generation else { return false }
+        // 恢复后校验（P1-7）：重铸等待期间用户可能已切线/停播，currentURL
+        // 不再是触发重铸的那条线时不接手，不把旧集的线路由进新集。
+        guard currentURL?.absoluteString == current else { return false }
         if !lines.contains(where: { $0.url == first.url }) {
             lines.insert(first, at: 0)
         }
@@ -1010,6 +1024,10 @@ final class PlayerViewModel: ObservableObject {
     /// 关闭嵌入播放器（WebView 里的 X）：停掉解流/清掉 WebView，
     /// 这条嵌入线记一次失败（不再自动重试），状态回 idle，等用户另点线路。
     func closeWebView() {
+        // 账本终局（P1-7）：routeLine 开的尝试在这里关掉，不留孤儿账本；
+        // finalize 已终局时是空操作，且要在清 resourceLoader/代理之前调
+        //（终局要合并它们的账本快照；stop()/play() 也是先终局再清）。
+        finalizeLedgerAttempt(outcome: "关闭嵌入播放", playedOK: false)
         embedTask?.cancel()
         embedTask = nil
         embedExtractor?.cancel()
@@ -1092,8 +1110,13 @@ final class PlayerViewModel: ObservableObject {
             currentURL = nil
         }
 
-        // 后台拿备线（模块的 loadResource），不挡快路径起播
-        Task.detached {
+        // 后台拿备线（模块的 loadResource），不挡快路径起播。
+        // （P1-7：不用 Task.detached 强捕 self——未跟踪的 detached 任务
+        // 会强持有 ViewModel 直到 loadResource 返回；改成继承 MainActor 的
+        // Task + [weak self]，代际仍由 playGeneration 拦，旧任务回来丢弃；
+        // 不另加 episodeTask 之类的新跟踪机制。）
+        Task { [weak self] in
+            guard let self else { return }
             let backup = (try? await host.loadResource(link: item.link, title: item.title)) ?? []
             await MainActor.run {
                 guard self.playGeneration == generation else { return } // 已播别的片，丢弃
@@ -1150,6 +1173,17 @@ final class PlayerViewModel: ObservableObject {
         playGeneration = UUID()
         failedURLs.remove(line.url)
         clearFallbackState(for: line.url) // 手动点播：回退/过期标记全清，重新按路由表定
+        // 上一集的播放器/代理/解流先清掉（P1-7）：现铸分支要 await loadResource，
+        // 不在这里清，旧集的拦截器/代理/解流会在现铸等待期间继续跑、结果还可能写回。
+        // （旧 AVPlayerItem 的 delegate 由控制器手里的强引用续命到换项，见 setCurrent。）
+        embedTask?.cancel()
+        embedTask = nil
+        embedExtractor?.cancel()
+        embedExtractor = nil
+        webViewURL = nil
+        isResolvingEmbed = false
+        resourceLoader = nil
+        releaseProxy()
         if let recastLink {
             currentRecastLink = recastLink
             currentRecastTitle = line.name
@@ -1208,6 +1242,9 @@ final class PlayerViewModel: ObservableObject {
     ///   分片需头 -12881 也走拦截器→hls.js 这条（拦截器覆盖不了分片，hls.js 经 XHR 能给分片带头）。
     /// - 明文静态线裸连失败：把同一条线升级成拦截器再试一次（不消费 token，
     ///   明文线本来就没 token）；升级过的线不再升级，直接切下一条。
+    /// - 拦截器失败且当前 URL 不是直链、无显式直链 hint：回退 WebView 嵌页
+    ///   （一步，P0-2；dood /d/xxx 这类无 hint 嵌页经路由记忆/旧覆盖走了
+    ///   拦截器时的兜底）。
     /// - 非原生容器且没集成软解：报明确错误（需要软解播放器），不无意义重试。
     /// 先试下一条没失败过的线，都失败才报 failed。
     /// 终局（切线/报 failed）时账本定 stage 与三路判定；分层明确的失败才写路线记忆。
@@ -1241,6 +1278,10 @@ final class PlayerViewModel: ObservableObject {
         }
         let currentLine = lines.first(where: { $0.url == current })
         let hintIsHLSJS = (currentLine?.playerHint ?? "").lowercased().contains("hlsjs")
+        // hls.js 只能播 HLS：当前 URL 是 .m3u8 形态才允许回退 hls.js，
+        // .mp4 送进 hls.js 解析不了播单（P1-7）。
+        let currentIsHLS = current.lowercased().contains(".m3u8")
+            || URL(string: current)?.pathExtension.lowercased() == "m3u8"
         // 404/410：服务端根本没有该片源，同线换引擎没有意义
         //（memojav 缺号时 native→拦截器→hls.js→代理全试一遍也是 404），
         // 直接跳过下面五段引擎升级，切备用线。
@@ -1273,7 +1314,9 @@ final class PlayerViewModel: ObservableObject {
                 }
                 // 拦截器失败 → hls.js 重试同一条线一次（分片需头 -12881 也走这条：
                 // 拦截器覆盖不了分片，hls.js 经 XHR 能给分片带头）。
+                // 只对 .m3u8 线：hlsjs+MP4 线走拦截器失败后不再送 hls.js（P1-7）。
                 if currentEngine == .nativeIntercepted,
+                   currentIsHLS,
                    PlaybackCapabilities.hasHLSJS,
                    !hasTriedFallback(url: current, engine: .hlsjs) {
                     markFallbackTried(url: current, engine: .hlsjs)
@@ -1290,6 +1333,7 @@ final class PlayerViewModel: ObservableObject {
             // 切 hls.js 再试一次（一步）；不是 hlsjs 线或 hls.js 已试过，直接走下面切线。
             if currentEngine == .proxy,
                hintIsHLSJS,
+               currentIsHLS,
                PlaybackCapabilities.hasHLSJS,
                !hasTriedFallback(url: current, engine: .hlsjs) {
                 markFallbackTried(url: current, engine: .hlsjs)
@@ -1326,6 +1370,26 @@ final class PlayerViewModel: ObservableObject {
                !hasTriedFallback(url: current, engine: .nativeIntercepted) {
                 markFallbackTried(url: current, engine: .nativeIntercepted)
                 engineOverrides[current] = .nativeIntercepted
+                routeLine(line)
+                return
+            }
+            // .nativeIntercepted 失败 → WebView 兜底（P0-2）：拦截器拿到的是
+            // HTML 嵌页（dood /d/xxx 这类无 hint 嵌页经路由记忆/旧覆盖走了
+            // 拦截器），AVPlayer 解析失败。直链（.m3u8/.mp4）与显式直链 hint
+            // 的线不走这条（它们不是嵌页）；同一条线只回退一次。
+            // 注意：无扩展名、无 hint 的直链与嵌页在此分不出——按任务约定，
+            // 拦截器已失败的前提下优先当嵌页回 WebView（解流解不出仍会落到
+            // 页内 WebView，不会静默丢线）。
+            if currentEngine == .nativeIntercepted,
+               !PlaybackEngine.isDirectMediaURL(current),
+               !["mp4", "direct", "avplayer", "hls", "m3u8", "native"].contains(
+                   (currentLine?.playerHint ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()),
+               !hasTriedFallback(url: current, engine: .webView),
+               let line = currentLine {
+                markFallbackTried(url: current, engine: .webView)
+                engineOverrides[current] = .webView
+                status = .loading
+                failureReason = nil
                 routeLine(line)
                 return
             }

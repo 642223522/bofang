@@ -62,8 +62,8 @@ enum PlaybackCapabilities {
 /// 这类嵌页 host 跳过解流、直接进页内 WebViewPlayer（Fix B wall-first）。
 /// WebViewPlayer 的导航白名单与 Playback 的 wall-first 共用这一张表，改一处即可。
 let wallEmbedHostFamilies = [
-    "playmogo.com", "doodstream.com", "dood.watch", "doodstream.co",
-    "d0o0d.com", "bysebuho.com", "lplaygo.com"
+    "playmogo.com", "doodstream.com", "dood.to", "dood.watch", "doodstream.co",
+    "doodstream.io", "d0o0d.com", "bysebuho.com", "lplaygo.com"
 ]
 
 /// 嵌页 host 是否属于墙后家族（含子域；host 为 nil 时返回 false）。

@@ -77,9 +77,10 @@ enum CategoryDetectionRules {
 }
 
 /// 需开节点（VPN/代理）才能用的模块 id 清单（用户定：源名字后面加（V））。
-/// 已确诊：黄果（DNS 毒化 + DoH 全灭 + TCP 超时，2026-11-26 用户定开节点用）、
-/// javtiful（关节点检测页死在 DNS 层，2026-11-27 确诊）。
-/// javhd、jav-pub 待关节点测试确诊后再加；pornjav / pornjav-clean / onlybokep
+/// 已列入：黄果（DNS 毒化 + DoH 全灭 + TCP 超时，2026-11-26 用户定开节点用）、
+/// javtiful（关节点检测页死在 DNS 层，2026-11-27 确诊）、javhd
+///（ids 里已有，注释同步；关节点是否真需要待重测，见 2026-11-27 诊断备注）。
+/// jav-pub 待关节点测试确诊后再加；pornjav / pornjav-clean / onlybokep
 /// 关节点可用，不加。只改这里一行即可增减，不用改模块 JS（朋友模块改不了 JS）。
 /// 生效方式：导入/同步建 SourceRecord 时标题加后缀，下次同步后显示。
 enum NodeRequiredModules {
@@ -171,12 +172,21 @@ extension VideoItem {
     }
 
     /// 分类标题常带 "（123）" 这样的帖子数后缀，取列表时用去掉后缀的名字。
+    /// 半角 "(123)" 同款处理（括号里须是纯数字才剥，"Video (Part 2)" 这类不动）。
     var categoryNameWithoutCount: String {
-        guard title.hasSuffix("）"),
-              let open = title.lastIndex(of: "（") else { return title }
-        let inner = title[title.index(after: open)..<title.index(before: title.endIndex)]
-        guard !inner.isEmpty, inner.allSatisfy({ $0.isNumber }) else { return title }
-        return String(title[..<open])
+        if title.hasSuffix("）"),
+           let open = title.lastIndex(of: "（") {
+            let inner = title[title.index(after: open)..<title.index(before: title.endIndex)]
+            guard !inner.isEmpty, inner.allSatisfy({ $0.isNumber }) else { return title }
+            return String(title[..<open])
+        }
+        if title.hasSuffix(")"),
+           let open = title.lastIndex(of: "(") {
+            let inner = title[title.index(after: open)..<title.index(before: title.endIndex)]
+            guard !inner.isEmpty, inner.allSatisfy({ $0.isNumber }) else { return title }
+            return String(title[..<open])
+        }
+        return title
     }
 }
 
@@ -331,8 +341,6 @@ struct PlayLine: Hashable {
     let cookie: String?
 
     /// 显式 init（不依赖编译器合成的 memberwise init）：
-
-    /// 显式 init（不依赖编译器合成的 memberwise init）：
     /// 构建 #38/#39 在 Xcode 27.2 上报 "extra argument 'playerHint' in call"，
     /// 而 Models.swift 明明有该字段、构建机签出与缓存都已核实无误；
     /// 显式写出 init 后调用点不再依赖合成行为。
@@ -463,11 +471,16 @@ enum NetConstants {
 
     /// 同源判定（scheme + host + 端口）：重定向时只有同源才保留凭据头。
     /// 端口：显式端口为准，缺省按 scheme 的默认端口（https 443 / http 80）算。
+    /// 空 host / 无 scheme 不算同源：两个无 scheme 的 URL（如 "//a.com/x"）
+    /// host 相同、scheme 都为空时，旧写法会误判同源。
     static func isSameOrigin(_ a: URL?, _ b: URL?) -> Bool {
         guard let a, let b,
-              let aHost = a.host?.lowercased(), let bHost = b.host?.lowercased(),
+              let aHost = a.host?.lowercased(), !aHost.isEmpty,
+              let bHost = b.host?.lowercased(), !bHost.isEmpty,
               aHost == bHost,
-              (a.scheme?.lowercased() ?? "") == (b.scheme?.lowercased() ?? "") else { return false }
+              let aScheme = a.scheme?.lowercased(), !aScheme.isEmpty,
+              let bScheme = b.scheme?.lowercased(), !bScheme.isEmpty,
+              aScheme == bScheme else { return false }
         return effectivePort(of: a) == effectivePort(of: b)
     }
 

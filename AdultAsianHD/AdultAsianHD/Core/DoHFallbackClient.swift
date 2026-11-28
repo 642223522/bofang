@@ -1456,7 +1456,11 @@ final class DoHFallbackClient: @unchecked Sendable {
         // 非 ASCII 变原始 UTF-8 字节），严格源站/CDN 拒 400——请求行必须
         // 用编码后形式。URLComponents 失败时才回落到解码过的 path/query。
         // （URL.path 保留目录尾斜杠，尾斜杠不动。）
-        let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        // P2-2：resolvingAgainstBaseURL 用 true——相对 URL 按其 baseURL
+        // 解析，不会丢 base；绝对 URL 不受影响。本函数调用方目前只传
+        // 绝对 URL（perform 的 https 守卫、queryDoH 的 comps 拼装），
+        // 相对 URL 实际到不了这里，这里是防御性修正。
+        let comps = URLComponents(url: url, resolvingAgainstBaseURL: true)
         let encodedPath = comps?.percentEncodedPath ?? url.path
         var pathAndQuery = encodedPath.isEmpty ? "/" : encodedPath
         let encodedQuery = comps?.percentEncodedQuery ?? url.query

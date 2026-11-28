@@ -119,6 +119,9 @@ final class SoftDecoderPlayerController: ObservableObject {
     private var didMarkFailedURL: URL?
     /// 拖进度条前是不是在播（松手后据此恢复）。
     private var wasPlayingBeforeScrub = false
+    /// 拖动中：拖动时只改本地 currentTime，不向 KSPlayer 狂发 seek；
+    /// handleTime 回写也暂停，松手 endScrub 一次 seek。
+    private var isScrubbing = false
     private var hideTask: Task<Void, Never>?
     /// 加载超时兜底：15 秒未出帧即按失败走切线（KSPlayer 有些失败只停住
     /// 不调 finish，不能让界面永远卡在“正在解析播放线路…”）。
@@ -135,6 +138,20 @@ final class SoftDecoderPlayerController: ObservableObject {
         viewModel.$lines
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.refreshQualityOptions() }
+            .store(in: &cancellables)
+        // 引擎监听（与 CustomPlayerController.init 同款）：currentEngine 一变就跟进。
+        // 同一 URL 换引擎时 .onChange(of: currentURL) 不触发，全靠这里重建；
+        // 同 URL 手动重试/重播也靠它把 playGeneration 的变化送进来（load 的去重
+        // 条件认代际与失败态，见 load()）。load() 内有引擎门控：切走非软解引擎
+        // 时走 teardown，不会误建层。
+        viewModel.$currentEngine
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.load(url: self.viewModel.currentURL, headers: self.viewModel.currentHeaders)
+                }
+            }
             .store(in: &cancellables)
         refreshQualityOptions()
     }
@@ -262,7 +279,9 @@ final class SoftDecoderPlayerController: ObservableObject {
     }
 
     /// 进度回调：直接记当前时间与总时长（与原生周期观察同义）。
+    /// 拖动中不回写（KSPlayer 还没 seek 完，回写会把用户刚拖到的时间 snap 回旧时间）。
     func handleTime(currentTime: TimeInterval, totalTime: TimeInterval) {
+        guard !isScrubbing else { return }
         self.currentTime = currentTime
         if totalTime.isFinite, totalTime > 0 { duration = totalTime }
     }
@@ -285,6 +304,10 @@ final class SoftDecoderPlayerController: ObservableObject {
             handleFatalError("软解播放失败（\(error.localizedDescription)）")
             return
         }
+        // 自然播完：用户意图 = 不播。不清 shouldPlay 的话，层下次就绪
+        // （handleState .readyToPlay 里 `if shouldPlay { layer.play() }`）
+        // 会自己播起来，违背“不自动续播”铁律。
+        shouldPlay = false
         isPlaying = false
         isLoading = false
         controlsVisible = true
@@ -331,17 +354,20 @@ final class SoftDecoderPlayerController: ObservableObject {
     /// 播着的片在等缓冲时会短暂不 playing，用它记就会把“在播”记成“暂停”，
     /// 松手不续播；shouldPlay 只有用户点暂停才变 false（与原生同款）。
     func beginScrub() {
+        isScrubbing = true
         wasPlayingBeforeScrub = shouldPlay
+        hideTask?.cancel()
+        controlsVisible = true
         playerLayer?.pause()
     }
 
-    /// 拖动中：实时 seek（FFmpeg 跳转到该位置），进度条跟手。
+    /// 拖动中：只改本地 currentTime（进度条跟手），不向 KSPlayer 发 seek——
+    /// 拖动是 60Hz 的连续调用，每帧都 seek 会把 FFmpeg 轰炸到卡死；
+    /// 真正的 seek 只在松手时发一次（与原生/嵌页探针同款）。
     func scrub(to seconds: Double) {
         guard duration > 0 else { return }
         let clamped = min(max(seconds, 0), duration)
         currentTime = clamped
-        // 拖动期间停播（beginScrub 已 pause），seek 后不自动播。
-        playerLayer?.seek(time: clamped, autoPlay: false) { _ in }
     }
 
     /// 松手：精确定位到拖到的位置；拖之前在播就恢复播放（不拖完停在暂停态）。
@@ -349,13 +375,18 @@ final class SoftDecoderPlayerController: ObservableObject {
         guard duration > 0 else { return }
         let clamped = min(max(seconds, 0), duration)
         currentTime = clamped
+        isScrubbing = false
         let resume = wasPlayingBeforeScrub
-        // autoPlay 必须 false：续播由下面 if resume { play() } 显式决定，
-        // 不能让 seek 自己播（否则拖之前是暂停也会被播起来）。
-        playerLayer?.seek(time: clamped, autoPlay: false) { _ in }
-        if resume {
-            shouldPlay = true
-            playerLayer?.play()
+        // autoPlay 必须 false：续播由 seek 完成回调里显式决定，不能让 seek 自己播
+        //（否则拖之前是暂停也会被播起来）；seek 是异步的，play() 必须等 seek
+        // 完成回调后再发，立即 play 会从旧位置先播一截再跳，与 seek 抢跑
+        //（与原生 playByUser 在 seek 在途时不直接 play 同源）。
+        playerLayer?.seek(time: clamped, autoPlay: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, resume else { return }
+                self.shouldPlay = true
+                self.playerLayer?.play()
+            }
         }
     }
 
@@ -718,7 +749,14 @@ enum SoftDecoderFullscreenPresenter {
 
     @MainActor
     static func present(controller: SoftDecoderPlayerController, viewModel: PlayerViewModel, onExit: @escaping () -> Void) {
-        guard let top = topViewController() else { return }
+        // 拿不到顶层控制器（转场/退后台瞬间）：直接调 onExit 把 isFullscreen
+        // 复位，不然 isFullscreen 一直 true、内嵌容器又把画面摘了，只剩黑屏。
+        guard let top = topViewController() else {
+            onExit()
+            return
+        }
+        // 已经在全屏里：不调 onExit（调了会把 isFullscreen 复位，全屏 VC 还在上面，
+        // 画面门控会把 video view 从全屏容器摘掉，反而黑屏），直接返回。
         if top is SoftDecoderFullscreenViewController { return }
         let vc = SoftDecoderFullscreenViewController(controller: controller, viewModel: viewModel, onExit: onExit)
         activeVC = vc

@@ -266,17 +266,25 @@ struct SourcesView: View {
     // MARK: - 从文件导入（UIDocumentPicker，不用 .fileImporter）
 
     private func presentDocumentPicker() {
+        guard !isReading else { return }
         let picker = DocumentPicker()
         picker.onPick = { urls in
             handlePickedDocuments(urls)
         }
         picker.onCancel = {
             isReading = false
+            // 取消也要清掉强引用：不然 picker 实例一直挂在 @State 上，
+            // 下次再打开文件选择器会复用旧实例的残留状态。
+            documentPicker = nil
         }
         // 强引用：delegate 是弱引用，不留住 picker 实例，回调会在 present 后丢失。
         documentPicker = picker
 
-        let contentTypes = [UTType(filenameExtension: "js") ?? .plainText]
+        // .js 之外再放行纯文本：源文件常被存成 .txt 后缀，只认 .js 会选不中。
+        // （UTType(filenameExtension: "js") 在部分系统上为 nil，保底仍是纯文本。）
+        var contentTypes: [UTType] = []
+        if let js = UTType(filenameExtension: "js") { contentTypes.append(js) }
+        contentTypes.append(.plainText)
         let controller = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: true)
         controller.delegate = picker
         controller.allowsMultipleSelection = true
@@ -379,7 +387,10 @@ struct SourcesView: View {
         guard !isReading else { return }
         let text = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
-            showResultAlert("请先输入 .js 直链。")
+            // 空输入的提示不能在 Sheet 还开着时弹：Alert 挂在父视图上，
+            // Sheet 盖着时父级 Alert 被吞；先关 Sheet，等退场动画走完再弹。
+            showURLSheet = false
+            showResultAlertAfterSheetDismiss("请先输入 .js 直链。")
             return
         }
         showURLSheet = false
@@ -390,9 +401,9 @@ struct SourcesView: View {
             isReading = false
             switch result {
             case .success(let record):
-                showResultAlert("已导入 \(record.title)")
+                showResultAlertAfterSheetDismiss("已导入 \(record.title)")
             case .failure(let error):
-                showResultAlert(error.localizedDescription)
+                showResultAlertAfterSheetDismiss(error.localizedDescription)
             }
         }
     }
@@ -460,6 +471,15 @@ struct SourcesView: View {
         alertMessage = message
         showAlert = true
     }
+
+    /// Sheet 关掉后弹结果：Alert 挂在父视图上，Sheet 退场动画（约 0.35 秒）
+    /// 没走完就弹会被正在退场的 Sheet 盖住吞掉——快速失败（无效链接秒回）
+    /// 正好撞上这个窗口；等 0.5 秒再弹，动画已走完。
+    private func showResultAlertAfterSheetDismiss(_ message: String) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            showResultAlert(message)
+        }
+    }
 }
 
 // MARK: - DocumentPicker：UIDocumentPickerDelegate 封装
@@ -469,7 +489,11 @@ struct SourcesView: View {
 // 这里由 SourcesView 的 @State 强引用本类实例（documentPicker），
 // present 期间实例一直活着；回调触发时先把闭包置 nil 断开引用环，
 // 再把 URL 交出去，View 侧随后把 @State 引用也清掉。
+// 整体 @MainActor：onPick/onCancel 闭包直接碰 View 的 @State，存进非 @MainActor
+// 的类里会跨隔离捕获；UIKit 的 picker 回调本来就在主线程跑，标 @MainActor
+// 与运行时一致。
 
+@MainActor
 final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
     var onPick: (([URL]) -> Void)?
     var onCancel: (() -> Void)?

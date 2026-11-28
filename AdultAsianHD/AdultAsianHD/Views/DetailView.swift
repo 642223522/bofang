@@ -148,6 +148,10 @@ struct DetailView: View {
                     VStack(spacing: 0) {
                         ForEach(Array(playerVM.lines.enumerated()), id: \.offset) { _, line in
                             Button {
+                                // 手动切线先取消在途的分集现铸任务：慢返回的分集
+                                // 会调 playLine 覆盖刚切好的线路。
+                                episodeTask?.cancel()
+                                episodeTask = nil
                                 playerVM.switchLine(line)
                             } label: {
                                 HStack {
@@ -268,6 +272,9 @@ struct DetailView: View {
             guard !isFullscreen else { return }
             episodeTask?.cancel()
             episodeTask = nil
+            // 重置起播旗：从“相关视频”点返回时 onAppear 会再跑，旗不重置就
+            // 永远不重播（离页时播放器已被停掉），只剩黑屏。
+            hasStartedPlayback = false
             player.pause()
             player.replaceCurrentItem(with: nil)
             playerVM.stop()
@@ -363,6 +370,11 @@ struct DetailView: View {
             showDownloadAlert = true
             return
         }
+        // 入队即弹窗“已加入下载”：downloadHLS/downloadMP4 是整片下完才返回的，
+        // 以前 await 下完才弹，文案与行为对不上（大片要等很久才提示）。
+        // 入队那一刻任务记录已进下载列表，提示属实；进度在「我的 → 下载」里看。
+        downloadAlertMessage = "已加入下载，可在「我的 → 下载」里查看进度。"
+        showDownloadAlert = true
         Task {
             if url.pathExtension.lowercased() == "m3u8"
                 || url.absoluteString.lowercased().contains("m3u8") {
@@ -370,8 +382,6 @@ struct DetailView: View {
             } else {
                 await downloader.downloadMP4(url, title: item.title)
             }
-            downloadAlertMessage = "已加入下载，可在「我的 → 下载」里查看进度。"
-            showDownloadAlert = true
         }
     }
 }

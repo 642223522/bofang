@@ -52,17 +52,20 @@ final class Downloader: ObservableObject {
     func downloadHLS(_ url: URL, title: String) async {
         let id = UUID()
         tasks.append(DownloadTask(id: id, title: title, progress: 0, state: .downloading, fileURL: nil, errorMessage: nil))
+        // destURL 放 do 外面：失败时 catch 里要删残文件（P1-8）。
+        var destURL: URL?
         do {
-            let playlistURL = try await resolveMediaPlaylist(from: url)
-            let (segments, initURL) = try await parsePlaylist(playlistURL)
+            let (playlistURL, playlistText) = try await resolveMediaPlaylist(from: url)
+            let (segments, initURL) = try parsePlaylist(playlistURL, text: playlistText)
             guard !segments.isEmpty else {
                 throw DownloadError.emptyPlaylist
             }
             let isFMP4 = segments.first?.pathExtension.lowercased() == "m4s"
             let ext = isFMP4 ? "mp4" : "ts"
-            let destURL = uniqueFileURL(for: title, ext: ext)
-            _ = fileManager.createFile(atPath: destURL.path, contents: nil)
-            let handle = try FileHandle(forWritingTo: destURL)
+            let dest = uniqueFileURL(for: title, ext: ext)
+            destURL = dest
+            _ = fileManager.createFile(atPath: dest.path, contents: nil)
+            let handle = try FileHandle(forWritingTo: dest)
             defer { try? handle.close() }
             var done = 0
             if let initURL {
@@ -86,19 +89,27 @@ final class Downloader: ObservableObject {
                 $0.state = .failed
                 $0.errorMessage = message
             }
+            // 失败不留残文件（P1-8）：分片已拼了一半的 destURL 删掉。
+            // （defer 已先关了 FileHandle，删文件是安全的。）
+            if let destURL {
+                try? fileManager.removeItem(at: destURL)
+            }
         }
     }
 
     /// 如果给的是 master 播单（含 #EXT-X-STREAM-INF），跟一层 variant（取最大码率），
     /// 拿到真正的媒体播单；本身就是媒体播单的直接返回。
-    private func resolveMediaPlaylist(from url: URL) async throws -> URL {
-        let text = try await fetchText(from: url)
+    /// 返回媒体播单最终 URL + 已取到的播单文本：媒体播单只 GET 一次（P1-8），
+    /// 文本直接复用，不再由 parsePlaylist 重取一次；相对地址一律按重定向后
+    /// 的最终 URL 解析，不按原始 URL。
+    private func resolveMediaPlaylist(from url: URL) async throws -> (url: URL, text: String) {
+        let (finalURL, text) = try await fetchTextAndFinalURL(from: url)
         guard text.contains("#EXTM3U") else { throw DownloadError.notPlaylist }
-        let variants = parseVariants(text, base: url)
+        let variants = parseVariants(text, base: finalURL)
         guard let best = variants.max(by: { $0.bandwidth < $1.bandwidth }) else {
-            return url
+            return (finalURL, text)
         }
-        return best.url
+        return try await fetchTextAndFinalURL(from: best.url)
     }
 
     private func parseVariants(_ text: String, base: URL) -> [(bandwidth: Int, url: URL)] {
@@ -127,12 +138,19 @@ final class Downloader: ObservableObject {
     }
 
     /// 解析媒体播单：#EXT-X-MAP 的 init 地址 + 所有分片地址（相对转绝对）。
-    /// AES-128 加密的播单直接 throw（下不了，明说，不硬拼）。
-    private func parsePlaylist(_ url: URL) async throws -> (segments: [URL], initURL: URL?) {
-        let text = try await fetchText(from: url)
+    /// AES-128 / SAMPLE-AES 加密的播单直接 throw（下不了，明说，不硬拼）。
+    /// #EXT-X-BYTERANGE 的播单也 throw：分片是同一文件的字节范围，
+    /// 不能按“每行一个独立分片 URL”逐个全量下载拼合。
+    /// 文本由调用方一次取好传进来，不再自己重取（P1-8：媒体播单双 GET）；
+    /// 相对地址按传入的最终 URL（已跟完重定向）解析。
+    private func parsePlaylist(_ url: URL, text: String) throws -> (segments: [URL], initURL: URL?) {
         guard text.contains("#EXTM3U") else { throw DownloadError.notPlaylist }
-        if text.contains("#EXT-X-KEY") && text.contains("METHOD=AES-128") {
+        if text.contains("#EXT-X-KEY")
+            && (text.contains("METHOD=AES-128") || text.contains("METHOD=SAMPLE-AES")) {
             throw DownloadError.encrypted
+        }
+        if text.contains("#EXT-X-BYTERANGE") {
+            throw DownloadError.unsupported("这个播单用了分片字节范围（BYTERANGE），暂不支持下载")
         }
         var initURL: URL?
         var segments: [URL] = []
@@ -225,7 +243,13 @@ final class Downloader: ObservableObject {
                 if let resumeData {
                     task = URLSession.shared.downloadTask(withResumeData: resumeData, completionHandler: finish)
                 } else {
-                    task = URLSession.shared.downloadTask(with: url, completionHandler: finish)
+                    // MP4 直下也带 iPhone UA（P1-8；与 fetchData 同款）：
+                    // 部分 CDN 拒默认 UA。Referer/Cookie 要按线传，
+                    // downloadMP4 入口只有 URL+title、无 headers 入口，
+                    // 改接口留下一轮，这里不发明新参数。
+                    var request = URLRequest(url: url)
+                    request.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
+                    task = URLSession.shared.downloadTask(with: request, completionHandler: finish)
                 }
                 box.installTask(task)
                 let observation = task.progress.observe(\.fractionCompleted, options: [.new]) { [weak self] progress, _ in
@@ -246,7 +270,10 @@ final class Downloader: ObservableObject {
     /// moveItem 必须在这里做，不能等 continuation 恢复后再由调用方移
     ///（P0-4：MP4 下载 100% 落盘时 No such file）。落盘失败直接报失败，
     /// 绝不把已失效的临时 location 交回去。
-    private static func finishDownload(location: URL?, response: URLResponse?, error: Error?, destURL: URL, box: DownloadRaceBox) {
+    /// nonisolated（ChatGPT P1-3）：Downloader 是 @MainActor，但本方法在
+    /// URLSession completion handler（后台线程可执行）里调；体内只操作
+    /// FileManager 与 DownloadRaceBox，不碰 Downloader 的主线程状态。
+    nonisolated private static func finishDownload(location: URL?, response: URLResponse?, error: Error?, destURL: URL, box: DownloadRaceBox) {
         let result: Result<URL, Error>
         if let error {
             // 失败时 URLSession 会在 userInfo 里给 resumeData（能续传时）
@@ -273,20 +300,31 @@ final class Downloader: ObservableObject {
         } else {
             result = .failure(DownloadError.network("下载完成但没拿到文件"))
         }
-        box.finish(result, cancelTask: false)
+        // 取消与完成竞态（ChatGPT P2-2 = Gemini P2-5）：box.finish 返回
+        // false 表示取消路径已先抢到完成权——文件虽已落盘，UI 却显示取消，
+        // 把刚落盘的 destURL 删掉，不留孤儿文件。
+        let wonRace = box.finish(result, cancelTask: false)
+        if !wonRace, case .success = result {
+            try? FileManager.default.removeItem(at: destURL)
+        }
     }
 
     // MARK: - 小工具
 
-    private func fetchText(from url: URL) async throws -> String {
-        let data = try await fetchData(from: url)
+    /// 取播单文本 + 重定向后的最终 URL（P1-8：相对地址按最终 URL 解析）。
+    private func fetchTextAndFinalURL(from url: URL) async throws -> (url: URL, text: String) {
+        let (data, response) = try await fetchDataWithResponse(from: url)
         guard let text = String(data: data, encoding: .utf8) else {
             throw DownloadError.badResponse
         }
-        return text
+        return (response.url ?? url, text)
     }
 
     private func fetchData(from url: URL) async throws -> Data {
+        try await fetchDataWithResponse(from: url).data
+    }
+
+    private func fetchDataWithResponse(from url: URL) async throws -> (data: Data, response: URLResponse) {
         var request = URLRequest(url: url)
         request.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 60
@@ -295,7 +333,7 @@ final class Downloader: ObservableObject {
             if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
                 throw DownloadError.httpStatus(http.statusCode)
             }
-            return data
+            return (data, response)
         } catch let error as DownloadError {
             throw error
         } catch {
@@ -313,8 +351,15 @@ final class Downloader: ObservableObject {
         tasks.removeAll { $0.id == task.id }
     }
 
-    /// delete 是 removeTask 的别名（界面层 MyView 调 downloader.delete(task)）。
+    /// delete 是 removeTask 的别名（界面层 MyView 调 downloader.delete(task)，
+    /// 左滑 destructive“删除”）。
+    /// （P1-8：已落盘的文件一起删掉，不留孤儿文件；正在下（fileURL 为 nil）
+    /// 的任务这里停不掉——downloadOnce/downloadHLS 的底层任务句柄没存下来，
+    /// 取消在途下载要改接口存 Task 句柄，留下一轮。）
     func delete(_ task: DownloadTask) {
+        if let fileURL = task.fileURL {
+            try? fileManager.removeItem(at: fileURL)
+        }
         removeTask(task)
     }
 
@@ -345,6 +390,7 @@ enum DownloadError: Error, LocalizedError {
     case notPlaylist
     case emptyPlaylist
     case encrypted
+    case unsupported(String)
     case badResponse
     case httpStatus(Int)
     case network(String)
@@ -353,7 +399,8 @@ enum DownloadError: Error, LocalizedError {
         switch self {
         case .notPlaylist: return "这个链接不是 m3u8 播单，下不了"
         case .emptyPlaylist: return "播单里没有分片，下不了"
-        case .encrypted: return "这个视频加密了（AES-128），暂不支持下载"
+        case .encrypted: return "这个视频加密了，暂不支持下载"
+        case .unsupported(let reason): return reason
         case .badResponse: return "服务器返回的数据看不懂"
         case .httpStatus(let code): return "下载失败（服务器返回 HTTP \(code)）"
         case .network(let reason): return "下载失败：\(reason)"
@@ -431,11 +478,14 @@ private final class DownloadRaceBox: @unchecked Sendable {
     }
 
     /// 完成：取消时 cancelTask == true，同步取消底层 downloadTask。
-    func finish(_ result: Result<URL, Error>, cancelTask: Bool) {
+    /// 返回是否抢到完成权（true = 本次调用的结果被采纳；false = 已有别的
+    /// 结果先完成，本次结果被丢弃——调用方据此决定要不要清理已落盘文件）。
+    @discardableResult
+    func finish(_ result: Result<URL, Error>, cancelTask: Bool) -> Bool {
         lock.lock()
         guard !finished else {
             lock.unlock()
-            return
+            return false
         }
         finished = true
         let continuation = self.continuation
@@ -453,5 +503,6 @@ private final class DownloadRaceBox: @unchecked Sendable {
             task?.cancel()
         }
         continuation?.resume(with: result)
+        return true
     }
 }

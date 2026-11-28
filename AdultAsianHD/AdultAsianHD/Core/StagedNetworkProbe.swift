@@ -552,17 +552,27 @@ final class StagedNetworkProbe: NSObject {
                 set { lock.lock(); defer { lock.unlock() }; _watchdog = newValue }
             }
 
-            /// 存 continuation：若 finish 已先跑（done），立即用存下的结果恢复。
-            func setContinuation(_ c: CheckedContinuation<String, Never>) {
+            /// 存 continuation：若 finish 已先跑（done），立即用存下的结果恢复，
+            /// 并返回 false——调用方不要再建 20 秒看门狗（continuation 已恢复，
+            /// 看门狗建了也是白等 20 秒才被 cancel）。正常存下返回 true。
+            func setContinuation(_ c: CheckedContinuation<String, Never>) -> Bool {
                 lock.lock()
                 if done, let result = pendingResult {
                     pendingResult = nil
                     lock.unlock()
                     c.resume(returning: result)
-                    return
+                    return false
+                }
+                if done {
+                    // finish 已跑且已恢复过之前存的 continuation：这次调用
+                    // 不应再发生，同样不建看门狗，直接恢复防挂起。
+                    lock.unlock()
+                    c.resume(returning: "CANCELLED")
+                    return false
                 }
                 cont = c
                 lock.unlock()
+                return true
             }
 
             func finish(_ text: String) {
@@ -609,7 +619,10 @@ final class StagedNetworkProbe: NSObject {
         wv.navigationDelegate = loader
         let result = await withTaskCancellationHandler {
             await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
-                loader.setContinuation(cont)
+                // P2-3：setContinuation 已 done 时返回 false（finish 先跑、
+                // continuation 已恢复），跳过 20 秒看门狗创建——建了也是
+                // 白等 20 秒才被 cancel。
+                guard loader.setContinuation(cont) else { return }
                 // 20 秒看门狗：挑战页/挂起的加载不会永远等下去（原版没有超时，会永久挂住）。
                 // 先存下来再加载：finish 里会 cancel 它。
                 loader.watchdog = Task { @MainActor in
@@ -635,6 +648,11 @@ final class StagedNetworkProbe: NSObject {
                 loader.finish("CANCELLED")
             }
         }
+        // P2-3：退出前摘掉 delegate 并停加载——TIMEOUT/CANCELLED 后 WebView
+        // 还在后台跑的话，它的 didFinish/didFail 会打进已结束的 Loader，
+        // 下一轮探针的结果会跟这轮串在一起；delegate 不摘还会强持 Loader。
+        wv.navigationDelegate = nil
+        wv.stopLoading()
         let ok = result.hasPrefix("LOADED")
         let stage: ProbeStage = result.hasPrefix("CHALLENGE") ? .waf : .webview
         return ProbeLine(stage: stage, label: label, detail: result, ok: ok)
