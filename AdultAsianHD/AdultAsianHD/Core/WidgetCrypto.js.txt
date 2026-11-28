@@ -256,6 +256,8 @@
 
     // base64 → 目标编码的字符串。
     function b64ToStr(b64, enc) {
+        // base64 输出直接返回：原来先全量解码成字节数组再原样扔掉，5MB 密文白解一次。
+        if (enc === 'base64') { return b64; }
         var bytes = b64ToBytes(b64, false);
         switch (enc) {
             case 'utf8': return utf8Decode(bytes);
@@ -384,6 +386,11 @@
             }
         }
 
+        // 加密时传 tag 是错：tag 是加密的输出产物（由原语返回），不是输入参数。
+        // 原来只拦了非 GCM 传 tag，GCM 加密传 tag 也被静默忽略。
+        if (isEncrypt && opts.tag !== undefined && opts.tag !== null) {
+            throw new TypeError('tag is only valid for decrypt');
+        }
         // 非 GCM 传 tag 是错：原来静默忽略，模块以为 tag 生效了、其实没传进去。
         if (mode !== 'GCM' && opts.tag !== undefined && opts.tag !== null) {
             throw new TypeError('tag is only valid for GCM');
@@ -511,7 +518,9 @@
         var outputEnc = normEncoding(opts.outputEncoding, 'utf8');
         if (typeof data !== 'string') { throw new TypeError('data must be a string'); }
         var urlSafe = !!opts.urlSafe;
-        var b64 = bytesToB64(b64ToBytes(data, urlSafe));
+        // 走 strToB64：原来直接调 b64ToBytes 全量解码，绕过了 P1-2 的前置长度守卫，
+        // 30MB 输入会先全量分配大数组。strToB64 自带前置守卫 + 合法性校验。
+        var b64 = strToB64(data, urlSafe ? 'base64url' : 'base64');
         checkMaxBytes(b64, 'data');
         return b64ToStr(b64, outputEnc);
     }
@@ -529,7 +538,8 @@
         var opts = isObject(options) ? options : {};
         var outputEnc = normEncoding(opts.outputEncoding, 'utf8');
         if (typeof data !== 'string') { throw new TypeError('data must be a string'); }
-        var b64 = bytesToB64(hexToBytes(data));
+        // 同上：走 strToB64 拿前置守卫，别直接调 hexToBytes 全量解码。
+        var b64 = strToB64(data, 'hex');
         checkMaxBytes(b64, 'data');
         return b64ToStr(b64, outputEnc);
     }

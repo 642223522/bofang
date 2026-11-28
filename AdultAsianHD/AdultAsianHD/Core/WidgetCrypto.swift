@@ -144,6 +144,12 @@ enum WidgetCrypto {
         }
         if isECB { options |= CCOptions(kCCOptionECBMode) }
 
+        // 解密 + pkcs7 + 空数据：合法 PKCS7 密文至少 16 字节；空密文直接报 BAD_PADDING，
+        // 别依赖底层 CCCrypt 对 0 字节输入的行为（不同版本行为有差异，未验证）。
+        if !encrypt && pad == "pkcs7" && data.isEmpty {
+            throw CryptoError.failure(code: "CRYPTO_BAD_PADDING", message: "empty ciphertext with pkcs7 padding")
+        }
+
         let algorithm = CCAlgorithm(kCCAlgorithmAES)
         let op: CCOperation = encrypt ? CCOperation(kCCEncrypt) : CCOperation(kCCDecrypt)
         // 输出 buffer：加密 pkcs7 时最多 +16；解密不超过输入。
