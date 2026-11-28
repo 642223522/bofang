@@ -444,6 +444,10 @@ extension WidgetCrypto {
             if let exc = context.exception {
                 print("[WidgetCrypto] delete globals failed: \(exc)")
                 context.exception = nil
+                #if DEBUG
+                // 严格模式下 delete 抛错也是原语没删掉，DEBUG 里同样断言。
+                assertionFailure("WidgetCrypto delete globals failed: \(exc)")
+                #endif
             } else if let left = context.evaluateScript("typeof __fwCryptoAESEncrypt + ',' + typeof __fwCryptoAESDecrypt + ',' + typeof __fwCryptoXOR + ',' + typeof __fwCryptoHash + ',' + typeof __fwCryptoHMAC + ',' + typeof __fwCryptoRandomBytes")?.toString(), left != "undefined,undefined,undefined,undefined,undefined,undefined" {
                 print("[WidgetCrypto] globals not deleted: \(left)")
                 #if DEBUG
