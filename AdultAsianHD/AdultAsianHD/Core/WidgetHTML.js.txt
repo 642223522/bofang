@@ -17,7 +17,8 @@
 // 护栏（load 是同步纯解析，解析本身不触网）：
 // - html 必须是字符串，非字符串抛 TypeError；空串返回空文档（不抛）；
 // - 输入按 UTF-8 字节数限 5MB（HARD_MAX_HTML_BYTES 是硬上限，只许调低不许调高；
-//   maxBytes 无效（非数/NaN/Infinity/≤0）抛 TypeError，null 视同未传）；
+//   maxBytes/maxHTMLBytes 任一有效（>= 1 的有限数），无效（非数/NaN/Infinity/< 1）
+//   抛 TypeError，null 视同未传；maxBytes 优先于 maxHTMLBytes）；
 //   注意：5MB 是 HTML 解析输入限制，不是网络响应内存限制——loadURL 会先把整包
 //   响应下载+解码再量尺寸（HTTP 层响应体上限是后续项，不在本轮）；
 // - 解析后走树计数：节点 > 100,000 抛 HTMLDocumentTooLargeError，深度 > 512 抛 HTMLDocumentTooDeepError；
@@ -30,8 +31,9 @@
 //   GBK 等非 UTF-8 页面目前会乱码（与现有模块 http.get + 正则的现状一致），以后 http 层做字符集嗅探时这里自动受益；
 // - prop('href')/prop('src') 的相对地址解析：<a>/<link> 的 href 与
 //   img/iframe/audio/video/source 的 src 会对 baseURI 解析（cheerio 原生行为，
-//   依赖全局 URL；裸 JSContext 里没有 URL，宿主在 __fwEnsureCheerio 里懒装了一个
-//   最小 URL 构造器——只在第一次调 html.load/loadURL 时装，不用的模块看不到它）；
+//   依赖全局 URL；裸 JSContext 里没有 URL，宿主在建桥时就装了一个最小 URL 构造器
+//   （模块在第一次调 html.load 之前 new URL 也能用）；searchParams 是活的，
+//   set/append/delete 后会同步回 URL 的 search 与 href）；
 //   别的标签的 prop 返回原始值。attr() 永远返回原始值。
 // - baseURI：loadURL 默认取响应的 finalUrl；load 的 options.baseURI 可显式传。
 // - 解析跑在主线程 JSContext 里（与现有模块一致），典型列表/详情页（50KB–800KB）约 20–50ms。
@@ -150,9 +152,11 @@
         // maxBytes 先验（无效就直接拒绝，不发请求；合法值由 loadImpl 里再钳制一次）。
         try { resolveMaxBytes(options); } catch (e) { return Promise.reject(e); }
         return g.Widget.http.get(url, httpOptions).then(function (res) {
-            // res 可能为空、status 可能不是数字：非数字按 0 算，非 2xx（含 0）按原约定
-            // 抛 HTMLHTTPError（带 .status 与 .finalUrl），不静默返回空文档。
-            var status = (res && typeof res.status === 'number') ? res.status : 0;
+            // res 可能为空、status 可能不是数字：非数字/NaN/Infinity/小数按 0 算，非 2xx（含 0）
+            // 按原约定抛 HTMLHTTPError（带 .status 与 .finalUrl），不静默返回空文档。
+            // typeof NaN 是 number，但 NaN 和任何数比较都是 false，会漏过非 2xx 检查，
+            // 所以要同时要求 isFinite 与整数。
+            var status = (res && typeof res.status === 'number' && isFinite(res.status) && Math.floor(res.status) === res.status) ? res.status : 0;
             var finalUrl = (res && res.finalUrl) || url;
             if (status < 200 || status >= 300) {
                 var e = new Error('Widget.html.loadURL: HTTP ' + status + ' for ' + url);
