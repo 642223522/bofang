@@ -15,7 +15,7 @@
 //
 // 错误约定：
 // - 参数/契约错 → TypeError（key/iv/tag 长度、未知 mode/padding/编码、ECB 带 iv、
-//   CTR/GCM 传 pkcs7/zero、非法 hex/base64、randomBytes 越界、超 5MB）。
+//   CTR/GCM 传 pkcs7/zero、非法 hex/base64）。
 // - 运行时失败 → Error，带稳定 .code（CRYPTO_BAD_PADDING / CRYPTO_ALIGNMENT_ERROR /
 //   CRYPTO_AUTH_FAILED / CRYPTO_INVALID_UTF8 / CRYPTO_OS_ERROR）。
 // - 超限（输入 > 5MB、randomBytes n 越界）→ RangeError。
@@ -173,7 +173,10 @@
         // 必须抛错，不能多解出字节。
         var stripped = t.replace(/=+$/, '');
         if (stripped.indexOf('=') !== -1) { throw new TypeError('invalid base64 input'); }
-        if (t.length - stripped.length > 2) { throw new TypeError('invalid base64 input'); }
+        var padLen = t.length - stripped.length;
+        if (padLen > 2) { throw new TypeError('invalid base64 input'); }
+        // 带 = 填充时总长度必须是 4 的倍数："AB=" 是残缺填充，不能静默补成 "AB==" 多解出字节。
+        if (padLen > 0 && t.length % 4 !== 0) { throw new TypeError('invalid base64 input'); }
         var rem = t.length % 4;
         if (rem === 1) { throw new TypeError('invalid base64 input'); }
         if (rem !== 0) { t += '==='.slice(0, 4 - rem); }
@@ -226,6 +229,18 @@
     // 任意编码的字符串 → base64（给 Swift 原语用）。
     function strToB64(s, enc) {
         if (typeof s !== 'string') { throw new TypeError('expected a string'); }
+        // 前置守卫：先按字符串长度拦超限，再解码。原来先把整串全量解成 JS 数组
+        // 再 checkMaxBytes，30MB 输入会先 OOM 才抛 RangeError。
+        // （每 UTF-16 单元至少编 1 个 UTF-8 字节，故 s.length > 5MB 时解码必超限。）
+        if (enc === 'utf8') {
+            if (s.length > MAX_INPUT_BYTES) { throw new RangeError('input exceeds ' + MAX_INPUT_BYTES + ' bytes'); }
+        } else if (enc === 'hex') {
+            var hx = s.slice(0, 2) === '0x' || s.slice(0, 2) === '0X' ? s.slice(2) : s;
+            if (hx.length > MAX_INPUT_BYTES * 2) { throw new RangeError('input exceeds ' + MAX_INPUT_BYTES + ' bytes'); }
+        } else if (enc === 'base64' || enc === 'base64url') {
+            var bx = s.replace(/[\t\n\f\r ]/g, '');
+            if (bx.length > Math.ceil(MAX_INPUT_BYTES / 3) * 4) { throw new RangeError('input exceeds ' + MAX_INPUT_BYTES + ' bytes'); }
+        }
         switch (enc) {
             case 'utf8': return bytesToB64(utf8Encode(s));
             case 'base64': return bytesToB64(b64ToBytes(s, false));
@@ -248,8 +263,15 @@
     }
 
     // base64 → 字节数组（供长度校验用）。
+    // O(1) 长度公式，不解码：输入是 strToB64 产出的已规范化标准 base64
+    // （长度必为 4 的倍数、带正确 = 填充），字节数 = 字符数 * 3/4 - 末尾 = 个数。
+    // 原来每次都全量解码成几百万元素的 JS 数组，5MB 输入反复解 4～6 次，极易触发真机内存告警。
     function b64ByteLength(b64) {
-        return b64ToBytes(b64, false).length;
+        var t = String(b64).replace(/[\t\n\f\r ]/g, '');
+        var pad = 0;
+        if (t.charAt(t.length - 1) === '=') { pad++; }
+        if (t.charAt(t.length - 2) === '=') { pad++; }
+        return Math.floor(t.length * 3 / 4) - pad;
     }
 
     // ---------- 错误映射 ----------
@@ -337,15 +359,19 @@
 
         var ivB64 = null;
         if (mode === 'ECB') {
-            if (opts.iv !== undefined && opts.iv !== null && String(opts.iv) !== '') {
-                throw new TypeError('ECB must not carry an iv');
+            // 先判 typeof 再判空串：String([]) === ''，原来先用 String(v) !== '' 判断，
+            // 传 [] 会绕过类型校验、被静默当成“没传”。
+            if (opts.iv !== undefined && opts.iv !== null) {
+                if (typeof opts.iv !== 'string') { throw new TypeError('iv must be a string'); }
+                if (opts.iv !== '') { throw new TypeError('ECB must not carry an iv'); }
             }
         } else {
             // CBC/CTR/GCM 的 iv 必传（加密不自动生成——返回值是单个字符串，装不下自动生成的 nonce）。
-            if (opts.iv === undefined || opts.iv === null || String(opts.iv) === '') {
+            if (opts.iv === undefined || opts.iv === null) {
                 throw new TypeError('iv is required for ' + mode);
             }
             if (typeof opts.iv !== 'string') { throw new TypeError('iv must be a string'); }
+            if (opts.iv === '') { throw new TypeError('iv is required for ' + mode); }
             ivB64 = strToB64(opts.iv, ivEnc);
             if (mode === 'GCM') {
                 checkByteLength(ivB64, [12, 16], 'iv');
@@ -354,6 +380,10 @@
             }
         }
 
+        // 非 GCM 传 tag 是错：原来静默忽略，模块以为 tag 生效了、其实没传进去。
+        if (mode !== 'GCM' && opts.tag !== undefined && opts.tag !== null) {
+            throw new TypeError('tag is only valid for GCM');
+        }
         var tagB64 = null;
         if (mode === 'GCM' && opts.tag !== undefined && opts.tag !== null) {
             if (typeof opts.tag !== 'string') { throw new TypeError('tag must be a string'); }
@@ -364,14 +394,22 @@
         }
 
         var aadB64 = null;
-        if (opts.aad !== undefined && opts.aad !== null && String(opts.aad) !== '') {
+        if (opts.aad !== undefined && opts.aad !== null) {
             if (typeof opts.aad !== 'string') { throw new TypeError('aad must be a string'); }
-            aadB64 = strToB64(opts.aad, aadEnc);
-            checkMaxBytes(aadB64, 'aad');
+            // 非 GCM 传非空 aad 是错：原来先转码传给 Swift、再被静默丢弃。
+            if (mode !== 'GCM' && opts.aad !== '') {
+                throw new TypeError('aad is only valid for GCM');
+            }
+            if (opts.aad !== '') {
+                aadB64 = strToB64(opts.aad, aadEnc);
+                checkMaxBytes(aadB64, 'aad');
+            }
         }
 
-        // padding:'none' 时数据长度必须是 16 的倍数（CBC/ECB）。
-        if ((mode === 'CBC' || mode === 'ECB') && padding === 'none') {
+        // padding:'none' 的长度校验只在加密时由 JS 抛 TypeError；解密时交给 Swift，
+        // 统一报 CRYPTO_ALIGNMENT_ERROR。原来解密也走 JS 的 TypeError，同一种错按
+        // padding 分裂成两种错误类型（'none' → TypeError，'zero'/'pkcs7' → Error）。
+        if (isEncrypt && (mode === 'CBC' || mode === 'ECB') && padding === 'none') {
             if (b64ByteLength(dataB64) % 16 !== 0) {
                 throw new TypeError('data length must be a multiple of 16 with padding none');
             }
@@ -444,6 +482,8 @@
         var dataB64 = strToB64(data, inputEnc);
         var keyB64 = strToB64(key, keyEnc);
         checkMaxBytes(dataB64, 'data');
+        // key 也受 5MB 护栏（原来只拦空 key，不限长）。
+        checkMaxBytes(keyB64, 'key');
         if (b64ByteLength(keyB64) === 0) { throw new TypeError('key must not be empty'); }
         var res = checkNative(_xor(dataB64, keyB64));
         return b64ToStr(res.result, outputEnc);
@@ -504,6 +544,8 @@
         var algorithm = normHashAlgorithm(opts.algorithm);
         var inputEnc = normEncoding(opts.inputEncoding, 'utf8');
         var outputEnc = normEncoding(opts.outputEncoding, 'hex');
+        // 摘要是任意字节，按严格 UTF-8 解几乎必抛 CRYPTO_INVALID_UTF8——utf8 输出不认。
+        if (outputEnc === 'utf8') { throw new TypeError('outputEncoding must be hex, base64 or base64url for hash'); }
         if (typeof data !== 'string') { throw new TypeError('data must be a string'); }
         var dataB64 = strToB64(data, inputEnc);
         checkMaxBytes(dataB64, 'data');
@@ -519,11 +561,13 @@
         var inputEnc = normEncoding(opts.inputEncoding, 'utf8');
         var keyEnc = normEncoding(opts.keyEncoding, 'utf8');
         var outputEnc = normEncoding(opts.outputEncoding, 'hex');
+        if (outputEnc === 'utf8') { throw new TypeError('outputEncoding must be hex, base64 or base64url for hmac'); }
         if (typeof data !== 'string') { throw new TypeError('data must be a string'); }
         if (typeof key !== 'string') { throw new TypeError('key must be a string'); }
         var dataB64 = strToB64(data, inputEnc);
         var keyB64 = strToB64(key, keyEnc);
         checkMaxBytes(dataB64, 'data');
+        checkMaxBytes(keyB64, 'key');
         var res = checkNative(_hmac(algo, dataB64, keyB64));
         if (outputEnc === 'hex') { return res.result; }
         return b64ToStr(bytesToB64(hexToBytes(res.result)), outputEnc);
@@ -534,6 +578,8 @@
     function randomBytes(n, options) {
         var opts = isObject(options) ? options : {};
         var outputEnc = normEncoding(opts.outputEncoding, 'base64');
+        // 随机字节是任意字节，按严格 UTF-8 解几乎必抛 CRYPTO_INVALID_UTF8——utf8 输出不认。
+        if (outputEnc === 'utf8') { throw new TypeError('outputEncoding must be hex, base64 or base64url for randomBytes'); }
         if (typeof n !== 'number' || Math.floor(n) !== n || n < 0 || n > MAX_RANDOM_BYTES) {
             throw new RangeError('n must be an integer 0...' + MAX_RANDOM_BYTES);
         }
@@ -556,7 +602,7 @@
             // 浅拷贝：别改写调用方传进来的 options 对象。
             var opts = {};
             if (isObject(options)) {
-                for (var k in options) { opts[k] = options[k]; }
+                for (var k in options) { if (Object.prototype.hasOwnProperty.call(options, k)) { opts[k] = options[k]; } }
             }
             opts.algorithm = 'md5';
             return hash(data, opts);
@@ -565,7 +611,7 @@
             // 浅拷贝：别改写调用方传进来的 options 对象。
             var opts = {};
             if (isObject(options)) {
-                for (var k in options) { opts[k] = options[k]; }
+                for (var k in options) { if (Object.prototype.hasOwnProperty.call(options, k)) { opts[k] = options[k]; } }
             }
             opts.algorithm = 'sha1';
             return hash(data, opts);
@@ -574,7 +620,7 @@
             // 浅拷贝：别改写调用方传进来的 options 对象。
             var opts = {};
             if (isObject(options)) {
-                for (var k in options) { opts[k] = options[k]; }
+                for (var k in options) { if (Object.prototype.hasOwnProperty.call(options, k)) { opts[k] = options[k]; } }
             }
             opts.algorithm = 'sha256';
             return hash(data, opts);
@@ -583,7 +629,7 @@
             // 浅拷贝：别改写调用方传进来的 options 对象。
             var opts = {};
             if (isObject(options)) {
-                for (var k in options) { opts[k] = options[k]; }
+                for (var k in options) { if (Object.prototype.hasOwnProperty.call(options, k)) { opts[k] = options[k]; } }
             }
             opts.algorithm = 'sha512';
             return hash(data, opts);
@@ -595,9 +641,10 @@
     // 冻住 Widget.crypto 及其方法，防止模块互相篡改。
     Object.freeze(crypto);
 
-    if (g.Widget) {
-        g.Widget.crypto = crypto;
-    } else {
-        g.Widget = { crypto: crypto };
+    // Object.freeze(crypto) 只冻住 crypto 内部成员，g.Widget.crypto 本身仍可写可删，
+    // 模块一句 Widget.crypto = fakeObj 就能整个替换掉。改用 defineProperty 锁定属性。
+    if (!g.Widget) { g.Widget = {}; }
+    if (g.Widget.crypto !== crypto) {
+        Object.defineProperty(g.Widget, 'crypto', { value: crypto, writable: false, configurable: false, enumerable: true });
     }
 })(this);

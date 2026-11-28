@@ -27,6 +27,8 @@
 import Foundation
 import CommonCrypto
 import CryptoKit
+import JavaScriptCore
+import Security
 
 /// Widget.crypto 原生原语。所有方法只做一件事：把 base64 字符串解成 Data，
 /// 调原生 crypto，返回 base64/hex 字符串。参数校验（长度、mode、padding）由
@@ -53,6 +55,13 @@ enum WidgetCrypto {
     /// GCM tag 固定 16 字节。
     static let gcmTagLength = 16
 
+    /// JS 胶水脚本进程级缓存：install 每次都读盘没必要，读一次缓存起来。
+    /// 读不到为 nil（install 直接打日志 return，不注册原语）。
+    static let glueScript: String? = {
+        guard let url = Bundle.main.url(forResource: "WidgetCrypto", withExtension: "js.txt") else { return nil }
+        return try? String(contentsOf: url, encoding: .utf8)
+    }()
+
     // MARK: - base64 / hex 编解码（原语边界用）
 
     static func dataFromBase64(_ s: String) -> Data? {
@@ -61,27 +70,6 @@ enum WidgetCrypto {
         let rem = t.count % 4
         if rem != 0 { t += String(repeating: "=", count: 4 - rem) }
         return Data(base64Encoded: t)
-    }
-
-    static func dataFromBase64URL(_ s: String) -> Data? {
-        // Base64URL：- → +，_ → /，再按 base64 解。
-        let t = s.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
-        return dataFromBase64(t)
-    }
-
-    static func dataFromHex(_ s: String) -> Data? {
-        var t = s
-        if t.hasPrefix("0x") || t.hasPrefix("0X") { t = String(t.dropFirst(2)) }
-        guard t.count % 2 == 0 else { return nil }
-        var data = Data(capacity: t.count / 2)
-        var idx = t.startIndex
-        while idx < t.endIndex {
-            let next = t.index(idx, offsetBy: 2)
-            guard let byte = UInt8(t[idx..<next], radix: 16) else { return nil }
-            data.append(byte)
-            idx = next
-        }
-        return data
     }
 
     static func hexString(_ data: Data) -> String {
@@ -165,7 +153,11 @@ enum WidgetCrypto {
         // 空 Data 传 C API 可能为 nil 指针：用 1 字节 dummy 兜底。
         let dataBytes: [UInt8] = data.isEmpty ? [0] : [UInt8](data)
         let keyBytes: [UInt8] = [UInt8](key)
-        let ivBytes: [UInt8]? = (isECB ? nil : (iv.map { [UInt8]($0) } ?? [UInt8](repeating: 0, count: 16)))
+        // ivBytes 必须是非可选 [UInt8]：Swift 的数组→指针隐式转换只支持非可选数组，
+        // [UInt8]? 传给 CCCrypt 的 iv: UnsafeRawPointer? 是编译错。ECB 传空数组
+        // （空数组转指针为 nil，ECB 本来也不用 iv）；其余传 16 字节 iv（非 ECB 时
+        // 上面的 guard 已保证 iv 非空，?? 分支走不到）。
+        let ivBytes: [UInt8] = isECB ? [] : [UInt8](iv ?? [UInt8](repeating: 0, count: 16))
         let status: CCStatus = out.withUnsafeMutableBytes { outPtr in
             CCCrypt(
                 op, algorithm, options,
@@ -176,13 +168,15 @@ enum WidgetCrypto {
                 &outLength
             )
         }
-        guard status == kCCSuccess else {
+        // CCStatus 是 Int32，kCCSuccess/kCCAlignmentError/kCCDecodeError 是无类型 C 枚举，
+        // Swift 导入为 Int——直接比较是类型不匹配的编译错，必须用 CCStatus(...) 包装。
+        guard status == CCStatus(kCCSuccess) else {
             // 坏 padding 是 kCCDecodeError；对齐错是 kCCAlignmentError；其余（参数/内存/缓冲）
             // 不是 padding 问题，报 CRYPTO_OS_ERROR，别一律扣成 BAD_PADDING。
             let code: String
             switch status {
-            case kCCAlignmentError: code = "CRYPTO_ALIGNMENT_ERROR"
-            case kCCDecodeError: code = "CRYPTO_BAD_PADDING"
+            case CCStatus(kCCAlignmentError): code = "CRYPTO_ALIGNMENT_ERROR"
+            case CCStatus(kCCDecodeError): code = "CRYPTO_BAD_PADDING"
             default: code = "CRYPTO_OS_ERROR"
             }
             throw CryptoError.failure(code: code, message: "CCCrypt failed with status \(status)")
@@ -227,9 +221,13 @@ enum WidgetCrypto {
         // 单次 ECB 加密全部计数器块（无填充；长度是 16 的倍数），得到 keystream。
         let keystream = try aesCCCrypt(data: counterBlocks, key: key, iv: nil, encrypt: true, mode: "ECB", padding: "none")
         // XOR（最后一块不足 16 字节时只取 keystream 的前 n 字节，不补齐）。
+        // 转 [UInt8] 再索引：Data[i] 假定 startIndex == 0，传 Data 切片会越界；
+        // [UInt8] 既安全又更快。
+        let dataBytes = [UInt8](data)
+        let ksBytes = [UInt8](keystream)
         var out = Data(capacity: data.count)
         for i in 0..<data.count {
-            out.append(data[i] ^ keystream[i])
+            out.append(dataBytes[i] ^ ksBytes[i])
         }
         return out
     }
@@ -250,13 +248,16 @@ enum WidgetCrypto {
             // 核实），12 或 16 字节都接受；真机再用 16 字节 nonce 的已知向量做 seal/open 互操作确认。
             nonce = try AES.GCM.Nonce(data: iv)
         } catch {
-            throw CryptoError.invalidParameter("invalid GCM nonce: \(error)")
+            // 系统错误不拼进给模块的消息（固定文案 + 日志记详情，避免万一带出敏感内容）。
+            print("[WidgetCrypto] invalid GCM nonce: \(error)")
+            throw CryptoError.invalidParameter("invalid GCM nonce")
         }
         do {
             let sealed = try AES.GCM.seal(data, using: symKey, nonce: nonce, authenticating: aad ?? Data())
             return (sealed.ciphertext, sealed.tag)
         } catch {
-            throw CryptoError.failure(code: "CRYPTO_OS_ERROR", message: "GCM seal failed: \(error)")
+            print("[WidgetCrypto] GCM seal failed: \(error)")
+            throw CryptoError.failure(code: "CRYPTO_OS_ERROR", message: "GCM seal failed")
         }
     }
 
@@ -275,24 +276,32 @@ enum WidgetCrypto {
         do {
             nonce = try AES.GCM.Nonce(data: iv)
         } catch {
-            throw CryptoError.invalidParameter("invalid GCM nonce: \(error)")
+            // 系统错误不拼进给模块的消息（固定文案 + 日志记详情，避免万一带出敏感内容）。
+            print("[WidgetCrypto] invalid GCM nonce: \(error)")
+            throw CryptoError.invalidParameter("invalid GCM nonce")
         }
         // SealedBox 手工拆分（不用 combined：16 字节 nonce 时 combined 为 nil）。
         // SealedBox(nonce:ciphertext:tag:) 是 throwing 初始化器（tag 长度不对就抛），
         // 必须 try，不能裸调——裸调是编译错（ChatGPT R12 抓到的第二处真编译错）。
         // 构造参数错与认证失败分开报：前者 invalidParameter，后者 CRYPTO_AUTH_FAILED。
-        // （tag 长度前面已校验过 16 字节，构造实际抛不出来，但编译器只认签名，必须 try。）
+        // （tag 长度前面已校验过 16 字节，正常不应抛，但编译器只认签名，必须 try。）
         let box: AES.GCM.SealedBox
         do {
             box = try AES.GCM.SealedBox(nonce: nonce, ciphertext: data, tag: tag)
         } catch {
-            throw CryptoError.invalidParameter("invalid GCM sealed box: \(error)")
+            print("[WidgetCrypto] invalid GCM sealed box: \(error)")
+            throw CryptoError.invalidParameter("invalid GCM sealed box")
         }
         do {
             return try AES.GCM.open(box, using: symKey, authenticating: aad ?? Data())
         } catch {
-            // 认证失败：不返回任何明文，统一报 CRYPTO_AUTH_FAILED（不区分细节）。
-            throw CryptoError.failure(code: "CRYPTO_AUTH_FAILED", message: "GCM authentication failed")
+            // 只有认证失败才报 CRYPTO_AUTH_FAILED；其他错误（如参数错）报 CRYPTO_OS_ERROR，
+            // 别把参数错误报成认证失败（诊断准确是验收项之一）。
+            if case CryptoKitError.authenticationFailure = error {
+                throw CryptoError.failure(code: "CRYPTO_AUTH_FAILED", message: "GCM authentication failed")
+            }
+            print("[WidgetCrypto] GCM open failed: \(error)")
+            throw CryptoError.failure(code: "CRYPTO_OS_ERROR", message: "GCM open failed")
         }
     }
 
@@ -304,9 +313,10 @@ enum WidgetCrypto {
         guard !key.isEmpty else {
             throw CryptoError.invalidParameter("key must not be empty")
         }
+        let keyBytes = [UInt8](key)
         var out = Data(capacity: data.count)
         for (i, byte) in data.enumerated() {
-            out.append(byte ^ key[i % key.count])
+            out.append(byte ^ keyBytes[i % keyBytes.count])
         }
         return out
     }
@@ -335,7 +345,9 @@ enum WidgetCrypto {
         switch algorithm.lowercased() {
         case "md5":
             // CryptoKit 没有 HMAC-MD5；用 CommonCrypto CCHmac。
-            return hmacCC(algorithm: kCCHmacAlgMD5, data: data, key: key)
+            // kCCHmacAlgMD5 是无类型 C 枚举（Swift 导入为 Int），CCHmacAlgorithm 是 UInt32——
+            // 直接传是类型不匹配的编译错，必须包装。
+            return hmacCC(algorithm: CCHmacAlgorithm(kCCHmacAlgMD5), data: data, key: key)
         case "sha1":
             let mac = HMAC<Insecure.SHA1>.authenticationCode(for: data, using: symKey)
             return Data(mac)
@@ -392,6 +404,12 @@ enum WidgetCrypto {
 extension WidgetCrypto {
 
     static func install(into context: JSContext) {
+        // 胶水读不到直接 return：不注册原语，不留半成品（Widget.crypto 不存在，
+        // 模块调它会明确报“不可用”，而不是拿到一个只有部分方法的对象）。
+        guard let glue = glueScript else {
+            print("[WidgetCrypto] WidgetCrypto.js.txt 读不到，Widget.crypto 不可用")
+            return
+        }
         // 统一的错误字典。
         func errDict(_ error: CryptoError) -> NSDictionary {
             switch error {
@@ -406,7 +424,9 @@ extension WidgetCrypto {
 
         // AES 加密：(dataB64, keyB64, ivB64|nil, mode, padding, aadB64|nil)
         // → {ok, ciphertext, tag?}（tag 仅 GCM 有，为 base64；其余 mode 无 tag 键）。
-        let aesEncrypt: @convention(block) (String, String, String?, String, String, String?) -> NSDictionary = { dataB64, keyB64, ivB64, mode, padding, aadB64 in
+        // 局部名必须加 Block 后缀：直接叫 aesEncrypt 会遮蔽同名静态方法，闭包里调
+        // aesEncrypt(data:...) 解析到正在初始化的局部变量本身，是编译错。
+        let aesEncryptBlock: @convention(block) (String, String, String?, String, String, String?) -> NSDictionary = { dataB64, keyB64, ivB64, mode, padding, aadB64 in
             do {
                 guard let data = dataFromBase64(dataB64), let key = dataFromBase64(keyB64) else {
                     throw CryptoError.invalidParameter("invalid base64 input")
@@ -418,7 +438,11 @@ extension WidgetCrypto {
                 if ivB64 != nil && iv == nil { throw CryptoError.invalidParameter("invalid base64 iv") }
                 let aad = aadB64.flatMap { dataFromBase64($0) }
                 if aadB64 != nil && aad == nil { throw CryptoError.invalidParameter("invalid base64 aad") }
-                let (ct, tag) = try aesEncrypt(data: data, key: key, iv: iv, mode: mode, padding: padding, aad: aad)
+                // aad 也受 5MB 护栏（JS 胶水已拦，这里是最后一道防线）。
+                if let aad = aad, aad.count > maxInputBytes {
+                    throw CryptoError.outOfRange("aad exceeds \(maxInputBytes) bytes")
+                }
+                let (ct, tag) = try Self.aesEncrypt(data: data, key: key, iv: iv, mode: mode, padding: padding, aad: aad)
                 var d: [String: Any] = ["ok": true, "ciphertext": ct.base64EncodedString()]
                 if let tag = tag { d["tag"] = tag.base64EncodedString() }
                 return d as NSDictionary
@@ -431,7 +455,7 @@ extension WidgetCrypto {
 
         // AES 解密：(dataB64, keyB64, ivB64|nil, mode, padding, tagB64|nil, aadB64|nil)
         // → {ok, plaintext}（plaintext 为 base64）。
-        let aesDecrypt: @convention(block) (String, String, String?, String, String, String?, String?) -> NSDictionary = { dataB64, keyB64, ivB64, mode, padding, tagB64, aadB64 in
+        let aesDecryptBlock: @convention(block) (String, String, String?, String, String, String?, String?) -> NSDictionary = { dataB64, keyB64, ivB64, mode, padding, tagB64, aadB64 in
             do {
                 guard let data = dataFromBase64(dataB64), let key = dataFromBase64(keyB64) else {
                     throw CryptoError.invalidParameter("invalid base64 input")
@@ -445,7 +469,10 @@ extension WidgetCrypto {
                 if tagB64 != nil && tag == nil { throw CryptoError.invalidParameter("invalid base64 tag") }
                 let aad = aadB64.flatMap { dataFromBase64($0) }
                 if aadB64 != nil && aad == nil { throw CryptoError.invalidParameter("invalid base64 aad") }
-                let pt = try aesDecrypt(data: data, key: key, iv: iv, mode: mode, padding: padding, tag: tag, aad: aad)
+                if let aad = aad, aad.count > maxInputBytes {
+                    throw CryptoError.outOfRange("aad exceeds \(maxInputBytes) bytes")
+                }
+                let pt = try Self.aesDecrypt(data: data, key: key, iv: iv, mode: mode, padding: padding, tag: tag, aad: aad)
                 return ["ok": true, "plaintext": pt.base64EncodedString()]
             } catch let e as CryptoError {
                 return errDict(e)
@@ -461,6 +488,10 @@ extension WidgetCrypto {
             }
             guard data.count <= maxInputBytes else {
                 return ["ok": false, "code": "RANGE", "message": "input exceeds \(maxInputBytes) bytes"]
+            }
+            // key 也受 5MB 护栏（JS 胶水已拦，这里是最后一道防线）。
+            guard key.count <= maxInputBytes else {
+                return ["ok": false, "code": "RANGE", "message": "key exceeds \(maxInputBytes) bytes"]
             }
             do {
                 return ["ok": true, "result": try xor(data: data, key: key).base64EncodedString()]
@@ -497,6 +528,9 @@ extension WidgetCrypto {
                 guard data.count <= maxInputBytes else {
                     throw CryptoError.outOfRange("input exceeds \(maxInputBytes) bytes")
                 }
+                guard key.count <= maxInputBytes else {
+                    throw CryptoError.outOfRange("key exceeds \(maxInputBytes) bytes")
+                }
                 return ["ok": true, "result": hexString(try hmac(algorithm: algorithm, data: data, key: key))]
             } catch let e as CryptoError {
                 return errDict(e)
@@ -516,26 +550,21 @@ extension WidgetCrypto {
             }
         }
 
-        context.setObject(aesEncrypt as @convention(block) (String, String, String?, String, String, String?) -> NSDictionary, forKeyedSubscript: "__fwCryptoAESEncrypt" as NSString)
-        context.setObject(aesDecrypt as @convention(block) (String, String, String?, String, String, String?, String?) -> NSDictionary, forKeyedSubscript: "__fwCryptoAESDecrypt" as NSString)
+        context.setObject(aesEncryptBlock as @convention(block) (String, String, String?, String, String, String?) -> NSDictionary, forKeyedSubscript: "__fwCryptoAESEncrypt" as NSString)
+        context.setObject(aesDecryptBlock as @convention(block) (String, String, String?, String, String, String?, String?) -> NSDictionary, forKeyedSubscript: "__fwCryptoAESDecrypt" as NSString)
         context.setObject(xorBlock as @convention(block) (String, String) -> NSDictionary, forKeyedSubscript: "__fwCryptoXOR" as NSString)
         context.setObject(hashBlock as @convention(block) (String, String) -> NSDictionary, forKeyedSubscript: "__fwCryptoHash" as NSString)
         context.setObject(hmacBlock as @convention(block) (String, String, String) -> NSDictionary, forKeyedSubscript: "__fwCryptoHMAC" as NSString)
         context.setObject(randomBlock as @convention(block) (Int) -> NSDictionary, forKeyedSubscript: "__fwCryptoRandomBytes" as NSString)
 
-        // JS 胶水（Core/WidgetCrypto.js.txt）：组装 Widget.crypto.* 友好 API。
-        // 读不到胶水时打日志（全构建，不只 DEBUG）——否则模块调 Widget.crypto 才报
-        // "不可用"，根因难查。胶水评完后删掉全局上的 6 个原语：胶水已把它们收进闭包
-        // 局部变量，删全局不影响胶水内部调用，但模块就调不到原语、绕不过胶水的校验。
-        // 无论胶水成没成，最后都删全局原语：成则胶水已收进闭包（删了不影响胶水内部调用）；
-        // 不成则不留半成品——Widget.crypto 不存在，模块调它会明确报“不可用”，而不是拿到
-        // 一个只有部分方法的对象。胶水是单个 IIFE，抛错就整段不挂载，不存在“挂一半”。
-        if let url = Bundle.main.url(forResource: "WidgetCrypto", withExtension: "js.txt"),
-           let glue = try? String(contentsOf: url, encoding: .utf8) {
-            context.evaluateScript(glue, withSourceURL: URL(string: "host://WidgetCrypto.js.txt"))
-        } else {
-            print("[WidgetCrypto] WidgetCrypto.js.txt 读不到，Widget.crypto 不可用")
-        }
+        // JS 胶水（Core/WidgetCrypto.js.txt，进程级缓存 glueScript）：组装
+        // Widget.crypto.* 友好 API。胶水评完后删掉全局上的 6 个原语：胶水已把它们
+        // 收进闭包局部变量，删全局不影响胶水内部调用，但模块就调不到原语、绕不过
+        // 胶水的校验。无论胶水成没成，最后都删全局原语：成则胶水已收进闭包（删了不
+        // 影响胶水内部调用）；不成则不留半成品——Widget.crypto 不存在，模块调它会
+        // 明确报“不可用”，而不是拿到一个只有部分方法的对象。胶水是单个 IIFE，
+        // 抛错就整段不挂载，不存在“挂一半”。
+        context.evaluateScript(glue, withSourceURL: URL(string: "host://WidgetCrypto.js.txt"))
         // 胶水评完检查 exception（全构建打日志，别只靠 WidgetHost 的 DEBUG 打印）。
         if let exc = context.exception {
             print("[WidgetCrypto] glue failed: \(exc)")
