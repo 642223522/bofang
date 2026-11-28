@@ -119,7 +119,8 @@ enum WidgetCrypto {
             throw CryptoError.invalidParameter("key must be 16, 24 or 32 bytes, got \(key.count)")
         }
         let isECB = mode.uppercased() == "ECB"
-        // iv 绑定到函数作用域：ECB 必须为空；CBC/CTR 必须 16 字节。缺 iv 直接抛错，
+        // iv 绑定到函数作用域：ECB 必须为空；CBC 必须 16 字节（本函数只处理 CBC/ECB，
+        // CTR 走 aesCTRCrypt、自有校验）。缺 iv 直接抛错，
         // 绝不静默补全零 iv（"不自动补零"是本文件的原则；防御性默认值最容易被将来的
         // 改动绕过）。后面 ivBytes 直接用 iv16，不再写 ?? 兜底。
         let iv16: Data?
@@ -131,7 +132,7 @@ enum WidgetCrypto {
             iv16 = nil
         } else {
             guard let v = iv, v.count == 16 else {
-                throw CryptoError.invalidParameter("CBC/CTR iv must be 16 bytes")
+                throw CryptoError.invalidParameter("CBC iv must be 16 bytes")
             }
             iv16 = v
         }
@@ -175,7 +176,7 @@ enum WidgetCrypto {
         } else if let v = iv16 {
             ivBytes = [UInt8](v)
         } else {
-            throw CryptoError.invalidParameter("CBC/CTR iv must be 16 bytes")
+            throw CryptoError.invalidParameter("CBC iv must be 16 bytes")
         }
         let status: CCStatus = out.withUnsafeMutableBytes { outPtr in
             CCCrypt(
