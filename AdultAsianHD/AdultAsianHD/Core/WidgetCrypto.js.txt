@@ -508,7 +508,9 @@
         if (typeof data !== 'string') { throw new TypeError('data must be a string'); }
         var b64 = strToB64(data, inputEnc);
         checkMaxBytes(b64, 'data');
-        if (opts.urlSafe) { return bytesToB64Url(b64ToBytes(b64, false)); }
+        // b64 已是标准 base64（strToB64 的产物），转 urlSafe 只需换字符、去填充，
+        // 别先解回字节再重编（5MB 输入白走一次编解码）。等价于 bytesToB64Url(b64ToBytes(b64))。
+        if (opts.urlSafe) { return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
         if (opts.noPadding) { return b64.replace(/=+$/, ''); }
         return b64;
     }

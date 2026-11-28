@@ -445,6 +445,10 @@ extension WidgetCrypto {
                 context.exception = nil
             } else if let left = context.evaluateScript("typeof __fwCryptoAESEncrypt + ',' + typeof __fwCryptoAESDecrypt + ',' + typeof __fwCryptoXOR + ',' + typeof __fwCryptoHash + ',' + typeof __fwCryptoHMAC + ',' + typeof __fwCryptoRandomBytes")?.toString(), left != "undefined,undefined,undefined,undefined,undefined,undefined" {
                 print("[WidgetCrypto] globals not deleted: \(left)")
+                #if DEBUG
+                // DEBUG 构建里直接断言：原语删不掉是安全问题，别只打一条日志就过去。
+                assertionFailure("WidgetCrypto globals not deleted: \(left)")
+                #endif
             }
         }
         // 统一的错误字典。
