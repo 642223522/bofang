@@ -2681,13 +2681,17 @@ final class EmbedProbeState: ObservableObject {
     }
 
     /// 外层底条的全屏：让页内 video 元素 requestFullscreen（WKWebView 原生接管全屏播放），
-    /// 没 video 时退回整个页面全屏；页内播放器自带的全屏按钮同样可用。
+    /// 没 video 时仍尝试整个页面全屏，但不乐观置位；页内播放器自带的全屏按钮同样可用。
     /// iPhone 上 <video> 全屏走 webkitEnterFullscreen（requestFullscreen /
     /// webkitRequestFullscreen 在 iPhone 上可能只是空壳），末尾补上它。
     func requestFullscreen() {
-        // 仅 JS 真找到 video（或页面本身可全屏）并已发起全屏请求时才乐观置
-        // true：没 video 时不置位——跨域 iframe 下探针 v == nil 时不再覆写，
-        // 无条件的乐观 true 会永远卡住、等不到任何通道扳回来。
+        // 仅 JS 真找到 video 并已发起全屏请求时才乐观置 true：没 video
+        // 时不置位——跨域 iframe 下探针 v == nil 时不再覆写，无条件的乐观
+        // true 会永远卡住、等不到任何通道扳回来。documentElement 兜底分支
+        // 只发起请求、返回 false：真成功时 fullscreenchange 消息与探针的
+        // fs == true 会自动置位；若因缺 JS 用户手势被静默拒绝（iPad / Duo
+        // 内屏），不触发 fullscreenchange、探针又因 "t" 缺失且 fs 为 false
+        // 而跳过覆写，乐观 true 会永久卡住并阻断离页停播。
         // 有 video 但请求失败时，下一轮探针（"t" 存在）会按 fs 把它扳回 false。
         webView?.evaluateJavaScript(
             """
@@ -2700,13 +2704,14 @@ final class EmbedProbeState: ObservableObject {
                 return true;
               } else if (document.documentElement.requestFullscreen) {
                 document.documentElement.requestFullscreen();
-                return true;
+                return false;
               }
               return false;
             })();
             """,
             completionHandler: { [weak self] result, _ in
-                if (result as? Bool) == true { self?.isFullscreen = true }
+                guard let self, self.webView != nil else { return }
+                if (result as? Bool) == true { self.isFullscreen = true }
             }
         )
     }

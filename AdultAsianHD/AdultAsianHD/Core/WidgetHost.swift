@@ -224,8 +224,8 @@ final class WidgetHost: @unchecked Sendable {
         // 校验阶段的读写落在独立前缀下，绝不共用空串前缀；
         // meta.id 到手后下面再以它为准（临时 host 随即丢弃）。
         let moduleIDBox = ModuleIDBox()
-        // 导入校验没有可信 id 时的临时命名空间：记下来，meta 到手后清掉
-        // 它名下的 storage/localStorage 孤儿键（见下面 metaId 校正处）。
+        // 导入校验没有可信 id 时的临时命名空间：记下来，build() 顶层的 defer
+        // 里无条件清掉它名下的 storage/localStorage 孤儿键（成功与任意失败点都只清一次）。
         let tempImportID: String?
         if let preknownModuleID, !preknownModuleID.isEmpty {
             moduleIDBox.id = preknownModuleID
@@ -441,7 +441,8 @@ final class WidgetHost: @unchecked Sendable {
 
         // Widget.http.get(url, {headers}) -> Promise<{status, data, headers, arrayBuffer}>
         // headers：响应头全量（原样 key + 全小写 key 各一份，至少含 set-cookie）；
-        // arrayBuffer：响应体原字节的 ArrayBuffer（16 MiB 以上或转换失败时该属性缺省，
+        // arrayBuffer：响应体原字节的 ArrayBuffer（≤1 MiB 急切构造；1 MiB–128 MiB
+        // 惰性构造，模块第一次读时才转换；>128 MiB 安装时即拒、该属性缺省；转换失败时该属性缺省，
         // data 照旧是 JSON 对象/数组或文本——data 不是二进制安全的，二进制请用 arrayBuffer）。
         // JS 调它时得到一个真 Promise；Swift 在后台发请求，完事回主线程 resolve/reject。
         // 注意：JSValue 的 block 用 @convention(block)，resolve/reject 必须在主线程调，
@@ -1946,12 +1947,15 @@ final class WidgetHost: @unchecked Sendable {
     /// __fwArrayBufferFromBytes（new Uint8Array(bytes).buffer），
     /// 不引入未经验证的 ArrayBuffer 构造器。
     /// 只在主线程调（调用点都在 MainActor.run 里，resolve/reject 与现有注释同款规矩）。
-    /// 边界：按字节数组过桥，O(n) 装箱。单个响应不再设 16 MiB 上限
-    ///（P1-1：原来 >16 MiB 直接返回 nil，模块读 .arrayBuffer 得 undefined，
-    /// 等于静默丢弃；R5：单个超限响应也走 installArrayBuffer 的惰性
-    /// token/FIFO 路径，只在模块读 .arrayBuffer 时才转换，不急切装箱。
-    /// 16 MiB 上限只约束 FIFO 里未读响应的累计量，见
-    /// ArrayBufferPendingQueue，不再卡单个响应）。
+    /// 边界：按字节数组过桥，O(n) 装箱。单个响应设 128 MiB 硬上限
+    ///（R6 ChatGPT P2-1：原来 >16 MiB 直接返回 nil，模块读 .arrayBuffer 得 undefined，
+    /// 等于静默丢弃；R5 改成单个超限响应也走 installArrayBuffer 的惰性
+    /// token/FIFO 路径，只在模块读 .arrayBuffer 时才转换，不急切装箱——
+    /// 但 store() 的 items.count > 1 守卫让单项可以无限大，数百 MB 的 Data
+    /// 会无 TTL 地滞留在队列里；所以入队前先卡单项上限，>128 MiB 的在
+    /// installArrayBuffer 里直接拒、arrayBuffer 缺省，不进队列。
+    /// 1 MiB–128 MiB 仍走惰性队列；16 MiB 上限只约束 FIFO 里未读响应的累计量，见
+    /// ArrayBufferPendingQueue）。
     /// 返回 nil = 没建出来，调用方直接不设该属性，不抛错。
     private static func jsArrayBuffer(from raw: Data, in context: JSContext) -> JSValue? {
         guard let helper = context.objectForKeyedSubscript("__fwArrayBufferFromBytes"),
@@ -1965,15 +1969,19 @@ final class WidgetHost: @unchecked Sendable {
 
     /// 在 Widget.http 回值对象上装 .arrayBuffer（chunk-1 性能问题）：
     /// ≤1 MiB 直接急切构造（装箱量可接受，行为与原来一致）；
-    /// 1–16 MiB 装惰性 getter，JS 第一次读 .arrayBuffer 时才构造——
+    /// 1–128 MiB 装惰性 getter，JS 第一次读 .arrayBuffer 时才构造——
     /// fetch().arrayBuffer() 与模块直接读 res.arrayBuffer 都是按需读，
     /// 平时不付装箱钱；首次访问后用 defineProperty 把访问器覆写成普通
     /// 数据属性，后续访问不再经过 getter。
-    /// >16 MiB 也走惰性 token/FIFO 路径（R5：原来直接 return 静默丢弃；
-    /// R4 改成安装时急切全量转换，主线程峰值数百 MiB、Jetsam 风险；
-    /// 现在只在模块读 .arrayBuffer 时才转换，转换失败才缺省——
-    /// 不静默丢弃、不急切装箱；单个超限项进队后不被自己淘汰，
-    /// 见 store() 的 items.count > 1 守卫）。
+    /// >128 MiB 安装时即拒、不进队列（R6 ChatGPT P2-1：单项硬上限；
+    /// 原来 >16 MiB 也走惰性 token/FIFO 路径，R5 只是把“安装即丢”
+    /// 推迟成“后一条响应到达且未读时丢”——队列已有超限项 A 时再来 B，
+    /// store() 的淘汰会删掉 A，之后读 A 只能得 undefined；且单项无上限
+    /// 时数百 MB 的 Data 可完整滞留在队列里，无 TTL。超限的 arrayBuffer
+    /// 定义成 undefined 数据属性，JS 侧与原来一致、不抛错，但判定处记
+    /// 一条日志，不静默；1 MiB–128 MiB 仍走惰性队列，多项合计仍受
+    /// 16 MiB / 4 项约束，单条 >16 MiB 入队时不自淘汰，见 store() 的
+    /// items.count > 1 守卫）。
     /// 只在主线程调（调用点都在 MainActor.run 里）。
     /// JS 侧契约不变：res.arrayBuffer 仍是 ArrayBuffer（或缺省），只是什么时候构造变了。
     /// P0-1：getter block 不捕获 raw / context / result——getter 挂在 result
@@ -1993,6 +2001,26 @@ final class WidgetHost: @unchecked Sendable {
             }
             return
         }
+        // 单项硬上限（R6 ChatGPT P2-1）：>128 MiB 的响应不进惰性队列——
+        // store() 的 items.count > 1 守卫让单项可以无限大（队列只有 1 项时
+        // 永不淘汰），数百 MB 的 Data 会无 TTL 地滞留到被读或 context 释放。
+        // 超限即拒：arrayBuffer 定义成 undefined 数据属性（JS 侧与原来一致，
+        // 不抛错、不改接口），但这里明确记一条日志，不静默。
+        if raw.count > ArrayBufferPendingQueue.maxSingleBytes {
+            print("[WidgetHost] arrayBuffer 响应过大（\(raw.count) 字节 > 128 MiB），拒绝入队，arrayBuffer 缺省")
+            if let undefined = JSValue(undefinedIn: context) {
+                result.defineProperty(
+                    "arrayBuffer",
+                    descriptor: [
+                        JSPropertyDescriptorValueKey: undefined,
+                        JSPropertyDescriptorWritableKey: true,
+                        JSPropertyDescriptorEnumerableKey: true,
+                        JSPropertyDescriptorConfigurableKey: true,
+                    ]
+                )
+            }
+            return
+        }
         // Data 登记（token → Data），与 result 的 JSValue 生命周期解耦：
         // 表按 context 弱键，context 释放时整条消失，从没被读过的 Data
         // 也随之释放，不永久滞留。
@@ -2008,7 +2036,14 @@ final class WidgetHost: @unchecked Sendable {
         arrayBufferPendingLock.unlock()
         // token 存在 result 的不可枚举内部属性上（getter 运行时从 this 上读）；
         // 不可枚举：模块 for..in / Object.keys / JSON.stringify 看不到它。
-        guard let tokenValue = JSValue(object: token, in: context) else { return }
+        guard let tokenValue = JSValue(object: token, in: context) else {
+            // 早退孤儿（R6 ChatGPT P2-1）：Data 已 store 入队，token 值建不出来
+            // 就没人能读到它——把刚存的项取回再返回，不留孤儿。
+            arrayBufferPendingLock.lock()
+            _ = arrayBufferPending.object(forKey: context)?.take(token: token)
+            arrayBufferPendingLock.unlock()
+            return
+        }
         result.defineProperty(
             "__fwArrayBufferToken",
             descriptor: [
@@ -2059,7 +2094,15 @@ final class WidgetHost: @unchecked Sendable {
             )
             return buffer
         }
-        guard let getterValue = JSValue(object: getter, in: context) else { return }
+        guard let getterValue = JSValue(object: getter, in: context) else {
+            // 早退孤儿（R6 ChatGPT P2-1）：与上面 tokenValue 分支同理——
+            // Data 已入队、token 属性已装，但 getter 建不出来就没人能读到它，
+            // 把刚存的项取回再返回，不留孤儿。
+            arrayBufferPendingLock.lock()
+            _ = arrayBufferPending.object(forKey: context)?.take(token: token)
+            arrayBufferPendingLock.unlock()
+            return
+        }
         result.defineProperty(
             "arrayBuffer",
             descriptor: [
@@ -2077,12 +2120,18 @@ final class WidgetHost: @unchecked Sendable {
     private static let arrayBufferPending = NSMapTable<JSContext, ArrayBufferPendingQueue>.weakToStrongObjects()
 
     /// 每 context 的惰性 arrayBuffer 待装箱队列（FIFO 封顶：最多最近 4 条
-    /// 或总计 16 MiB，超限淘汰最旧 token）。模块只读 res.data、从不访问
-    /// .arrayBuffer 时，未读的 Data 不再随浏览页数在整个会话里堆积。
+    /// 或总计 16 MiB，超限淘汰最旧 token；另有单项硬上限 128 MiB，见
+    /// maxSingleBytes——入队前由 installArrayBuffer 判定，超限不进队，
+    /// 不经过这里）。模块只读 res.data、从不访问 .arrayBuffer 时，未读的
+    /// Data 不再随浏览页数在整个会话里堆积。
     /// 只在 arrayBufferPendingLock 后访问。
     private final class ArrayBufferPendingQueue {
         static let maxEntries = 4
         static let maxBytes = 16 * 1024 * 1024
+        /// 单项硬上限（R6 ChatGPT P2-1）：store() 的 items.count > 1 守卫让
+        /// 队列只有 1 项时永不淘汰，单项再大也滞留——所以上限判定放在入队前
+        ///（installArrayBuffer），不在 store() 里；这里只作常量归属。
+        static let maxSingleBytes = 128 * 1024 * 1024
         private var items: [(token: String, data: Data)] = []
         private var totalBytes = 0
 

@@ -268,19 +268,22 @@ struct CoverImage: View {
 
     var body: some View {
         Group {
-            // 16:9 占位底色锁定布局尺寸；原图用 .scaledToFill()（即
-            // aspectRatio(nil, .fill)，按原图固有比例等比填满）放进 overlay
-            // 居中裁切，不压扁竖图。显式 .aspectRatio(16/9, .fill) 是把
-            // 16:9 的盒子尺寸提给子视图、覆盖原图固有比例，四轮争议就此终结。
+            // 16:9 由组件自身保证：占位 Color 上挂 .aspectRatio(16/9, .fit)
+            // 锁定 16:9 盒子，不靠调用方兜底；原图用 .scaledToFill()（按原图
+            // 固有比例等比填满）放进 overlay 居中，不压扁竖图。竖图的
+            // scaledToFill 布局尺寸会高出盒子（如 96×144 vs 96×54），它后面
+            // 的 .clipped() 只按自身尺寸裁、裁不掉盒子外的溢出，故去掉；
+            // 溢出改由外层 .clipped()（作用在 Color 的 16:9 布局框上）裁掉。
             Color(.systemGray5)
+                .aspectRatio(16.0 / 9.0, contentMode: .fit)
                 .overlay {
                     if let image {
                         Image(uiImage: image)
                             .resizable()
                             .scaledToFill()
-                            .clipped()
                     }
                 }
+                .clipped()
         }
         .task(id: urlString) { await load() }
     }

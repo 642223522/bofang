@@ -134,7 +134,7 @@ enum PlaybackEngine {
     ///     URL 里没有 .mp4，模块须给 playerHint "mp4"，否则会被下面误判成嵌页。
     ///  3. URL 形态：path 含 /e/、/embed/、/player/ → .embed；墙后嵌页家族
     ///     （dood /d/、/v/，与 isEmbedURL 同款判定）→ .embed；扩展名
-    ///     .html/.htm/.php → .embed（与 isEmbedURL 一致）。
+    ///     .html/.htm/.php/.aspx/.jsp → .embed（与 isEmbedURL 一致）。
     ///  4. 其余 http(s) URL → .directFile（按内容校验兜底；Step 5 遇 HTML 时回退按嵌页重验）。
     ///  5. 非 http(s) / 空 URL → nil。
     static func classifyPlayableLine(_ line: PlayLine) -> PlayableLineKind? {
@@ -161,9 +161,9 @@ enum PlaybackEngine {
         // 到不了这里，到这里时它恒为真。
         if isWalledEmbedHost(url.host),
            (path.contains("/d/") || path.contains("/v/")) { return .embed }
-        // .html/.htm/.php 无 hint 链接是嵌页（与 isEmbedURL 一致；原来掉进
-        // 下面 .directFile，与 isEmbedURL/route(for:) 不一致）。
-        if ["html", "htm", "php"].contains(url.pathExtension.lowercased()) { return .embed }
+        // .html/.htm/.php/.aspx/.jsp 无 hint 链接是嵌页（与 isEmbedURL 一致；
+        // 原来掉进下面 .directFile，与 isEmbedURL/route(for:) 不一致）。
+        if ["html", "htm", "php", "aspx", "jsp"].contains(url.pathExtension.lowercased()) { return .embed }
         return .directFile
     }
 
