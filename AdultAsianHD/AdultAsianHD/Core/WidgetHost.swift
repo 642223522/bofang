@@ -556,7 +556,10 @@ final class WidgetHost: @unchecked Sendable {
             guard let resolved, resolved.scheme != nil else { return nil }
             let scheme = resolved.scheme!.lowercased()
             // host 小写（WHATWG 小写 host，Foundation 保留输入大小写）。
-            let host = (resolved.host ?? "").lowercased()
+            // file: 的 localhost 规范化为空 host（WHATWG：file://localhost/path
+            // 等同 file:///path；ChatGPT R6 P2-3）。
+            var host = (resolved.host ?? "").lowercased()
+            if scheme == "file" && host == "localhost" { host = "" }
             // 特殊协议必须有 host（"https:"、"http:///foo" 这种 Foundation 能建出来，
             // WHATWG 不认；不拦会产出 hostname:""、origin:"null" 的坏 URL）。file 除外。
             let special = specialSchemes.contains(scheme)
@@ -590,16 +593,28 @@ final class WidgetHost: @unchecked Sendable {
             // 回退到未归一化的 resolved.absoluteString（回退串与归一化字段打架）。
             guard var components = URLComponents(url: resolved, resolvingAgainstBaseURL: true) else { return nil }
             components.scheme = scheme
-            if !host.isEmpty {
-                // IPv6：写回要带括号（formattedHost 已加括号）。上轮剥括号再写回是错的：
-                // URLComponents.host 存 IPv6 要求带括号，裸 "::1" 写回去会被百分号编码，
-                // href 变成 "https://%3A%3A1:8443/a"。普通 host 的 formattedHost 就是 host 本身。
-                components.host = formattedHost
+            if scheme == "file" && (resolved.host ?? "").lowercased() == "localhost" {
+                // file://localhost/path → file:///path：host 规范化为空字符串。
+                // 用 "" 而不用 nil（nil 可能把 "//" 也丢掉，变成 "file:/path"）。
+                components.host = ""
+            } else if !host.isEmpty {
+                if host.contains(":") {
+                    // IPv6：用 encodedHost 写回（带括号形式 "[::1]"）。host 是未编码属性，
+                    // 写 "[::1]" 会被 Foundation 按 reg-name 百分号编码成 %5B::1%5D，
+                    // href 变成 "https://%5B::1%5D:8443/a"（Gemini R6 P0-2；ChatGPT
+                    // 说它本机 host 写回能行，但 encodedHost 是文档化写法，两边都安全）。
+                    components.encodedHost = formattedHost
+                } else {
+                    components.host = host
+                }
             }
             // host 为空时不动 components.host（file:/// 的空 authority 要保留 "//"，
             // 置 nil 会把它丢掉，变成 "file:/path"）。
             components.port = (port != nil && port != defaultPort) ? port : nil
-            if special && (components.percentEncodedPath ?? "").isEmpty {
+            // percentEncodedPath 是非可选 String（不像 query/fragment 是 String?），
+            // 不能用 ?? 或 if let（R6 的 if let 编不过：Initializer for conditional
+            // binding must have Optional type——Gemini R6 P0-1 抓到的硬编译错）。
+            if special && components.percentEncodedPath.isEmpty {
                 components.percentEncodedPath = "/"
             }
             // special-query percent-encode set：单引号 ' 必须编成 %27（WHATWG；
@@ -612,8 +627,10 @@ final class WidgetHost: @unchecked Sendable {
             if (components.percentEncodedQuery ?? "").isEmpty { components.percentEncodedQuery = nil }
             if (components.percentEncodedFragment ?? "").isEmpty { components.percentEncodedFragment = nil }
             // pathname/search/hash 从归一化后的 components 读（与 href 同一套值，不再各读各的）。
+            // percentEncodedPath 是非可选 String，直接读；query/fragment 是 String?，用 if let。
             let pathname: String = {
-                if let p = components.percentEncodedPath, !p.isEmpty { return p }
+                let p = components.percentEncodedPath
+                if !p.isEmpty { return p }
                 return special ? "/" : ""
             }()
             let search: String = {
@@ -683,6 +700,9 @@ final class WidgetHost: @unchecked Sendable {
                     var out = '';
                     for (var i = 0; i < s.length; i++) {
                         var c = s.charCodeAt(i);
+                        // tab/LF/CR 直接删掉（WHATWG：URL 解析器删 tab/LF/CR；构造器经 Swift clean
+                        // 也是删，不删会与构造器行为不一致——R6 是编成 %09/%0A/%0D，错）。
+                        if (c === 0x09 || c === 0x0A || c === 0x0D) { continue; }
                         if (c <= 0x20 || c === 0x22 || c === 0x23 || c === 0x3C || c === 0x3E || c === 0x27) {
                             out += '%' + (c < 16 ? '0' : '') + c.toString(16).toUpperCase();
                         } else {
@@ -695,6 +715,8 @@ final class WidgetHost: @unchecked Sendable {
                     var out = '';
                     for (var i = 0; i < s.length; i++) {
                         var c = s.charCodeAt(i);
+                        // tab/LF/CR 直接删掉（同 encodeQueryValue）。
+                        if (c === 0x09 || c === 0x0A || c === 0x0D) { continue; }
                         if (c <= 0x20 || c === 0x22 || c === 0x3C || c === 0x3E || c === 0x60) {
                             out += '%' + (c < 16 ? '0' : '') + c.toString(16).toUpperCase();
                         } else {
@@ -702,6 +724,37 @@ final class WidgetHost: @unchecked Sendable {
                         }
                     }
                     return out;
+                };
+                // 路径编码器（pathname setter 用）：编 ?、#、控制字符、空格、"、<、>、反引号、反斜杠，
+                // / 保留为路径分隔符（不能用 encodeURIComponent 整段编，会把 / 也编了）。
+                // tab/LF/CR 直接删掉（同上）。
+                var encodePathValue = function (s) {
+                    var out = '';
+                    for (var i = 0; i < s.length; i++) {
+                        var c = s.charCodeAt(i);
+                        if (c === 0x09 || c === 0x0A || c === 0x0D) { continue; }
+                        if (c <= 0x20 || c === 0x7F || c === 0x22 || c === 0x23 || c === 0x3C || c === 0x3E || c === 0x3F || c === 0x5C || c === 0x60) {
+                            out += '%' + (c < 16 ? '0' : '') + c.toString(16).toUpperCase();
+                        } else {
+                            out += s.charAt(i);
+                        }
+                    }
+                    return out;
+                };
+                // 特殊协议集合（与 Swift 侧 specialSchemes 一致，含 file）。
+                var isSpecialScheme = function (scheme) {
+                    var s = String(scheme).toLowerCase();
+                    if (s.charAt(s.length - 1) === ':') { s = s.slice(0, -1); }
+                    return s === 'http' || s === 'https' || s === 'ws' || s === 'wss' || s === 'ftp' || s === 'file';
+                };
+                // 全 ASCII 数字校验（port setter 用：parseInt 会接受 '8080junk' 这种尾随字符）。
+                var isAllDigits = function (s) {
+                    if (!s) { return false; }
+                    for (var i = 0; i < s.length; i++) {
+                        var c = s.charCodeAt(i);
+                        if (c < 0x30 || c > 0x39) { return false; }
+                    }
+                    return true;
                 };
                 var parseQuery = function (str, pairs) {
                     if (str.charAt(0) === '?') { str = str.slice(1); }
@@ -730,6 +783,34 @@ final class WidgetHost: @unchecked Sendable {
                 // 数组 → [k, v] 对；Map / 原生 URLSearchParams / 其他可迭代 → Symbol.iterator；
                 // 普通对象 → 自有可枚举 key（旧代码的 init._pairs 鸭子类型会误判普通对象，
                 // { _pairs: "abc" } 会被拆成 a=undefined&b=undefined&c=undefined，已删）。
+                // 把 pair 统一转成 [k, v]（数组直接接受；非数组要求可迭代且恰好两个值；
+                // 单纯有 length 和数字属性的 array-like（如 {0:'a',1:'b',length:2}）拒绝——
+                // WHATWG 要求 pair 是可迭代的二元序列）。
+                var toPair = function (pair) {
+                    if (Array.isArray(pair)) {
+                        if (pair.length !== 2) {
+                            throw new TypeError("Failed to construct 'URLSearchParams': The provided value cannot be converted to a sequence.");
+                        }
+                        return [String(pair[0]), String(pair[1])];
+                    }
+                    if (pair && typeof Symbol !== 'undefined' && Symbol.iterator && typeof pair[Symbol.iterator] === 'function') {
+                        var it = pair[Symbol.iterator]();
+                        var first = it.next();
+                        if (first.done) {
+                            throw new TypeError("Failed to construct 'URLSearchParams': The provided value cannot be converted to a sequence.");
+                        }
+                        var second = it.next();
+                        if (second.done) {
+                            throw new TypeError("Failed to construct 'URLSearchParams': The provided value cannot be converted to a sequence.");
+                        }
+                        var third = it.next();
+                        if (!third.done) {
+                            throw new TypeError("Failed to construct 'URLSearchParams': The provided value cannot be converted to a sequence.");
+                        }
+                        return [String(first.value), String(second.value)];
+                    }
+                    throw new TypeError("Failed to construct 'URLSearchParams': The provided value cannot be converted to a sequence.");
+                };
                 var URLSearchParamsCtor = function (init) {
                     if (!(this instanceof URLSearchParamsCtor)) {
                         throw new TypeError("Failed to construct 'URLSearchParams': Please use the 'new' operator");
@@ -745,21 +826,13 @@ final class WidgetHost: @unchecked Sendable {
                             }
                         } else if (Array.isArray(init)) {
                             for (var b = 0; b < init.length; b++) {
-                                var pair = init[b];
-                                if (!pair || pair.length !== 2) {
-                                    throw new TypeError("Failed to construct 'URLSearchParams': The provided value cannot be converted to a sequence.");
-                                }
-                                this._pairs.push([String(pair[0]), String(pair[1])]);
+                                this._pairs.push(toPair(init[b]));
                             }
                         } else if (typeof Symbol !== 'undefined' && Symbol.iterator && typeof init[Symbol.iterator] === 'function') {
                             var it = init[Symbol.iterator]();
                             var step;
                             while (!(step = it.next()).done) {
-                                var pair = step.value;
-                                if (!pair || pair.length !== 2) {
-                                    throw new TypeError("Failed to construct 'URLSearchParams': The provided value cannot be converted to a sequence.");
-                                }
-                                this._pairs.push([String(pair[0]), String(pair[1])]);
+                                this._pairs.push(toPair(step.value));
                             }
                         } else {
                             for (var key in init) {
@@ -838,7 +911,7 @@ final class WidgetHost: @unchecked Sendable {
                 // 之后改 _pairs 不影响它）。entries 深拷贝内层 [k, v]，外部改 entry[1]
                 // 不会篡改 _pairs。sort 按 key 排序（稳定排序），改完触发 _onChange。
                 var toIter = function (arr) {
-                    if (typeof Symbol !== 'undefined' && Symbol.iterator) {
+                    if (typeof Symbol !== 'undefined' && Symbol.iterator && typeof arr[Symbol.iterator] === 'function') {
                         return arr[Symbol.iterator]();
                     }
                     return arr;
@@ -942,6 +1015,8 @@ final class WidgetHost: @unchecked Sendable {
                             set: function (v) {
                                 var newProto = String(v);
                                 if (newProto.charAt(newProto.length - 1) !== ':') { newProto += ':'; }
+                                // WHATWG：不允许在特殊与非特殊协议之间切换（https: → foo: 拒绝）。
+                                if (isSpecialScheme(_protocol) !== isSpecialScheme(newProto)) { return; }
                                 var p = g.__fwResolveURL(newProto + _protoAuth.slice(_protocol.length) + _pathname + _search + _hash, null);
                                 if (!p) { return; }
                                 applyParts(p);
@@ -954,7 +1029,14 @@ final class WidgetHost: @unchecked Sendable {
                             set: function (v) {
                                 // 无 authority 的 URL（如 mailto:）不能设 host，直接忽略。
                                 if (_protoAuth.indexOf('://') < 0) { return; }
-                                var p = g.__fwResolveURL(_protocol + '//' + String(v) + _pathname + _search + _hash, null);
+                                var newHost = String(v);
+                                // 含 /、?、#、反斜杠、空白、@ 的输入会注入并改 pathname/query/fragment，
+                                // 拒绝（host setter 只改 host，不顺便改别的组件）。
+                                for (var i = 0; i < newHost.length; i++) {
+                                    var c = newHost.charCodeAt(i);
+                                    if (c <= 0x20 || c === 0x2F || c === 0x3F || c === 0x23 || c === 0x40 || c === 0x5C) { return; }
+                                }
+                                var p = g.__fwResolveURL(_protocol + '//' + newHost + _pathname + _search + _hash, null);
                                 if (!p) { return; }
                                 applyParts(p);
                             },
@@ -966,8 +1048,19 @@ final class WidgetHost: @unchecked Sendable {
                             set: function (v) {
                                 if (_protoAuth.indexOf('://') < 0) { return; }
                                 var newHostname = String(v);
-                                if (newHostname.indexOf(':') >= 0 && newHostname.charAt(0) !== '[') {
-                                    newHostname = '[' + newHostname + ']';
+                                // 含 /、?、#、反斜杠、空白、@ 的输入拒绝（同 host setter）。
+                                // 冒号只允许出现在 bracketed IPv6 里（[::1]），裸冒号 + 别的字符拒绝。
+                                if (newHostname.charAt(0) === '[') {
+                                    if (newHostname.charAt(newHostname.length - 1) !== ']') { return; }
+                                    for (var j = 0; j < newHostname.length; j++) {
+                                        var cj = newHostname.charCodeAt(j);
+                                        if (cj <= 0x20 || cj === 0x2F || cj === 0x3F || cj === 0x23 || cj === 0x40 || cj === 0x5C) { return; }
+                                    }
+                                } else {
+                                    for (var i = 0; i < newHostname.length; i++) {
+                                        var c = newHostname.charCodeAt(i);
+                                        if (c <= 0x20 || c === 0x2F || c === 0x3F || c === 0x23 || c === 0x40 || c === 0x5C || c === 0x3A) { return; }
+                                    }
                                 }
                                 var portPart = _port ? ':' + _port : '';
                                 var p = g.__fwResolveURL(_protocol + '//' + newHostname + portPart + _pathname + _search + _hash, null);
@@ -984,6 +1077,8 @@ final class WidgetHost: @unchecked Sendable {
                                 var newPort = String(v);
                                 var portPart = '';
                                 if (newPort !== '') {
+                                    // 全是 ASCII 数字才接受（parseInt 会接受 '8080junk'、'80.5' 这种尾随字符）。
+                                    if (!isAllDigits(newPort)) { return; }
                                     var n = parseInt(newPort, 10);
                                     if (isNaN(n) || n < 0 || n > 65535) { return; }
                                     portPart = ':' + n;
@@ -998,10 +1093,12 @@ final class WidgetHost: @unchecked Sendable {
                         Object.defineProperty(this, 'pathname', {
                             get: function () { return _pathname; },
                             set: function (v) {
-                                var newPath = String(v);
-                                // 特殊 URL 的 pathname 必须以 / 开头；不以 / 开头时补一个，
+                                // 先按 path percent-encode set 编码（?、#、空格等编掉，不能让它们
+                                // 在拼串后被解析器当成 query/fragment 起点，破坏原 search/hash）。
+                                var newPath = encodePathValue(String(v));
+                                // 有 authority 的 URL 且新 path 非空、不以 / 开头时补一个 /，
                                 // 不然 _protoAuth + newPath 会拼成另一个 host。
-                                if (_protoAuth.indexOf('://') >= 0 && newPath.charAt(0) !== '/') {
+                                if (_protoAuth.indexOf('://') >= 0 && newPath !== '' && newPath.charAt(0) !== '/') {
                                     newPath = '/' + newPath;
                                 }
                                 var p = g.__fwResolveURL(_protoAuth + newPath + _search + _hash, null);
@@ -1020,7 +1117,10 @@ final class WidgetHost: @unchecked Sendable {
                             get: function () { return _href; },
                             set: function (v) {
                                 var p = g.__fwResolveURL(String(v), null);
-                                if (!p) { return; }
+                                // WHATWG：只有 href setter 在解析失败时抛 TypeError，
+                                // 其他组件 setter（protocol/host/hostname/port/pathname/search/hash）
+                                // 都是静默忽略。R6 把 href 的 throw 一并去掉了，是错的，恢复。
+                                if (!p) { throw new TypeError('Invalid URL'); }
                                 applyParts(p);
                             },
                             enumerable: true,
