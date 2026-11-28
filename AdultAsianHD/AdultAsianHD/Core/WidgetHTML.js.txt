@@ -1,0 +1,150 @@
+// Widget.html — Forward 兼容的 Cheerio DOM 解析接口（宿主提供）。
+//
+// 用法（与 Forward 官方一致，先拿 http.get 的文本再解析）：
+//   const res = await Widget.http.get(url);
+//   const $ = Widget.html.load(res.data);
+//   const titles = $('.card h2').map((i, el) => $(el).text()).get();
+//
+//   const $2 = await Widget.html.loadURL(url);   // 我们自己的扩展：get + load 一步到位
+//
+// 底层是 cheerio 1.2.0（parse5 + htmlparser2 + css-select + 完整实体表），
+// 由 esbuild 打成单文件（Core/cheerio.min.js.txt，.txt 资源进包，不违反 0 .js 门禁），
+// 运行时由 Swift 侧 __fwEnsureCheerio 懒注入（第一次调 load/loadURL 时才注入，
+// 约 30ms，之后常驻；不用的模块不付这个钱）。
+// 手写解析器已验证走不通（table foster parenting、raw-text 边界、实体解码陷阱），
+// 不要改回手写；想升级 cheerio 版本先跑 round30-pack 的沙箱 harness。
+//
+// 护栏（load 是同步纯解析，解析本身不触网）：
+// - html 必须是字符串，非字符串抛 TypeError；空串返回空文档（不抛）；
+// - 输入按 UTF-8 字节数限 5MB（默认，可用 options.maxBytes 改），超限抛 HTMLDocumentTooLargeError；
+// - 解析后走树计数：节点 > 100,000 抛 HTMLDocumentTooLargeError，深度 > 512 抛 HTMLDocumentTooDeepError；
+// - loadURL 非 2xx 时 reject，错误名 HTMLHTTPError，带 .status 与 .finalUrl（不静默返回空文档）；
+// - 字符集：沿用 Widget.http.get 的解码（UTF-8，失败时按 UTF-8 宽容解码），
+//   GBK 等非 UTF-8 页面目前会乱码（与现有模块 http.get + 正则的现状一致），以后 http 层做字符集嗅探时这里自动受益；
+// - prop('href')/prop('src') 的相对地址解析：<a>/<link> 的 href 与
+//   img/iframe/audio/video/source 的 src 会对 baseURI 解析（cheerio 原生行为，
+//   依赖全局 URL；裸 JSContext 里没有 URL，宿主在桥里补了一个最小 URL 构造器，
+//   见 WidgetHost.installWidgetBridge）；别的标签的 prop 返回原始值。attr() 永远返回原始值。
+// - baseURI：loadURL 默认取响应的 finalUrl；load 的 options.baseURI 可显式传。
+// - 解析跑在主线程 JSContext 里（与现有模块一致），典型列表/详情页（50KB–800KB）约 20–50ms。
+(function (g) {
+    'use strict';
+
+    var DEFAULT_MAX_HTML_BYTES = 5 * 1024 * 1024;
+    var MAX_DOM_NODES = 100000;
+    var MAX_DOM_DEPTH = 512;
+
+    // UTF-8 字节数。不用 TextEncoder：它在 JSC 里是否可用不确定，手动算是确定的。
+    function utf8ByteLength(s) {
+        var n = 0;
+        for (var i = 0; i < s.length; i++) {
+            var c = s.charCodeAt(i);
+            if (c < 0x80) { n += 1; }
+            else if (c < 0x800) { n += 2; }
+            else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) {
+                var d = s.charCodeAt(i + 1);
+                if (d >= 0xDC00 && d <= 0xDFFF) { n += 4; i++; }
+                else { n += 3; }
+            } else { n += 3; }
+        }
+        return n;
+    }
+
+    // 迭代式走树（不用递归：深树会爆 JS 栈），数节点数与最大深度，超限就抛。
+    // 在解析完成后跑：它防的是超大树被后续选择器反复扫的代价，解析本身的代价由 5MB 输入上限兜底。
+    function checkTree(root) {
+        var nodes = 0;
+        var maxDepth = 0;
+        var stack = [{ n: root, d: 0 }];
+        while (stack.length > 0) {
+            var cur = stack.pop();
+            nodes++;
+            if (nodes > MAX_DOM_NODES) {
+                var e1 = new Error('Widget.html.load: DOM node count exceeds ' + MAX_DOM_NODES);
+                e1.name = 'HTMLDocumentTooLargeError';
+                throw e1;
+            }
+            if (cur.d > maxDepth) { maxDepth = cur.d; }
+            if (maxDepth > MAX_DOM_DEPTH) {
+                var e2 = new Error('Widget.html.load: DOM depth exceeds ' + MAX_DOM_DEPTH);
+                e2.name = 'HTMLDocumentTooDeepError';
+                throw e2;
+            }
+            var kids = cur.n.children;
+            if (kids && kids.length) {
+                for (var i = kids.length - 1; i >= 0; i--) {
+                    stack.push({ n: kids[i], d: cur.d + 1 });
+                }
+            }
+        }
+    }
+
+    // cheerio 选项：只透传已知的三个，别的键不往下传（防模块误传 maxBytes 之类被 cheerio 误解）。
+    function cheerioOptionsFrom(options) {
+        var out = {};
+        if (options) {
+            if (typeof options.baseURI === 'string') { out.baseURI = options.baseURI; }
+            if (typeof options.decodeEntities === 'boolean') { out.decodeEntities = options.decodeEntities; }
+            if (typeof options.xml === 'boolean') { out.xml = options.xml; }
+        }
+        return out;
+    }
+
+    function loadImpl(html, options) {
+        if (typeof html !== 'string') {
+            throw new TypeError('Widget.html.load: html must be a string');
+        }
+        options = options || {};
+        var maxBytes = DEFAULT_MAX_HTML_BYTES;
+        if (typeof options.maxBytes === 'number' && isFinite(options.maxBytes) && options.maxBytes > 0) {
+            maxBytes = Math.floor(options.maxBytes);
+        }
+        if (utf8ByteLength(html) > maxBytes) {
+            var e = new Error('Widget.html.load: HTML document exceeds ' + maxBytes + ' bytes');
+            e.name = 'HTMLDocumentTooLargeError';
+            throw e;
+        }
+        if (typeof g.__fwEnsureCheerio !== 'function' || !g.__fwEnsureCheerio()) {
+            throw new Error('Widget.html: cheerio runtime is unavailable');
+        }
+        if (typeof g.__fwCheerioLoad !== 'function') {
+            throw new Error('Widget.html: cheerio runtime is unavailable');
+        }
+        var $ = g.__fwCheerioLoad(html, cheerioOptionsFrom(options));
+        var root = $.root();
+        if (root && root.length && root[0]) { checkTree(root[0]); }
+        return $;
+    }
+
+    function loadURLImpl(url, options) {
+        options = options || {};
+        var httpOptions = {};
+        if (options.headers) { httpOptions.headers = options.headers; }
+        if (options.timeout !== undefined && options.timeout !== null) { httpOptions.timeout = options.timeout; }
+        var maxBytes = (options.maxBytes !== undefined) ? options.maxBytes : options.maxHTMLBytes;
+        var baseURIOverride = options.baseURI;
+        return g.Widget.http.get(String(url), httpOptions).then(function (res) {
+            if (res.status < 200 || res.status >= 300) {
+                var e = new Error('Widget.html.loadURL: HTTP ' + res.status + ' for ' + url);
+                e.name = 'HTMLHTTPError';
+                e.status = res.status;
+                e.finalUrl = res.finalUrl || String(url);
+                throw e;
+            }
+            // data 可能是宿主解析过的 JSON 对象（见 WidgetHost.httpDataObject）：
+            // 字符串原样用，对象转 JSON 文本（与注入的 fetch 的 text() 同款处理）。
+            var html = (res.data == null) ? '' : (typeof res.data === 'string' ? res.data : JSON.stringify(res.data));
+            var loadOptions = {};
+            if (maxBytes !== undefined) { loadOptions.maxBytes = maxBytes; }
+            loadOptions.baseURI = (typeof baseURIOverride === 'string' && baseURIOverride)
+                ? baseURIOverride
+                : (res.finalUrl || String(url));
+            return loadImpl(html, loadOptions);
+        });
+    }
+
+    g.Widget.html = {
+        load: loadImpl,
+        loadURL: loadURLImpl
+    };
+})(this);

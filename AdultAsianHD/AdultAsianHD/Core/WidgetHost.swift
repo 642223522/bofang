@@ -289,6 +289,9 @@ final class WidgetHost: @unchecked Sendable {
     /// Widget.storage.get / set / remove / clear、localStorage（getItem/setItem/removeItem/clear，
     /// 前缀 fw.localstorage.）、全局 fetch（GET/POST 最小实现）、setTimeout / clearTimeout、
     /// setInterval / clearInterval、console.log / info / debug / warn / error（多参数拼接）。
+    /// Widget.html.load / loadURL（Cheerio DOM 解析，见 Core/WidgetHTML.js.txt；
+    /// 底层 cheerio bundle 懒注入，见 __fwEnsureCheerio；裸 JSC 没有 URL，桥里补了一个
+    /// 最小 URL 构造器——cheerio 的 prop('href')/prop('src') 靠它解析相对地址）。
     /// 模块发现三路超集、loadDetail/childItems/relatedItems 解析、分类拦截器都不在这里动。
     private static func installWidgetBridge(in context: JSContext, interceptor: CategoryRequestInterceptor, httpRegistry: HTTPRequestRegistry) {
         let widget = JSValue(newObjectIn: context)!
@@ -488,6 +491,135 @@ final class WidgetHost: @unchecked Sendable {
         context.setObject(clearInterval as @convention(block) (Int) -> Void, forKeyedSubscript: "clearInterval" as NSString)
 
         context.setObject(widget, forKeyedSubscript: "Widget" as NSString)
+
+        // URL 构造器（最小版）：裸 JavaScriptCore 里没有 URL（它是 Web API，不是 JS 内置），
+        // 但 cheerio 的 prop('href')/prop('src') 靠 new URL(s, baseURI).href 解析相对地址，
+        // 没有它 prop 就静默返回相对地址（已在沙箱复现）。模块里 new URL(...) 也靠它。
+        // 只在 URL 缺席时装（JSC 哪天自带了就用原生的）；解析走 Foundation URL（RFC 3986），
+        // JS 侧只负责拼对象与抛错。不提供 createObjectURL/revokeObjectURL（没有 blob URL 的概念）。
+        // 注意：Foundation 的 .path/.query/.fragment 是解码后的，与 WHATWG 的 pathname/search/hash
+        // （保留百分号编码）有差异；href 是准的（absoluteString 原样保留编码），cheerio 只用 href。
+        let resolveURL: @convention(block) (String, String?) -> NSDictionary? = { urlString, baseString in
+            let base = baseString.flatMap { URL(string: $0) }
+            guard let resolved = URL(string: urlString, relativeTo: base)?.absoluteURL,
+                  resolved.scheme != nil else { return nil }
+            let scheme = resolved.scheme!.lowercased()
+            let host = resolved.host ?? ""
+            let port = resolved.port
+            let defaultPort: Int? = {
+                switch scheme {
+                case "http", "ws": return 80
+                case "https", "wss": return 443
+                case "ftp": return 21
+                default: return nil
+                }
+            }()
+            let effectivePort = (port != nil && port != defaultPort) ? String(port!) : ""
+            let hostWithPort = host.isEmpty ? "" : (effectivePort.isEmpty ? host : "\(host):\(effectivePort)")
+            let special = ["http", "https", "ws", "wss", "ftp"].contains(scheme)
+            let origin = (special && !host.isEmpty) ? "\(scheme)://\(hostWithPort)" : "null"
+            let path = resolved.path
+            return [
+                "href": resolved.absoluteString,
+                "protocol": scheme.isEmpty ? "" : "\(scheme):",
+                "host": hostWithPort,
+                "hostname": host,
+                "port": effectivePort,
+                "pathname": path.isEmpty ? "/" : path,
+                "search": resolved.query.map { "?\($0)" } ?? "",
+                "hash": resolved.fragment.map { "#\($0)" } ?? "",
+                "origin": origin,
+            ] as NSDictionary
+        }
+        context.setObject(resolveURL as @convention(block) (String, String?) -> NSDictionary?, forKeyedSubscript: "__fwResolveURL" as NSString)
+        context.evaluateScript("""
+            (function (g) {
+                if (typeof g.URL === 'function') { return; }
+                var URL = function (url, base) {
+                    if (!(this instanceof URL)) {
+                        throw new TypeError("Failed to construct 'URL': Please use the 'new' operator");
+                    }
+                    var parts = g.__fwResolveURL(String(url), base == null ? null : String(base));
+                    if (!parts) { throw new TypeError('Invalid URL'); }
+                    this.href = parts.href;
+                    this.protocol = parts.protocol;
+                    this.host = parts.host;
+                    this.hostname = parts.hostname;
+                    this.port = parts.port;
+                    this.pathname = parts.pathname;
+                    this.search = parts.search;
+                    this.hash = parts.hash;
+                    this.origin = parts.origin;
+                };
+                URL.prototype.toString = function () { return this.href; };
+                URL.prototype.toJSON = function () { return this.href; };
+                g.URL = URL;
+            })(this);
+            """)
+
+        // Widget.html（Cheerio DOM 解析，见 Core/WidgetHTML.js.txt）：
+        // __fwEnsureCheerio：懒注入 cheerio bundle（第一次调 load/loadURL 时才注入，
+        // 约 30ms，之后常驻；不用的模块不付这个钱）。bundle 是 Core/cheerio.min.js.txt
+        // （esbuild 打包的 cheerio 1.2.0，.txt 资源进包，不违反 0 .js 门禁）。
+        // 注意：bundle 加载时就要 atob（它内置的 base64 解码守卫是 typeof Buffer.from，
+        // Buffer 不存在时直接抛 ReferenceError——已在沙箱复现）；裸 JSC 不一定有 atob，
+        // 缺时先注入一个最小 atob polyfill（与 round30-pack 的 harness 里测过的逐字一致）。
+        // 读不到 bundle 或注入后 global 仍缺失时返回 false，load() 那边抛一个清楚的错，
+        // 不连累整个桥（桥在 build 时继续建，模块调 html.load 才报错）。
+        let ensureCheerio: @convention(block) () -> Bool = { [weak context] in
+            guard let context else { return false }
+            if let fn = context.objectForKeyedSubscript("__fwCheerioLoad"), !fn.isUndefined, !fn.isNull {
+                return true
+            }
+            if context.evaluateScript("typeof atob")?.toString() != "function" {
+                context.evaluateScript("""
+                    (function (g) {
+                        if (typeof g.atob === 'function') { return; }
+                        var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+                        var map = {};
+                        for (var i = 0; i < chars.length; i++) { map[chars.charAt(i)] = i; }
+                        g.atob = function (input) {
+                            var str = String(input).replace(/[^A-Za-z0-9+/=]/g, '');
+                            var out = '';
+                            var i = 0;
+                            while (i < str.length) {
+                                var e1 = map[str.charAt(i++)];
+                                var e2 = map[str.charAt(i++)];
+                                var e3 = map[str.charAt(i++)];
+                                var e4 = map[str.charAt(i++)];
+                                if (e1 === undefined || e2 === undefined) { break; }
+                                var c1 = (e1 << 2) | (e2 >> 4);
+                                out += String.fromCharCode(c1);
+                                if (e3 !== undefined) {
+                                    var c2 = ((e2 & 15) << 4) | (e3 >> 2);
+                                    out += String.fromCharCode(c2);
+                                    if (e4 !== undefined) {
+                                        var c3 = ((e3 & 3) << 6) | e4;
+                                        out += String.fromCharCode(c3);
+                                    }
+                                }
+                            }
+                            return out;
+                        };
+                    })(this);
+                    """)
+            }
+            guard let bundleURL = Bundle.main.url(forResource: "cheerio.min", withExtension: "js.txt"),
+                  let bundle = try? String(contentsOf: bundleURL, encoding: .utf8),
+                  !bundle.isEmpty else { return false }
+            context.evaluateScript(bundle)
+            guard let fn = context.objectForKeyedSubscript("__fwCheerioLoad"), !fn.isUndefined, !fn.isNull else { return false }
+            return true
+        }
+        context.setObject(ensureCheerio as @convention(block) () -> Bool, forKeyedSubscript: "__fwEnsureCheerio" as NSString)
+
+        // Widget.html 的胶水（load/loadURL/护栏）在 Core/WidgetHTML.js.txt 里：
+        // 读不到就跳过——模块调 Widget.html.load 时再报“不可用”，不连累整个桥。
+        // 必须在 Widget 对象挂上之后再评（胶水里写 g.Widget.html = ...）。
+        if let glueURL = Bundle.main.url(forResource: "WidgetHTML", withExtension: "js.txt"),
+           let glue = try? String(contentsOf: glueURL, encoding: .utf8), !glue.isEmpty {
+            context.evaluateScript(glue)
+        }
 
         // __fwArrayBufferFromBytes（内部助手，Widget.http 回值 .arrayBuffer 用）：
         // JS 数字数组（0–255）→ ArrayBuffer。只在 Swift 侧的 jsArrayBuffer 里调，模块不用直接调它。
