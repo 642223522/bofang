@@ -48,7 +48,7 @@ enum WidgetCrypto {
 
     // MARK: - 常量
 
-    /// 单次输入总长度护栏（5MB）。
+    /// 单次输入总长度护栏（5MB，按解码后的字节数计，与 JS 胶水 MAX_INPUT_BYTES 同口径）。
     static let maxInputBytes = 5 * 1024 * 1024
     /// randomBytes 的 n 上限。
     static let maxRandomBytes = 65536
@@ -155,7 +155,7 @@ enum WidgetCrypto {
         let keyBytes: [UInt8] = [UInt8](key)
         // ivBytes 必须是非可选 [UInt8]：Swift 的数组→指针隐式转换只支持非可选数组，
         // [UInt8]? 传给 CCCrypt 的 iv: UnsafeRawPointer? 是编译错。ECB 传空数组
-        // （空数组转指针为 nil，ECB 本来也不用 iv）；其余传 16 字节 iv（非 ECB 时
+        // （ECB 忽略 iv，传什么都不影响结果）；其余传 16 字节 iv（非 ECB 时
         // 上面的 guard 已保证 iv 非空，?? 分支走不到）。
         let ivBytes: [UInt8] = isECB ? [] : [UInt8](iv ?? [UInt8](repeating: 0, count: 16))
         let status: CCStatus = out.withUnsafeMutableBytes { outPtr in

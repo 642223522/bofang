@@ -45,7 +45,7 @@
 
     // ---------- 基础工具 ----------
 
-    var MAX_INPUT_BYTES = 5 * 1024 * 1024;
+    var MAX_INPUT_BYTES = 5 * 1024 * 1024; // 单次输入总长度护栏，按解码后的字节数计（与 Swift 侧 maxInputBytes 同口径）。
     var MAX_RANDOM_BYTES = 65536;
 
     function isObject(v) {
@@ -643,8 +643,10 @@
 
     // Object.freeze(crypto) 只冻住 crypto 内部成员，g.Widget.crypto 本身仍可写可删，
     // 模块一句 Widget.crypto = fakeObj 就能整个替换掉。改用 defineProperty 锁定属性。
+    // 已挂载过（同一 JSContext 重复 install）直接保留已有的：configurable:false 的属性
+    // 再 defineProperty 会抛 TypeError；重复挂载的 crypto 与这份功能相同，不必重挂。
     if (!g.Widget) { g.Widget = {}; }
-    if (g.Widget.crypto !== crypto) {
+    if (!g.Widget.crypto) {
         Object.defineProperty(g.Widget, 'crypto', { value: crypto, writable: false, configurable: false, enumerable: true });
     }
 })(this);
