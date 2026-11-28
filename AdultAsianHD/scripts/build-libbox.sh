@@ -58,7 +58,7 @@ go install "github.com/sagernet/gomobile/cmd/gobind@$GOMOBILE_VERSION"
 export PATH="$PATH:$(go env GOPATH)/bin"
 gomobile version || true
 
-echo "--- clone sing-box v$SING_BOX_VERSION（浅 clone，只要这个 tag） ---"
+echo "--- clone sing-box v${SING_BOX_VERSION}（浅 clone，只要这个 tag） ---"
 rm -rf /tmp/sing-box-build
 git clone --depth 1 --branch "v$SING_BOX_VERSION" \
   https://github.com/SagerNet/sing-box /tmp/sing-box-build
