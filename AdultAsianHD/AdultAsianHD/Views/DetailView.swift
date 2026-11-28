@@ -51,10 +51,12 @@ struct DetailView: View {
     /// 分集现铸的异步任务（run #36 P0-10）：保存下来才能在离页/点别的集时
     /// 取消；不保存的话，点第 2 集后离页，loadResource 返回后会在后台重新起播。
     @State private var episodeTask: Task<Void, Never>?
-    /// onAppear 起的任务（起播 + 分集加载）：保存下来才能在离页时取消；
-    /// 不保存的话，刚进页就退出，迟到的 play() 还会在后台起播、迟到的
-    /// loadDetail 还会往已拆的视图写 detail。
-    @State private var appearTasks: [Task<Void, Never>] = []
+    /// onAppear 起的起播任务（run #36 R4：与分集任务分开——旧的 appearTasks
+    /// 数组把两者混在一起，从全屏返回时 onAppear 取消数组会误取消尚未返回的
+    /// playTask；分开后全屏返回只动分集任务，起播任务不受影响）。
+    @State private var playTask: Task<Void, Never>?
+    /// onAppear 起的分集加载任务（与 playTask 分开，见上）。
+    @State private var loadDetailTask: Task<Void, Never>?
 
     var body: some View {
         ScrollView {
@@ -87,7 +89,7 @@ struct DetailView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                 case .webView:
                     if let webViewURL = playerVM.webViewURL {
-                        WebViewPlayerView(url: webViewURL, onClose: { playerVM.closeWebView() }, onPlaying: { playerVM.markPlaying() }, onEmbedFailed: { playerVM.markEmbedFailed($0) }, onFullscreenChange: { isFullscreen = $0 }, retryNonce: playerVM.embedRetryNonce)
+                        WebViewPlayerView(url: webViewURL, onClose: { isFullscreen = false; playerVM.closeWebView() }, onPlaying: { playerVM.markPlaying() }, onEmbedFailed: { playerVM.markEmbedFailed($0) }, onFullscreenChange: { isFullscreen = $0 }, retryNonce: playerVM.embedRetryNonce)
                             .aspectRatio(16.0 / 9.0, contentMode: .fit)
                             .background(Color.black)
                             .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -242,24 +244,27 @@ struct DetailView: View {
         .navigationTitle("详情")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
-            // 起播只做一次（首进）：全屏进出也会触发 onAppear，回来不重播、不从头。
-            // 分集加载不受影响（每次出现都取，幂等）。
-            // 旧的 onAppear 任务先取消：全屏回来会再跑一次 onAppear，上一轮的
-            // loadDetail 没跑完就别让它继续占着（新的那轮会重新取）。
-            appearTasks.forEach { $0.cancel() }
-            appearTasks = []
+            // 起播只做一次（首进）：全屏进出也会触发 onAppear，回来不重播、不从头，
+            // 也不取消尚未返回的起播任务（playTask 与分集任务已分开）。
             if !hasStartedPlayback {
                 hasStartedPlayback = true
-                appearTasks.append(Task {
+                playTask?.cancel()
+                playTask = Task {
                     await playerVM.play(item: item, host: host)
-                })
-            }
-            appearTasks.append(Task {
-                // 分集：模块有 loadDetail 就取详情（短剧站）；没有就当没有分集，不报错。
-                if let d = try? await host.loadDetail(link: item.link) {
-                    detail = d
                 }
-            })
+            }
+            // 分集只在还没拿到时拉一次：从全屏回来 onAppear 再跑也不重拉；
+            // 写回前校验 !Task.isCancelled，迟到的返回不往视图写 detail。
+            if detail == nil {
+                loadDetailTask?.cancel()
+                loadDetailTask = Task {
+                    // 分集：模块有 loadDetail 就取详情（短剧站）；没有就当没有分集，不报错。
+                    if let d = try? await host.loadDetail(link: item.link) {
+                        guard !Task.isCancelled else { return }
+                        detail = d
+                    }
+                }
+            }
         }
         .onChange(of: playerVM.isResolvingEmbed) { _, resolving in
             // 开始解嵌入页时，停掉正在播的直链（不然旧的直链会继续出声）。
@@ -269,6 +274,13 @@ struct DetailView: View {
         .onChange(of: playerVM.webViewURL) { _, webURL in
             // 切到页内 WebView 播时，同样停掉直链播放器。
             if webURL != nil { player.pause() }
+            // 嵌页卸载（webViewURL 变 nil）：全屏一定已不在——probe.stop() 故意
+            // 保留 isFullscreen，若恰为 true 又不复位，onDisappear 的
+            // guard !isFullscreen 会永久拦住停播。复位条件只认 webURL == nil，
+            // 不再加 currentEngine == .webView：closeWebView()/stop() 都是先置
+            // webViewURL = nil 再置 currentEngine = .native（同一同步批），
+            // onChange 送达时引擎早已是 .native，加了等于永不触发。
+            if webURL == nil { isFullscreen = false }
         }
         .onDisappear {
             // 全屏时不拆播放器：全屏模态盖上来也会触发 onDisappear，
@@ -276,8 +288,10 @@ struct DetailView: View {
             guard !isFullscreen else { return }
             episodeTask?.cancel()
             episodeTask = nil
-            appearTasks.forEach { $0.cancel() }
-            appearTasks = []
+            playTask?.cancel()
+            playTask = nil
+            loadDetailTask?.cancel()
+            loadDetailTask = nil
             // 重置起播旗：从“相关视频”点返回时 onAppear 会再跑，旗不重置就
             // 永远不重播（离页时播放器已被停掉），只剩黑屏。
             hasStartedPlayback = false

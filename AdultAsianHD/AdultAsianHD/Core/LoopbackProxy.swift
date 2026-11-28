@@ -1151,9 +1151,12 @@ extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
                     redirected.setValue(nil, forHTTPHeaderField: key)
                 }
             }
-            // 跨域重定向也要原样字节，不让上游 gzip。
-            redirected.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         }
+        // P1-5：无条件要原样字节，不让上游 gzip——同源 302 也一样：
+        // 上面 headers 循环只补缺失的头，模块自定义 Accept-Encoding
+        //（如 gzip）若已在 redirected 上，不在这里盖掉就会一路带下去，
+        // URLSession 透明解压后字节数与 Content-Length 对不上、截断流。
+        redirected.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         completionHandler(redirected)
     }
 

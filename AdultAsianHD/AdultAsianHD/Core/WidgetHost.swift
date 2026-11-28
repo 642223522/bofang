@@ -236,6 +236,24 @@ final class WidgetHost: @unchecked Sendable {
             tempImportID = temp
         }
         installWidgetBridge(in: context, interceptor: interceptor, httpRegistry: httpRegistry, timerRegistry: timerRegistry, promiseStore: promiseStore, exceptionBox: box, moduleIDBox: moduleIDBox)
+        // build() 失败路径清理（P1-1/P2-1 合修）：下面任一 throw 都会直接
+        // 丢掉 BuiltHost，没人走 WidgetHost.init/deinit，顶层 JS 在
+        // evaluateScript 里已挂的 setInterval（顶层 setInterval 未取消会
+        // 永久空转）与在途 Widget.http 请求（detached executor Task）会
+        // 泄漏——失败时在这里统一取消，并清掉临时前缀的孤儿键。
+        // 成功时 builtSucceeded 置 true，defer 不动作；成功路径的临时前缀
+        // 清理仍在下面 metaId 校正处（只在成功时跑，与这里互补、不重复）。
+        var builtSucceeded = false
+        defer {
+            if !builtSucceeded {
+                httpRegistry.cancelAll()
+                timerRegistry.cancelAll()
+                if let temp = tempImportID {
+                    Self.clearUserDefaultsKeys(withPrefix: "fw.storage." + temp + ".")
+                    Self.clearUserDefaultsKeys(withPrefix: "fw.localstorage." + temp + ".")
+                }
+            }
+        }
 
         context.evaluateScript(jsSource)
         if let message = box.message, !message.isEmpty {
@@ -330,6 +348,7 @@ final class WidgetHost: @unchecked Sendable {
             throw WidgetHostError.invalidFormat("这个脚本的模块清单是空的，没有可用的功能")
         }
 
+        builtSucceeded = true
         return BuiltHost(context: context, meta: meta, modules: modules, exceptionBox: box, requestInterceptor: interceptor, httpRegistry: httpRegistry, timerRegistry: timerRegistry, nativePromiseConstructor: nativePromiseConstructor)
     }
 
@@ -1932,11 +1951,13 @@ final class WidgetHost: @unchecked Sendable {
     /// __fwArrayBufferFromBytes（new Uint8Array(bytes).buffer），
     /// 不引入未经验证的 ArrayBuffer 构造器。
     /// 只在主线程调（调用点都在 MainActor.run 里，resolve/reject 与现有注释同款规矩）。
-    /// 边界：按字节数组过桥，O(n) 装箱；16 MiB 以上不建（避免一次巨额装箱冲内存），
-    /// 此时 .arrayBuffer 属性直接缺省，data（文本/JSON）不受影响。
+    /// 边界：按字节数组过桥，O(n) 装箱。单个响应不再设 16 MiB 上限
+    ///（P1-1：原来 >16 MiB 直接返回 nil，模块读 .arrayBuffer 得 undefined，
+    /// 等于静默丢弃；现在单个超限响应走 installArrayBuffer 的单次直接转换，
+    /// 不进 FIFO。16 MiB 上限只约束 FIFO 里未读响应的累计量，见
+    /// ArrayBufferPendingQueue，不再卡单个响应）。
     /// 返回 nil = 没建出来，调用方直接不设该属性，不抛错。
     private static func jsArrayBuffer(from raw: Data, in context: JSContext) -> JSValue? {
-        guard raw.count <= 16 * 1024 * 1024 else { return nil }
         guard let helper = context.objectForKeyedSubscript("__fwArrayBufferFromBytes"),
               !helper.isUndefined, !helper.isNull else { return nil }
         let bytes: [Int] = raw.map { Int($0) }
@@ -1952,7 +1973,9 @@ final class WidgetHost: @unchecked Sendable {
     /// fetch().arrayBuffer() 与模块直接读 res.arrayBuffer 都是按需读，
     /// 平时不付装箱钱；首次访问后用 defineProperty 把访问器覆写成普通
     /// 数据属性，后续访问不再经过 getter。
-    /// >16 MiB 不装（与原来一致，属性缺省）。16 MiB 上限阈值保持不变。
+    /// >16 MiB 单次直接转换、不进 FIFO（P1-1：原来直接 return，属性缺省，
+    /// 模块读到 undefined 等于静默丢弃；单个超限响应不在 FIFO 里占累计量，
+    /// 一次性转完即交付，转换失败才缺省——不静默丢弃、不显式报错）。
     /// 只在主线程调（调用点都在 MainActor.run 里）。
     /// JS 侧契约不变：res.arrayBuffer 仍是 ArrayBuffer（或缺省），只是什么时候构造变了。
     /// P0-1：getter block 不捕获 raw / context / result——getter 挂在 result
@@ -1966,7 +1989,13 @@ final class WidgetHost: @unchecked Sendable {
     /// 首次访问后删登记，并用 defineProperty（带 JSPropertyDescriptorValueKey）
     /// 把属性覆写成普通数据属性，不再走 setValue。
     private static func installArrayBuffer(from raw: Data, in context: JSContext, on result: JSValue) {
-        guard raw.count <= 16 * 1024 * 1024 else { return }
+        // >16 MiB：单次直接转换，不进 FIFO（见上面注释）。
+        if raw.count > 16 * 1024 * 1024 {
+            if let buffer = jsArrayBuffer(from: raw, in: context) {
+                result.setValue(buffer, forProperty: "arrayBuffer")
+            }
+            return
+        }
         if raw.count <= 1 * 1024 * 1024 {
             if let buffer = jsArrayBuffer(from: raw, in: context) {
                 result.setValue(buffer, forProperty: "arrayBuffer")
@@ -2008,7 +2037,25 @@ final class WidgetHost: @unchecked Sendable {
             // take() 读删一次完成：首次访问即删登记，不留窗口。
             let raw = arrayBufferPending.object(forKey: context)?.take(token: token)
             arrayBufferPendingLock.unlock()
-            guard let raw, let buffer = WidgetHost.jsArrayBuffer(from: raw, in: context) else { return nil }
+            guard let raw, let buffer = WidgetHost.jsArrayBuffer(from: raw, in: context) else {
+                // P2-3：Data 已被 FIFO 淘汰（或转换失败）时，把属性定成
+                // undefined 数据属性再返回——后续读取不再进 getter 查空表
+                //（原来每次读都重新进原生 getter、加锁、take 查空表）。
+                // 读到的值与原来一致（getter 返回 nil 即 undefined），
+                // 只是不再反复走 getter。
+                if let undefined = JSValue(undefinedIn: context) {
+                    this.defineProperty(
+                        "arrayBuffer",
+                        descriptor: [
+                            JSPropertyDescriptorValueKey: undefined,
+                            JSPropertyDescriptorWritableKey: true,
+                            JSPropertyDescriptorEnumerableKey: true,
+                            JSPropertyDescriptorConfigurableKey: true,
+                        ]
+                    )
+                }
+                return nil
+            }
             // 首次访问后用 defineProperty 把访问器覆写成普通数据属性。
             this.defineProperty(
                 "arrayBuffer",
@@ -2051,7 +2098,12 @@ final class WidgetHost: @unchecked Sendable {
         func store(token: String, data: Data) {
             items.append((token, data))
             totalBytes += data.count
-            while items.count > Self.maxEntries || totalBytes > Self.maxBytes {
+            // FIFO 只限制未读累计量：淘汰最旧项，但刚存进来的这一项自己
+            // 绝不被淘汰（P1-1：原来 while 循环没留这一项，单个响应超
+            // 16 MiB 时 append 后自己就是最旧项、立即被自己淘汰；
+            // items.count > 1 守住后，超限时先淘汰旧项，只剩新项时即便
+            // 仍超限也留着它，不静默丢弃）。
+            while (items.count > Self.maxEntries || totalBytes > Self.maxBytes) && items.count > 1 {
                 let oldest = items.removeFirst()
                 totalBytes -= oldest.data.count
             }

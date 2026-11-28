@@ -132,7 +132,8 @@ enum PlaybackEngine {
     ///     含 "embed"/"webview"/"hlsjs" → .embed（"hlsjs" 不当直链，它明确走 WebView）。
     ///     这一步兜底无扩展名签发直链（如 javtiful 的 /media/video/<id>/720p，
     ///     URL 里没有 .mp4，模块须给 playerHint "mp4"，否则会被下面误判成嵌页。
-    ///  3. URL 形态：path 含 /e/、/embed/、/player/ → .embed。
+    ///  3. URL 形态：path 含 /e/、/embed/、/player/ → .embed；墙后嵌页家族
+    ///     （dood /d/、/v/，与 isEmbedURL 同款判定）→ .embed。
     ///  4. 其余 http(s) URL → .directFile（按内容校验兜底；Step 5 遇 HTML 时回退按嵌页重验）。
     ///  5. 非 http(s) / 空 URL → nil。
     static func classifyPlayableLine(_ line: PlayLine) -> PlayableLineKind? {
@@ -151,6 +152,12 @@ enum PlaybackEngine {
         }
         let path = url.path.lowercased()
         if path.contains("/e/") || path.contains("/embed/") || path.contains("/player/") { return .embed }
+        // P2-2：墙后嵌页家族的 /d/、/v/ 形态（dood /d/xxx）——与 isEmbedURL
+        // 同款判定（非直链 + 墙后 host + /d/ 或 /v/）。不补的话，无 hint 的
+        // dood /d/xxx 会掉进下面 .directFile，竞速说明把它标成
+        // “无需竞速（直链）”，而 isEmbedURL/route(for:) 认它是嵌页，两边不一致。
+        if !isDirectMediaURL(trimmed), isWalledEmbedHost(url.host),
+           (path.contains("/d/") || path.contains("/v/")) { return .embed }
         return .directFile
     }
 
@@ -1179,6 +1186,12 @@ final class PlayerViewModel: ObservableObject {
 
     /// 点线路切线（在小窗口里切，不重建播放器，由 Views 层换 AVPlayerItem）。
     func switchLine(_ line: PlayLine) {
+        // P1-2：先取消在途 recastTask——switchLine 故意不换 generation
+        //（同片保进度），不取消的话回来的 recastTask 过 generation 校验后
+        // 会劫持用户刚切的线；backupTask 不动（与 play/stop 不同，这里
+        // 不重建线路表，后台备线仍可继续补线）。
+        recastTask?.cancel()
+        recastTask = nil
         failedURLs.remove(line.url) // 手动点的线允许重试：先清掉它的失败记录
         clearFallbackState(for: line.url) // 手动点也清掉回退/过期标记，重新按路由表定
         routeLine(line)

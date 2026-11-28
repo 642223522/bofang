@@ -784,7 +784,12 @@ final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUID
       video.addEventListener('ended', function(){ post({type: 'ended'}); });
       video.addEventListener('timeupdate', function(){ post({type: 'timeupdate', t: video.currentTime, d: video.duration, buffered: bufferedEnd()}); });
       video.addEventListener('progress', function(){ post({type: 'progress', t: video.currentTime, d: video.duration, buffered: bufferedEnd()}); });
-      document.addEventListener('fullscreenchange', function(){ post({type: 'fullscreen', value: !!document.fullscreenElement}); });
+      function isFullscreen(){ try { return !!(document.fullscreenElement || document.webkitFullscreenElement || (video && video.webkitDisplayingFullscreen)); } catch(e){ return false; } }
+      function reportFullscreen(){ post({type: 'fullscreen', value: isFullscreen()}); }
+      document.addEventListener('fullscreenchange', reportFullscreen);
+      document.addEventListener('webkitfullscreenchange', reportFullscreen);
+      video.addEventListener('webkitbeginfullscreen', reportFullscreen);
+      video.addEventListener('webkitendfullscreen', reportFullscreen);
       window.__webplayer = {
         play: function(){ try { player.play(); } catch(e){ video.play().catch(function(){}); } },
         pause: function(){ try { player.pause(); } catch(e){ video.pause(); } },
@@ -804,8 +809,10 @@ final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUID
         fullscreen: function(){
           try {
             if (document.fullscreenElement){ document.exitFullscreen(); }
+            else if (video.webkitDisplayingFullscreen && video.webkitExitFullscreen){ video.webkitExitFullscreen(); }
             else if (video.requestFullscreen){ video.requestFullscreen(); }
             else if (video.webkitRequestFullscreen){ video.webkitRequestFullscreen(); }
+            else if (video.webkitEnterFullscreen){ video.webkitEnterFullscreen(); }
           } catch(e){}
         },
         teardown: function(){
@@ -861,8 +868,9 @@ struct DASHPlayerView: View {
 
     @StateObject private var controller: DASHPlayerController
 
-    init(viewModel: PlayerViewModel) {
+    init(viewModel: PlayerViewModel, onFullscreenChange: ((Bool) -> Void)? = nil) {
         self.viewModel = viewModel
+        self.onFullscreenChange = onFullscreenChange
         _controller = StateObject(wrappedValue: DASHPlayerController(viewModel: viewModel))
     }
 
@@ -916,7 +924,7 @@ struct DASHPlayerView: View {
         // 正常全屏进出时引擎仍是本播放器，条件不成立，不误清。
         .onDisappear {
             if viewModel.currentEngine != .dash && controller.isFullscreen { onFullscreenChange?(false) }
-            if !controller.isFullscreen { controller.teardown() }
+            if viewModel.currentEngine != .dash || !controller.isFullscreen { controller.teardown() }
         }
     }
 }

@@ -797,7 +797,12 @@ final class HLSJSWebViewController: UIViewController, WKNavigationDelegate, WKUI
       video.addEventListener('ended', function(){ post({type: 'ended'}); });
       video.addEventListener('timeupdate', function(){ post({type: 'timeupdate', t: video.currentTime, d: video.duration, buffered: bufferedEnd()}); });
       video.addEventListener('progress', function(){ post({type: 'progress', t: video.currentTime, d: video.duration, buffered: bufferedEnd()}); });
-      document.addEventListener('fullscreenchange', function(){ post({type: 'fullscreen', value: !!document.fullscreenElement}); });
+      function isFullscreen(){ try { return !!(document.fullscreenElement || document.webkitFullscreenElement || (video && video.webkitDisplayingFullscreen)); } catch(e){ return false; } }
+      function reportFullscreen(){ post({type: 'fullscreen', value: isFullscreen()}); }
+      document.addEventListener('fullscreenchange', reportFullscreen);
+      document.addEventListener('webkitfullscreenchange', reportFullscreen);
+      video.addEventListener('webkitbeginfullscreen', reportFullscreen);
+      video.addEventListener('webkitendfullscreen', reportFullscreen);
       window.__webplayer = {
         play: function(){ video.play().catch(function(){}); },
         pause: function(){ video.pause(); },
@@ -806,8 +811,10 @@ final class HLSJSWebViewController: UIViewController, WKNavigationDelegate, WKUI
         fullscreen: function(){
           try {
             if (document.fullscreenElement){ document.exitFullscreen(); }
+            else if (video.webkitDisplayingFullscreen && video.webkitExitFullscreen){ video.webkitExitFullscreen(); }
             else if (video.requestFullscreen){ video.requestFullscreen(); }
             else if (video.webkitRequestFullscreen){ video.webkitRequestFullscreen(); }
+            else if (video.webkitEnterFullscreen){ video.webkitEnterFullscreen(); }
           } catch(e){}
         },
         teardown: function(){
@@ -864,8 +871,9 @@ struct HLSJSPlayerView: View {
 
     @StateObject private var controller: HLSJSPlayerController
 
-    init(viewModel: PlayerViewModel) {
+    init(viewModel: PlayerViewModel, onFullscreenChange: ((Bool) -> Void)? = nil) {
         self.viewModel = viewModel
+        self.onFullscreenChange = onFullscreenChange
         _controller = StateObject(wrappedValue: HLSJSPlayerController(viewModel: viewModel))
     }
 
@@ -919,7 +927,7 @@ struct HLSJSPlayerView: View {
         // 正常全屏进出时引擎仍是本播放器，条件不成立，不误清。
         .onDisappear {
             if viewModel.currentEngine != .hlsjs && controller.isFullscreen { onFullscreenChange?(false) }
-            if !controller.isFullscreen { controller.teardown() }
+            if viewModel.currentEngine != .hlsjs || !controller.isFullscreen { controller.teardown() }
         }
     }
 }

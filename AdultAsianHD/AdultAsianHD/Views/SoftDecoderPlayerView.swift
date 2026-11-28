@@ -358,7 +358,9 @@ final class SoftDecoderPlayerController: ObservableObject {
 
     func playByUser() {
         shouldPlay = true
-        playerLayer?.play()
+        // seek 在途时不直接 play（与 endScrub 注释同源：立即 play 会从旧位置先播一截再跳，
+        // 与 seek 抢跑）；seek 完成回调按 shouldPlay 决定是否续播。
+        if !isSeeking { playerLayer?.play() }
         showControlsTemporarily()
     }
 
@@ -621,8 +623,9 @@ struct SoftDecoderPlayerView: View {
 
     @StateObject private var controller: SoftDecoderPlayerController
 
-    init(viewModel: PlayerViewModel) {
+    init(viewModel: PlayerViewModel, onFullscreenChange: ((Bool) -> Void)? = nil) {
         self.viewModel = viewModel
+        self.onFullscreenChange = onFullscreenChange
         _controller = StateObject(wrappedValue: SoftDecoderPlayerController(viewModel: viewModel))
     }
 
@@ -687,7 +690,7 @@ struct SoftDecoderPlayerView: View {
         // 正常全屏进出时引擎仍是本播放器，条件不成立，不误清。
         .onDisappear {
             if viewModel.currentEngine != .softDecoder && controller.isFullscreen { onFullscreenChange?(false) }
-            if !controller.isFullscreen { controller.teardown() }
+            if viewModel.currentEngine != .softDecoder || !controller.isFullscreen { controller.teardown() }
         }
     }
 }
@@ -844,8 +847,9 @@ struct SoftDecoderPlayerView: View {
     /// 与主分支同款签名（无 KSPlayer 时 DetailView 的调用也要能编译；占位无全屏，不调用）。
     var onFullscreenChange: ((Bool) -> Void)? = nil
 
-    init(viewModel: PlayerViewModel) {
+    init(viewModel: PlayerViewModel, onFullscreenChange: ((Bool) -> Void)? = nil) {
         self.viewModel = viewModel
+        self.onFullscreenChange = onFullscreenChange
     }
 
     var body: some View {

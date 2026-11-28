@@ -275,6 +275,9 @@ final class Downloader: ObservableObject {
     /// FileManager 与 DownloadRaceBox，不碰 Downloader 的主线程状态。
     nonisolated private static func finishDownload(location: URL?, response: URLResponse?, error: Error?, destURL: URL, box: DownloadRaceBox) {
         let result: Result<URL, Error>
+        // 本次 completion 是否已取得落盘提交权（见下面 location 分支）：
+        // 取得后才调 box.finish(isCommit: true)，取消路径的 finish 抢不走它。
+        var claimedCommit = false
         if let error {
             // 失败时 URLSession 会在 userInfo 里给 resumeData（能续传时）
             if let resumeData = (error as NSError).userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
@@ -287,9 +290,14 @@ final class Downloader: ObservableObject {
             //（404 也会“成功”返回一个装着错误页的临时文件）。
             result = .failure(DownloadError.httpStatus(http.statusCode))
         } else if let location {
-            // 已终结（取消路径已先抢到完成权）时不落盘：迟到的 completion
-            // 再 moveItem 会删掉/覆盖后来同名新建的下载文件。
-            guard !box.isFinished else { return }
+            // 落盘前先原子取得提交权（P2-2 TOCTOU）：原来 guard !box.isFinished
+            // 只是加锁读一个 Bool，解锁后取消仍可在删旧文件/moveItem 之前抢到
+            // 完成权，completion 却继续把临时文件移到目标路径，最后 finish
+            // 返回 false 再删 destURL——同名新下载已用同一 dest 时会误删它的文件。
+            // beginCommit 让落盘与取消竞争同一个完成权：取消先获胜时这里直接
+            // 返回，不再碰目标文件；取得提交权后取消的 finish 会失败，落盘必成。
+            guard box.beginCommit() else { return }
+            claimedCommit = true
             do {
                 // 目标已存在（同名残留）先清掉：moveItem 不覆盖已存在文件。
                 if FileManager.default.fileExists(atPath: destURL.path) {
@@ -305,8 +313,10 @@ final class Downloader: ObservableObject {
         }
         // 取消与完成竞态（ChatGPT P2-2 = Gemini P2-5）：box.finish 返回
         // false 表示取消路径已先抢到完成权——文件虽已落盘，UI 却显示取消，
-        // 把刚落盘的 destURL 删掉，不留孤儿文件。
-        let wonRace = box.finish(result, cancelTask: false)
+        // 把刚落盘的 destURL 删掉，不留孤儿文件。取得提交权后取消抢不走，
+        // 这里恒为 true，这段清理只是防卫（非提交路径的 result 不是 success，
+        // 也走不到删文件）。
+        let wonRace = box.finish(result, cancelTask: false, isCommit: claimedCommit)
         if !wonRace, case .success = result {
             try? FileManager.default.removeItem(at: destURL)
         }
@@ -430,13 +440,34 @@ private final class DownloadRaceBox: @unchecked Sendable {
     private var task: URLSessionDownloadTask?
     private var observation: NSKeyValueObservation?
     private var finished = false
+    /// 落盘提交权已被 completion 取得（P2-2）：beginCommit() 原子置起；
+    /// 置起后取消路径的 finish（isCommit == false）直接失败，不再抢走
+    /// 完成权——落盘（删旧文件/moveItem）与取消竞争的是同一个完成权，
+    /// 不再是“先读 Bool、解锁后再动手”的 TOCTOU。
 
     /// 是否已终结（finish 已被调用过一次，取消或完成任一路径抢到完成权）。
-    /// finishDownload 落盘前用它拦迟到的已取消下载。
+    /// 落盘路径不再用它做“检查再动手”的门禁（那是 P2-2 的 TOCTOU），
+    /// 改用 beginCommit() 原子取提交权；这里只保留状态查询。
     var isFinished: Bool {
         lock.lock()
         defer { lock.unlock() }
         return finished
+    }
+
+    /// 原子取得落盘提交权（P2-2）：同一把锁里同时查 finished 与 commitClaimed
+    /// 再置起 commitClaimed，查与置之间取消插不进来。返回 false = 取消路径
+    /// 已先抢到完成权（或已有一次提交在进行），调用方不得再碰目标文件，
+    /// 直接返回；返回 true = 本次 completion 独占落盘，之后取消路径的
+    /// finish 会因 commitClaimed 而失败，落盘必成、finish 必胜。
+    /// 注意：取得提交权后调用方必须一路走到 finish(isCommit: true)——
+    /// finishDownload 的 location 分支在 beginCommit 成功后没有任何提前
+    /// return，所有路径都汇到同一个 finish 调用，不会悬住 continuation。
+    func beginCommit() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finished, !commitClaimed else { return false }
+        commitClaimed = true
+        return true
     }
 
     /// 装 continuation；已 finish 时返回 false（调用方什么都不创建直接返回）。
@@ -491,10 +522,17 @@ private final class DownloadRaceBox: @unchecked Sendable {
     /// 完成：取消时 cancelTask == true，同步取消底层 downloadTask。
     /// 返回是否抢到完成权（true = 本次调用的结果被采纳；false = 已有别的
     /// 结果先完成，本次结果被丢弃——调用方据此决定要不要清理已落盘文件）。
+    /// isCommit：落盘路径传 true（已先调 beginCommit 取得提交权）；取消与
+    /// 其余路径传 false。提交进行中（commitClaimed）时非提交调用直接失败，
+    /// 不抢走完成权、不取消已完成的任务；提交路径的 finish 必胜。
     @discardableResult
-    func finish(_ result: Result<URL, Error>, cancelTask: Bool) -> Bool {
+    func finish(_ result: Result<URL, Error>, cancelTask: Bool, isCommit: Bool = false) -> Bool {
         lock.lock()
         guard !finished else {
+            lock.unlock()
+            return false
+        }
+        guard !commitClaimed || isCommit else {
             lock.unlock()
             return false
         }

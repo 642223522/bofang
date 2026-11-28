@@ -2311,7 +2311,9 @@ final class EmbedProbeState: ObservableObject {
     /// CF 质询是不是正在跑（还没出 video）：外层用它显示原生 Loading 遮罩。
     @Published var challengeRunning = false
     /// 页内 video 是不是在全屏（fullscreenchange 事件回传 + 探针轮询
-    /// document.fullscreenElement 双通道）：外层据此同步 DetailView.isFullscreen，
+    /// 双通道；两通道都含 webkit 全屏判定——iPhone 上 <video> 全屏走
+    /// webkitEnterFullscreen，document.fullscreenElement 恒 null）：
+    /// 外层据此同步 DetailView.isFullscreen，
     /// 全屏进出触发的 onDisappear 才不会误停播。stop() 故意不重置它——
     /// 全屏进出也会触发 onDisappear → probe.stop()，清掉就把 DetailView
     /// 的全屏判断也清掉了。
@@ -2445,8 +2447,12 @@ final class EmbedProbeState: ObservableObject {
                 if (document.querySelector('iframe[src*="turnstile"]')) cf = true;
                 if (document.querySelector('#challenge-form, #challenge-running, #challenge-stage, #cf-wrapper, #cf-spinner, #cf-browser-verification, [id*="cf-chl-"], [class*="cf-challenge"], [class*="challenge-running"], [class*="turnstile"]')) cf = true;
               } catch(e){}
-              if (!v) return JSON.stringify({cf: cf, cfTitle: cfTitle, fs: !!document.fullscreenElement});
-              return JSON.stringify({t: v.currentTime, d: v.duration, p: v.paused, cf: cf, cfTitle: cfTitle, fs: !!document.fullscreenElement});
+              // iPhone 上 <video> 全屏走 webkitEnterFullscreen，document.fullscreenElement
+              // 恒 null：再并上 webkitFullscreenElement 与 video 元素的
+              // webkitDisplayingFullscreen，否则页内自带全屏按钮进全屏也探不到。
+              var fs = !!(document.fullscreenElement || document.webkitFullscreenElement || (v && v.webkitDisplayingFullscreen));
+              if (!v) return JSON.stringify({cf: cf, cfTitle: cfTitle, fs: fs});
+              return JSON.stringify({t: v.currentTime, d: v.duration, p: v.paused, cf: cf, cfTitle: cfTitle, fs: fs});
             })();
             """
         ) { [weak self] result, _ in
@@ -2463,7 +2469,8 @@ final class EmbedProbeState: ObservableObject {
             }
             // 全屏状态轮询纠正（与 fullscreenchange 消息双通道）：底条全屏按钮
             // 是乐观先置 true，页内自带全屏按钮走消息；万一消息漏了，0.5 秒
-            // 一次的轮询也能把状态扳回来。
+            // 一次的轮询也能把状态扳回来（轮询的 fs 已含 webkit 全屏通道，
+            // 见 probe() 内 fs 的算法）。
             self.isFullscreen = (json["fs"] as? Bool) ?? false
             // CF 质询处理：所有质询信号统一等 12 秒，让挑战 JS 自己完成
             //（iframe 里的勾选框我们点不到，立即 reload 会破坏挑战会话）；
@@ -2667,11 +2674,13 @@ final class EmbedProbeState: ObservableObject {
 
     /// 外层底条的全屏：让页内 video 元素 requestFullscreen（WKWebView 原生接管全屏播放），
     /// 没 video 时退回整个页面全屏；页内播放器自带的全屏按钮同样可用。
+    /// iPhone 上 <video> 全屏走 webkitEnterFullscreen（requestFullscreen /
+    /// webkitRequestFullscreen 在 iPhone 上可能只是空壳），末尾补上它。
     func requestFullscreen() {
         // 乐观先置 true：fullscreenchange 消息与轮询都可能在
         // DetailView.onDisappear 之后才到，先置位才能让全屏判断及时生效；
         // 万一 requestFullscreen 失败，下一轮探针轮询会按
-        // document.fullscreenElement 把它扳回 false。
+        // document.fullscreenElement / webkit 全屏状态把它扳回 false。
         isFullscreen = true
         webView?.evaluateJavaScript(
             """
@@ -2680,6 +2689,7 @@ final class EmbedProbeState: ObservableObject {
               if (v) {
                 if (v.requestFullscreen) v.requestFullscreen();
                 else if (v.webkitRequestFullscreen) v.webkitRequestFullscreen();
+                else if (v.webkitEnterFullscreen) v.webkitEnterFullscreen();
               } else if (document.documentElement.requestFullscreen) {
                 document.documentElement.requestFullscreen();
               }
@@ -2780,11 +2790,18 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
         // 不靠 0.5 秒轮询——轮询可能在 DetailView.onDisappear 之后才跑到，
         // 全屏一进就被 playerVM.stop() 打断。只报状态，不碰播放；
         // 与 adStrip 无关，剥离关掉也要报。
+        // iPhone 上 <video> 全屏走 webkitEnterFullscreen：document.fullscreenElement
+        // 恒 null，须并上 webkitFullscreenElement 与 video 元素的
+        // webkitDisplayingFullscreen；webkitbeginfullscreen/webkitendfullscreen
+        // 在 video 元素上触发，用 document 捕获阶段监听（冒泡与否都兜住），
+        // video 可能藏在同源 iframe 里，沿用 findVideoJS 去找。
         let fullscreenScript = WKUserScript(source: """
             (function(){
-              function report(){ try { window.webkit.messageHandlers.xspFullscreen.postMessage(!!document.fullscreenElement); } catch(e){} }
+              function report(){ try { var v = \(findVideoJS); window.webkit.messageHandlers.xspFullscreen.postMessage(!!(document.fullscreenElement || document.webkitFullscreenElement || (v && v.webkitDisplayingFullscreen))); } catch(e){} }
               document.addEventListener('fullscreenchange', report);
               document.addEventListener('webkitfullscreenchange', report);
+              document.addEventListener('webkitbeginfullscreen', report, true);
+              document.addEventListener('webkitendfullscreen', report, true);
             })();
             """, injectionTime: .atDocumentStart, forMainFrameOnly: false)
         config.userContentController.addUserScript(fullscreenScript)
@@ -2876,12 +2893,12 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
         // probe 的 @Published 赋值挪到下一个 runloop：makeUIViewController
         // 触发的 viewDidLoad 会在 SwiftUI 视图更新期内同步调到这里，直接写
         // 会撞“Publishing changes from within view updates”。
-        DispatchQueue.main.async { [weak self] in self?.probe.pageLoaded = false }
+        DispatchQueue.main.async { [weak self] in guard let self, self.webView != nil else { return }; self.probe.pageLoaded = false }
         // 立即加载（不等预热）。
         load(request: url)
         // 预热并行跑：只做 cookie 预种，不挡加载、不改页面。
         if let host = url.host, CloudflareWarmup.needsWarmup(host: host) {
-            DispatchQueue.main.async { [weak self] in self?.probe.warmingUp = true }
+            DispatchQueue.main.async { [weak self] in guard let self, self.webView != nil else { return }; self.probe.warmingUp = true }
             CloudflareWarmup.shared.ensureClearance(for: host, webView: webView, container: view) { [weak self] in
                 self?.probe.warmingUp = false
             }
