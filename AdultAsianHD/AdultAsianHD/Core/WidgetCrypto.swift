@@ -155,9 +155,11 @@ enum WidgetCrypto {
         let keyBytes: [UInt8] = [UInt8](key)
         // ivBytes 必须是非可选 [UInt8]：Swift 的数组→指针隐式转换只支持非可选数组，
         // [UInt8]? 传给 CCCrypt 的 iv: UnsafeRawPointer? 是编译错。ECB 传空数组
-        // （ECB 忽略 iv，传什么都不影响结果）；其余传 16 字节 iv（非 ECB 时
-        // 上面的 guard 已保证 iv 非空，?? 分支走不到）。
-        let ivBytes: [UInt8] = isECB ? [] : [UInt8](iv ?? [UInt8](repeating: 0, count: 16))
+        // （ECB 忽略 iv，传什么都不影响结果）；其余传 16 字节 iv。
+        // 注意：iv 是 Data?，?? 两边必须同类型——必须先 iv.map 转成 [UInt8]? 再 ??。
+        // 直接写 [UInt8](iv ?? [UInt8](...)) 是编译错（Data 与 [UInt8] 类型不匹配），
+        // R15 初版就是这么写的，ChatGPT 抓到了。
+        let ivBytes: [UInt8] = isECB ? [] : (iv.map { [UInt8]($0) } ?? [UInt8](repeating: 0, count: 16))
         let status: CCStatus = out.withUnsafeMutableBytes { outPtr in
             CCCrypt(
                 op, algorithm, options,
@@ -297,7 +299,9 @@ enum WidgetCrypto {
         } catch {
             // 只有认证失败才报 CRYPTO_AUTH_FAILED；其他错误（如参数错）报 CRYPTO_OS_ERROR，
             // 别把参数错误报成认证失败（诊断准确是验收项之一）。
-            if case CryptoKitError.authenticationFailure = error {
+            // 注意：catch 的 error 是 Error 类型，枚举 case 模式不能直接匹配它——必须先
+            // as? 转成 CryptoKitError 再匹配，否则是编译错（ChatGPT R15 指出的风险）。
+            if let cryptoError = error as? CryptoKitError, case .authenticationFailure = cryptoError {
                 throw CryptoError.failure(code: "CRYPTO_AUTH_FAILED", message: "GCM authentication failed")
             }
             print("[WidgetCrypto] GCM open failed: \(error)")

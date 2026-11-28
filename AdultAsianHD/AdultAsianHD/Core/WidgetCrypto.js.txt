@@ -239,6 +239,10 @@
             if (hx.length > MAX_INPUT_BYTES * 2) { throw new RangeError('input exceeds ' + MAX_INPUT_BYTES + ' bytes'); }
         } else if (enc === 'base64' || enc === 'base64url') {
             var bx = s.replace(/[\t\n\f\r ]/g, '');
+            // 注意：ceil 阈值会放过 1 个字节的超限（6990508 字符解出 5242881 字节），这是粗筛
+            // 故意放宽的——解码后 checkMaxBytes 会再精确拦一次，不会 OOM、不会漏。改成 floor
+            // 反而会误拒合法输入（6990506/6990507 字符的无填充串解出 5242879/5242880 字节，
+            // 在 5MB 内）。精确口径以 checkMaxBytes 为准。
             if (bx.length > Math.ceil(MAX_INPUT_BYTES / 3) * 4) { throw new RangeError('input exceeds ' + MAX_INPUT_BYTES + ' bytes'); }
         }
         switch (enc) {
