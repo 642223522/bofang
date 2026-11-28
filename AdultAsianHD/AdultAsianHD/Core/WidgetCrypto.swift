@@ -119,15 +119,21 @@ enum WidgetCrypto {
             throw CryptoError.invalidParameter("key must be 16, 24 or 32 bytes, got \(key.count)")
         }
         let isECB = mode.uppercased() == "ECB"
+        // iv 绑定到函数作用域：ECB 必须为空；CBC/CTR 必须 16 字节。缺 iv 直接抛错，
+        // 绝不静默补全零 iv（"不自动补零"是本文件的原则；防御性默认值最容易被将来的
+        // 改动绕过）。后面 ivBytes 直接用 iv16，不再写 ?? 兜底。
+        let iv16: Data?
         if isECB {
             // ECB 传非空 iv 直接错（JS 胶水已拦，这里是防线）。
             if let iv = iv, !iv.isEmpty {
                 throw CryptoError.invalidParameter("ECB must not carry an iv")
             }
+            iv16 = nil
         } else {
-            guard let iv = iv, iv.count == 16 else {
+            guard let v = iv, v.count == 16 else {
                 throw CryptoError.invalidParameter("CBC iv must be 16 bytes")
             }
+            iv16 = v
         }
         // padding:'none' 时数据长度必须是 16 的倍数（加密）；解密同样（CCCrypt 会报）。
         let pad = padding.lowercased()
@@ -161,11 +167,16 @@ enum WidgetCrypto {
         let keyBytes: [UInt8] = [UInt8](key)
         // ivBytes 必须是非可选 [UInt8]：Swift 的数组→指针隐式转换只支持非可选数组，
         // [UInt8]? 传给 CCCrypt 的 iv: UnsafeRawPointer? 是编译错。ECB 传空数组
-        // （ECB 忽略 iv，传什么都不影响结果）；其余传 16 字节 iv。
-        // 注意：iv 是 Data?，?? 两边必须同类型——必须先 iv.map 转成 [UInt8]? 再 ??。
-        // 直接写 [UInt8](iv ?? [UInt8](...)) 是编译错（Data 与 [UInt8] 类型不匹配），
-        // R15 初版就是这么写的，ChatGPT 抓到了。
-        let ivBytes: [UInt8] = isECB ? [] : (iv.map { [UInt8]($0) } ?? [UInt8](repeating: 0, count: 16))
+        // （ECB 忽略 iv，传什么都不影响结果）；其余传 iv16（上面 guard 已保证 16 字节，
+        // 缺 iv 到不了这里——else 分支走不到，但编译器要求穷尽，仍显式抛错，绝不补零）。
+        let ivBytes: [UInt8]
+        if isECB {
+            ivBytes = []
+        } else if let v = iv16 {
+            ivBytes = [UInt8](v)
+        } else {
+            throw CryptoError.invalidParameter("CBC iv must be 16 bytes")
+        }
         let status: CCStatus = out.withUnsafeMutableBytes { outPtr in
             CCCrypt(
                 op, algorithm, options,
@@ -420,6 +431,22 @@ extension WidgetCrypto {
             print("[WidgetCrypto] WidgetCrypto.js.txt 读不到，Widget.crypto 不可用")
             return
         }
+        // 删除 6 个全局原语：无论胶水成没成、挂没挂，都要删。放进 defer，保证所有返回
+        // 路径都覆盖（胶水提前返回、评估抛异常、将来加的 early return 都不会漏）。
+        // defer 在函数返回时执行，此时胶水已评完（原语已收进闭包），删全局不影响
+        // 胶水内部调用。注意：guard 读不到胶水时提前 return，那时还没注册原语，
+        // defer 不会执行（defer 声明在 guard 之后），没有要删的东西。
+        defer {
+            // 'use strict'：非严格模式下 delete 不可配置属性会静默失败；严格模式抛错，能被发现。
+            // 删完断言 6 个全局确实没了（模块里 typeof __fwCryptoHash 应为 'undefined'）。
+            context.evaluateScript("'use strict'; delete this.__fwCryptoAESEncrypt; delete this.__fwCryptoAESDecrypt; delete this.__fwCryptoXOR; delete this.__fwCryptoHash; delete this.__fwCryptoHMAC; delete this.__fwCryptoRandomBytes;")
+            if let exc = context.exception {
+                print("[WidgetCrypto] delete globals failed: \(exc)")
+                context.exception = nil
+            } else if let left = context.evaluateScript("typeof __fwCryptoAESEncrypt + ',' + typeof __fwCryptoAESDecrypt + ',' + typeof __fwCryptoXOR + ',' + typeof __fwCryptoHash + ',' + typeof __fwCryptoHMAC + ',' + typeof __fwCryptoRandomBytes")?.toString(), left != "undefined,undefined,undefined,undefined,undefined,undefined" {
+                print("[WidgetCrypto] globals not deleted: \(left)")
+            }
+        }
         // 统一的错误字典。
         func errDict(_ error: CryptoError) -> NSDictionary {
             switch error {
@@ -579,15 +606,6 @@ extension WidgetCrypto {
         if let exc = context.exception {
             print("[WidgetCrypto] glue failed: \(exc)")
             context.exception = nil
-        }
-        // 'use strict'：非严格模式下 delete 不可配置属性会静默失败；严格模式抛错，能被发现。
-        // 删完断言 6 个全局确实没了（模块里 typeof __fwCryptoHash 应为 'undefined'）。
-        context.evaluateScript("'use strict'; delete this.__fwCryptoAESEncrypt; delete this.__fwCryptoAESDecrypt; delete this.__fwCryptoXOR; delete this.__fwCryptoHash; delete this.__fwCryptoHMAC; delete this.__fwCryptoRandomBytes;")
-        if let exc = context.exception {
-            print("[WidgetCrypto] delete globals failed: \(exc)")
-            context.exception = nil
-        } else if let left = context.evaluateScript("typeof __fwCryptoAESEncrypt + ',' + typeof __fwCryptoAESDecrypt + ',' + typeof __fwCryptoXOR + ',' + typeof __fwCryptoHash + ',' + typeof __fwCryptoHMAC + ',' + typeof __fwCryptoRandomBytes")?.toString(), left != "undefined,undefined,undefined,undefined,undefined,undefined" {
-            print("[WidgetCrypto] globals not deleted: \(left)")
         }
     }
 }

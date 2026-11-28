@@ -261,7 +261,7 @@
         var bytes = b64ToBytes(b64, false);
         switch (enc) {
             case 'utf8': return utf8Decode(bytes);
-            case 'base64': return b64;
+            // case 'base64' 已在函数开头早返，这里不再列出（留着是死代码）。
             case 'base64url': return bytesToB64Url(bytes);
             case 'hex': return bytesToHex(bytes);
             default: throw new TypeError('unknown encoding: ' + enc);
