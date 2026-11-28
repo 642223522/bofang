@@ -2471,7 +2471,15 @@ final class EmbedProbeState: ObservableObject {
             // 是乐观先置 true，页内自带全屏按钮走消息；万一消息漏了，0.5 秒
             // 一次的轮询也能把状态扳回来（轮询的 fs 已含 webkit 全屏通道，
             // 见 probe() 内 fs 的算法）。
-            self.isFullscreen = (json["fs"] as? Bool) ?? false
+            // 但跨域 iframe 全屏时主框架探不到 video（findVideoJS 只查同源
+            // iframe，跨域返回 null，本轮 JSON 里没有 "t"，fs 恒 false）：
+            // 无条件覆写会在 0.5 秒内把 fullscreenScript 多帧消息通道上报的
+            // true 扳回 false。所以只在主框架/同源确实拿到 <video>（"t" 存在）
+            // 或 fs == true 时才用轮询覆写；v == nil 时保留消息通道的值。
+            let fs = (json["fs"] as? Bool) ?? false
+            if json["t"] != nil || fs {
+                self.isFullscreen = fs
+            }
             // CF 质询处理：所有质询信号统一等 12 秒，让挑战 JS 自己完成
             //（iframe 里的勾选框我们点不到，立即 reload 会破坏挑战会话）；
             // 12 秒还没出 video 才关规则重载一次。只重载一次。
@@ -2677,11 +2685,10 @@ final class EmbedProbeState: ObservableObject {
     /// iPhone 上 <video> 全屏走 webkitEnterFullscreen（requestFullscreen /
     /// webkitRequestFullscreen 在 iPhone 上可能只是空壳），末尾补上它。
     func requestFullscreen() {
-        // 乐观先置 true：fullscreenchange 消息与轮询都可能在
-        // DetailView.onDisappear 之后才到，先置位才能让全屏判断及时生效；
-        // 万一 requestFullscreen 失败，下一轮探针轮询会按
-        // document.fullscreenElement / webkit 全屏状态把它扳回 false。
-        isFullscreen = true
+        // 仅 JS 真找到 video（或页面本身可全屏）并已发起全屏请求时才乐观置
+        // true：没 video 时不置位——跨域 iframe 下探针 v == nil 时不再覆写，
+        // 无条件的乐观 true 会永远卡住、等不到任何通道扳回来。
+        // 有 video 但请求失败时，下一轮探针（"t" 存在）会按 fs 把它扳回 false。
         webView?.evaluateJavaScript(
             """
             (function(){
@@ -2690,12 +2697,17 @@ final class EmbedProbeState: ObservableObject {
                 if (v.requestFullscreen) v.requestFullscreen();
                 else if (v.webkitRequestFullscreen) v.webkitRequestFullscreen();
                 else if (v.webkitEnterFullscreen) v.webkitEnterFullscreen();
+                return true;
               } else if (document.documentElement.requestFullscreen) {
                 document.documentElement.requestFullscreen();
+                return true;
               }
+              return false;
             })();
             """,
-            completionHandler: nil
+            completionHandler: { [weak self] result, _ in
+                if (result as? Bool) == true { self?.isFullscreen = true }
+            }
         )
     }
 

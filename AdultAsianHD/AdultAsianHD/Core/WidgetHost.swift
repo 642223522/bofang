@@ -240,18 +240,20 @@ final class WidgetHost: @unchecked Sendable {
         // 丢掉 BuiltHost，没人走 WidgetHost.init/deinit，顶层 JS 在
         // evaluateScript 里已挂的 setInterval（顶层 setInterval 未取消会
         // 永久空转）与在途 Widget.http 请求（detached executor Task）会
-        // 泄漏——失败时在这里统一取消，并清掉临时前缀的孤儿键。
-        // 成功时 builtSucceeded 置 true，defer 不动作；成功路径的临时前缀
-        // 清理仍在下面 metaId 校正处（只在成功时跑，与这里互补、不重复）。
+        // 泄漏——失败时在这里统一取消。
+        // 临时前缀清理在 defer 顶层无条件跑一次（R5：成功与任意失败点都只
+        // 清一次；原来成功路径在 metaId 校正处另清一份，第 5/6 个 throw 点
+        // 会与 defer 各扫一次。temp 是 "__import__.<随机 UUID>"，模块 id
+        // 不可能撞上，故不再判 temp != metaId）。
         var builtSucceeded = false
         defer {
             if !builtSucceeded {
                 httpRegistry.cancelAll()
                 timerRegistry.cancelAll()
-                if let temp = tempImportID {
-                    Self.clearUserDefaultsKeys(withPrefix: "fw.storage." + temp + ".")
-                    Self.clearUserDefaultsKeys(withPrefix: "fw.localstorage." + temp + ".")
-                }
+            }
+            if let temp = tempImportID {
+                Self.clearUserDefaultsKeys(withPrefix: "fw.storage." + temp + ".")
+                Self.clearUserDefaultsKeys(withPrefix: "fw.localstorage." + temp + ".")
             }
         }
 
@@ -275,13 +277,6 @@ final class WidgetHost: @unchecked Sendable {
         // 不一致时信模块、不信旧记录；导入校验时这里把临时命名空间换成真 id。
         if moduleIDBox.id != metaId {
             moduleIDBox.id = metaId
-        }
-        // 导入校验的临时命名空间清理：顶层 JS 在校验期写 storage/localStorage
-        // 落在 "__import__.<随机>" 前缀下，meta 到手后该前缀永不再用，清掉
-        // 它名下的孤儿键；只清临时前缀，绝不清真实模块前缀。
-        if let temp = tempImportID, temp != metaId {
-            Self.clearUserDefaultsKeys(withPrefix: "fw.storage." + temp + ".")
-            Self.clearUserDefaultsKeys(withPrefix: "fw.localstorage." + temp + ".")
         }
         // 标题缺失不整文件报错：先用调用方给的文件名，再退回 id。
         let metaTitle: String = {
@@ -1953,8 +1948,9 @@ final class WidgetHost: @unchecked Sendable {
     /// 只在主线程调（调用点都在 MainActor.run 里，resolve/reject 与现有注释同款规矩）。
     /// 边界：按字节数组过桥，O(n) 装箱。单个响应不再设 16 MiB 上限
     ///（P1-1：原来 >16 MiB 直接返回 nil，模块读 .arrayBuffer 得 undefined，
-    /// 等于静默丢弃；现在单个超限响应走 installArrayBuffer 的单次直接转换，
-    /// 不进 FIFO。16 MiB 上限只约束 FIFO 里未读响应的累计量，见
+    /// 等于静默丢弃；R5：单个超限响应也走 installArrayBuffer 的惰性
+    /// token/FIFO 路径，只在模块读 .arrayBuffer 时才转换，不急切装箱。
+    /// 16 MiB 上限只约束 FIFO 里未读响应的累计量，见
     /// ArrayBufferPendingQueue，不再卡单个响应）。
     /// 返回 nil = 没建出来，调用方直接不设该属性，不抛错。
     private static func jsArrayBuffer(from raw: Data, in context: JSContext) -> JSValue? {
@@ -1973,9 +1969,11 @@ final class WidgetHost: @unchecked Sendable {
     /// fetch().arrayBuffer() 与模块直接读 res.arrayBuffer 都是按需读，
     /// 平时不付装箱钱；首次访问后用 defineProperty 把访问器覆写成普通
     /// 数据属性，后续访问不再经过 getter。
-    /// >16 MiB 单次直接转换、不进 FIFO（P1-1：原来直接 return，属性缺省，
-    /// 模块读到 undefined 等于静默丢弃；单个超限响应不在 FIFO 里占累计量，
-    /// 一次性转完即交付，转换失败才缺省——不静默丢弃、不显式报错）。
+    /// >16 MiB 也走惰性 token/FIFO 路径（R5：原来直接 return 静默丢弃；
+    /// R4 改成安装时急切全量转换，主线程峰值数百 MiB、Jetsam 风险；
+    /// 现在只在模块读 .arrayBuffer 时才转换，转换失败才缺省——
+    /// 不静默丢弃、不急切装箱；单个超限项进队后不被自己淘汰，
+    /// 见 store() 的 items.count > 1 守卫）。
     /// 只在主线程调（调用点都在 MainActor.run 里）。
     /// JS 侧契约不变：res.arrayBuffer 仍是 ArrayBuffer（或缺省），只是什么时候构造变了。
     /// P0-1：getter block 不捕获 raw / context / result——getter 挂在 result
@@ -1989,13 +1987,6 @@ final class WidgetHost: @unchecked Sendable {
     /// 首次访问后删登记，并用 defineProperty（带 JSPropertyDescriptorValueKey）
     /// 把属性覆写成普通数据属性，不再走 setValue。
     private static func installArrayBuffer(from raw: Data, in context: JSContext, on result: JSValue) {
-        // >16 MiB：单次直接转换，不进 FIFO（见上面注释）。
-        if raw.count > 16 * 1024 * 1024 {
-            if let buffer = jsArrayBuffer(from: raw, in: context) {
-                result.setValue(buffer, forProperty: "arrayBuffer")
-            }
-            return
-        }
         if raw.count <= 1 * 1024 * 1024 {
             if let buffer = jsArrayBuffer(from: raw, in: context) {
                 result.setValue(buffer, forProperty: "arrayBuffer")
@@ -2099,10 +2090,11 @@ final class WidgetHost: @unchecked Sendable {
             items.append((token, data))
             totalBytes += data.count
             // FIFO 只限制未读累计量：淘汰最旧项，但刚存进来的这一项自己
-            // 绝不被淘汰（P1-1：原来 while 循环没留这一项，单个响应超
-            // 16 MiB 时 append 后自己就是最旧项、立即被自己淘汰；
-            // items.count > 1 守住后，超限时先淘汰旧项，只剩新项时即便
-            // 仍超限也留着它，不静默丢弃）。
+            // 绝不被淘汰（items.count > 1 守卫：超限时先淘汰旧项，只剩
+            // 新项时即便仍超累计上限也留着它，不静默丢弃。注：旧
+            // installArrayBuffer 的 >16 MiB guard 在进队前就 return，
+            // store() 实际从未见过超限项，守卫是防超限项进队后自淘汰，
+            // 不是修已发生的旧行为）。
             while (items.count > Self.maxEntries || totalBytes > Self.maxBytes) && items.count > 1 {
                 let oldest = items.removeFirst()
                 totalBytes -= oldest.data.count

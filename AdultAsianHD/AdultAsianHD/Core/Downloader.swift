@@ -440,6 +440,7 @@ private final class DownloadRaceBox: @unchecked Sendable {
     private var task: URLSessionDownloadTask?
     private var observation: NSKeyValueObservation?
     private var finished = false
+    private var commitClaimed = false
     /// 落盘提交权已被 completion 取得（P2-2）：beginCommit() 原子置起；
     /// 置起后取消路径的 finish（isCommit == false）直接失败，不再抢走
     /// 完成权——落盘（删旧文件/moveItem）与取消竞争的是同一个完成权，

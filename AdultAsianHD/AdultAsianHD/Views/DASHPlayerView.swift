@@ -197,7 +197,9 @@ final class DASHPlayerController: ObservableObject {
             if !isScrubbing, let t = Self.doubleValue(message["t"]) { currentTime = t }
             if let d = Self.doubleValue(message["d"]), d.isFinite, d > 0 { duration = d }
             if let b = Self.doubleValue(message["buffered"]), b.isFinite, b >= 0 {
-                bufferedEnd = max(bufferedEnd, b)
+                // JS 的 bufferedEnd() 已返回含 currentTime 的那个区间之 end，
+                // 直接赋值；旧的 max() 会让回拖后缓冲条卡在高点不回落。
+                bufferedEnd = b
             }
         case "playing":
             isPlaying = true
@@ -729,7 +731,15 @@ final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUID
         }
       }
       function bufferedEnd(){
-        try { if (video.buffered.length > 0) return video.buffered.end(video.buffered.length - 1); } catch(e){}
+        try {
+          var t = video.currentTime;
+          for (var i = 0; i < video.buffered.length; i++) {
+            if (video.buffered.start(i) <= t && t <= video.buffered.end(i)) return video.buffered.end(i);
+          }
+          // currentTime 不在任何已缓冲区间内（在空隙里或尚未缓冲）：回退到
+          // 最后一个区间的 end，与旧行为一致，不把缓冲条闪回 0。
+          if (video.buffered.length > 0) return video.buffered.end(video.buffered.length - 1);
+        } catch(e){}
         return 0;
       }
       if (typeof dashjs === 'undefined' || !dashjs.MediaPlayer){
@@ -809,6 +819,7 @@ final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUID
         fullscreen: function(){
           try {
             if (document.fullscreenElement){ document.exitFullscreen(); }
+            else if (document.webkitFullscreenElement && document.webkitExitFullscreen){ document.webkitExitFullscreen(); }
             else if (video.webkitDisplayingFullscreen && video.webkitExitFullscreen){ video.webkitExitFullscreen(); }
             else if (video.requestFullscreen){ video.requestFullscreen(); }
             else if (video.webkitRequestFullscreen){ video.webkitRequestFullscreen(); }
