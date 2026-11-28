@@ -290,8 +290,9 @@ final class WidgetHost: @unchecked Sendable {
     /// 前缀 fw.localstorage.）、全局 fetch（GET/POST 最小实现）、setTimeout / clearTimeout、
     /// setInterval / clearInterval、console.log / info / debug / warn / error（多参数拼接）。
     /// Widget.html.load / loadURL（Cheerio DOM 解析，见 Core/WidgetHTML.js.txt；
-    /// 底层 cheerio bundle 懒注入，见 __fwEnsureCheerio；裸 JSC 没有 URL，桥里补了一个
-    /// 最小 URL 构造器——cheerio 的 prop('href')/prop('src') 靠它解析相对地址）。
+    /// 底层 cheerio bundle 与最小 URL 构造器都由 __fwEnsureCheerio 懒注入——
+    /// 只在第一次调 html.load/loadURL 时装，不用的模块看不到新的全局 URL；
+    /// 裸 JSC 没有 URL，cheerio 的 prop('href')/prop('src') 靠它解析相对地址）。
     /// 模块发现三路超集、loadDetail/childItems/relatedItems 解析、分类拦截器都不在这里动。
     private static func installWidgetBridge(in context: JSContext, interceptor: CategoryRequestInterceptor, httpRegistry: HTTPRequestRegistry) {
         let widget = JSValue(newObjectIn: context)!
@@ -492,75 +493,10 @@ final class WidgetHost: @unchecked Sendable {
 
         context.setObject(widget, forKeyedSubscript: "Widget" as NSString)
 
-        // URL 构造器（最小版）：裸 JavaScriptCore 里没有 URL（它是 Web API，不是 JS 内置），
-        // 但 cheerio 的 prop('href')/prop('src') 靠 new URL(s, baseURI).href 解析相对地址，
-        // 没有它 prop 就静默返回相对地址（已在沙箱复现）。模块里 new URL(...) 也靠它。
-        // 只在 URL 缺席时装（JSC 哪天自带了就用原生的）；解析走 Foundation URL（RFC 3986），
-        // JS 侧只负责拼对象与抛错。不提供 createObjectURL/revokeObjectURL（没有 blob URL 的概念）。
-        // 注意：Foundation 的 .path/.query/.fragment 是解码后的，与 WHATWG 的 pathname/search/hash
-        // （保留百分号编码）有差异；href 是准的（absoluteString 原样保留编码），cheerio 只用 href。
-        let resolveURL: @convention(block) (String, String?) -> NSDictionary? = { urlString, baseString in
-            let base = baseString.flatMap { URL(string: $0) }
-            guard let resolved = URL(string: urlString, relativeTo: base)?.absoluteURL,
-                  resolved.scheme != nil else { return nil }
-            let scheme = resolved.scheme!.lowercased()
-            let host = resolved.host ?? ""
-            let port = resolved.port
-            let defaultPort: Int? = {
-                switch scheme {
-                case "http", "ws": return 80
-                case "https", "wss": return 443
-                case "ftp": return 21
-                default: return nil
-                }
-            }()
-            let effectivePort = (port != nil && port != defaultPort) ? String(port!) : ""
-            let hostWithPort = host.isEmpty ? "" : (effectivePort.isEmpty ? host : "\(host):\(effectivePort)")
-            let special = ["http", "https", "ws", "wss", "ftp"].contains(scheme)
-            let origin = (special && !host.isEmpty) ? "\(scheme)://\(hostWithPort)" : "null"
-            let path = resolved.path
-            return [
-                "href": resolved.absoluteString,
-                "protocol": scheme.isEmpty ? "" : "\(scheme):",
-                "host": hostWithPort,
-                "hostname": host,
-                "port": effectivePort,
-                "pathname": path.isEmpty ? "/" : path,
-                "search": resolved.query.map { "?\($0)" } ?? "",
-                "hash": resolved.fragment.map { "#\($0)" } ?? "",
-                "origin": origin,
-            ] as NSDictionary
-        }
-        context.setObject(resolveURL as @convention(block) (String, String?) -> NSDictionary?, forKeyedSubscript: "__fwResolveURL" as NSString)
-        context.evaluateScript("""
-            (function (g) {
-                if (typeof g.URL === 'function') { return; }
-                var URL = function (url, base) {
-                    if (!(this instanceof URL)) {
-                        throw new TypeError("Failed to construct 'URL': Please use the 'new' operator");
-                    }
-                    var parts = g.__fwResolveURL(String(url), base == null ? null : String(base));
-                    if (!parts) { throw new TypeError('Invalid URL'); }
-                    this.href = parts.href;
-                    this.protocol = parts.protocol;
-                    this.host = parts.host;
-                    this.hostname = parts.hostname;
-                    this.port = parts.port;
-                    this.pathname = parts.pathname;
-                    this.search = parts.search;
-                    this.hash = parts.hash;
-                    this.origin = parts.origin;
-                };
-                URL.prototype.toString = function () { return this.href; };
-                URL.prototype.toJSON = function () { return this.href; };
-                g.URL = URL;
-            })(this);
-            """)
-
         // Widget.html（Cheerio DOM 解析，见 Core/WidgetHTML.js.txt）：
-        // __fwEnsureCheerio：懒注入 cheerio bundle（第一次调 load/loadURL 时才注入，
-        // 约 30ms，之后常驻；不用的模块不付这个钱）。bundle 是 Core/cheerio.min.js.txt
-        // （esbuild 打包的 cheerio 1.2.0，.txt 资源进包，不违反 0 .js 门禁）。
+        // __fwEnsureCheerio：懒注入 cheerio bundle + 最小 URL 构造器（第一次调 load/loadURL 时
+        // 才注入，约 30ms，之后常驻；不用的模块不付这个钱，也看不到新的全局 URL，旧模块行为不变）。
+        // bundle 是 Core/cheerio.min.js.txt（esbuild 打包的 cheerio 1.2.0，.txt 资源进包，不违反 0 .js 门禁）。
         // 注意：bundle 加载时就要 atob（它内置的 base64 解码守卫是 typeof Buffer.from，
         // Buffer 不存在时直接抛 ReferenceError——已在沙箱复现）；裸 JSC 不一定有 atob，
         // 缺时先注入一个最小 atob polyfill（与 round30-pack 的 harness 里测过的逐字一致）。
@@ -579,14 +515,37 @@ final class WidgetHost: @unchecked Sendable {
                         var map = {};
                         for (var i = 0; i < chars.length; i++) { map[chars.charAt(i)] = i; }
                         g.atob = function (input) {
-                            var str = String(input).replace(/[^A-Za-z0-9+/=]/g, '');
+                            var str = String(input);
+                            var bad = function () {
+                                var err = new Error('InvalidCharacterError: The string to be decoded is not correctly encoded.');
+                                err.name = 'InvalidCharacterError';
+                                throw err;
+                            };
+                            // 只许 Base64 字符与 ASCII 空白；非法字符直接抛错（原生 atob 抛
+                            // InvalidCharacterError），不悄悄删掉——损坏数据不能变成看似有效的数据。
+                            // 注意：这里故意不用正则写空白转义（Swift 多行字符串里反斜杠要双写，
+                            // 容易错），改用 charCode 比较，JS 文本里一个反斜杠也没有。
+                            var clean = '';
+                            for (var j = 0; j < str.length; j++) {
+                                var ch = str.charAt(j);
+                                var code = str.charCodeAt(j);
+                                if (code === 32 || code === 9 || code === 10 || code === 12 || code === 13) { continue; }
+                                if (map[ch] === undefined && ch !== '=') { bad(); }
+                                clean += ch;
+                            }
+                            // 结构：长度是 4 的倍数；'=' 只许在末尾，最多两个。
+                            if (clean.length % 4 !== 0) { bad(); }
+                            var eq = 0;
+                            for (var k = clean.length - 1; k >= 0 && clean.charAt(k) === '='; k--) { eq++; }
+                            if (eq > 2) { bad(); }
+                            if (clean.indexOf('=') !== -1 && clean.indexOf('=') < clean.length - eq) { bad(); }
                             var out = '';
                             var i = 0;
-                            while (i < str.length) {
-                                var e1 = map[str.charAt(i++)];
-                                var e2 = map[str.charAt(i++)];
-                                var e3 = map[str.charAt(i++)];
-                                var e4 = map[str.charAt(i++)];
+                            while (i < clean.length) {
+                                var e1 = map[clean.charAt(i++)];
+                                var e2 = map[clean.charAt(i++)];
+                                var e3 = map[clean.charAt(i++)];
+                                var e4 = map[clean.charAt(i++)];
                                 if (e1 === undefined || e2 === undefined) { break; }
                                 var c1 = (e1 << 2) | (e2 >> 4);
                                 out += String.fromCharCode(c1);
@@ -604,11 +563,109 @@ final class WidgetHost: @unchecked Sendable {
                     })(this);
                     """)
             }
+            // URL 构造器（最小版）：裸 JavaScriptCore 里没有 URL（它是 Web API，不是 JS 内置），
+            // 但 cheerio 的 prop('href')/prop('src') 靠 new URL(s, baseURI).href 解析相对地址，
+            // 没有它 prop 就静默返回相对地址（已在沙箱复现）。模块里 new URL(...) 也靠它。
+            // 懒安装：只在第一次调 html.load/loadURL 时装（这里，__fwEnsureCheerio 里），
+            // 不用的模块看不到新的全局 URL，旧模块行为不变；JSC 哪天自带了就用原生的。
+            // 解析走 Foundation URL（RFC 3986），JS 侧只负责拼对象与抛错。
+            // 不提供 createObjectURL/revokeObjectURL（没有 blob URL 的概念）。
+            let resolveURL: @convention(block) (String, String?) -> NSDictionary? = { urlString, baseString in
+                let base = baseString.flatMap { URL(string: $0) }
+                guard let resolved = URL(string: urlString, relativeTo: base)?.absoluteURL,
+                      resolved.scheme != nil else { return nil }
+                let scheme = resolved.scheme!.lowercased()
+                let host = resolved.host ?? ""
+                let port = resolved.port
+                let defaultPort: Int? = {
+                    switch scheme {
+                    case "http", "ws": return 80
+                    case "https", "wss": return 443
+                    case "ftp": return 21
+                    default: return nil
+                    }
+                }()
+                let effectivePort = (port != nil && port != defaultPort) ? String(port!) : ""
+                // IPv6 host 拼端口要加方括号；Foundation 的 .host 可能去括号也可能带括号，
+                // 两种都处理（已带括号的不重复加；不带括号但含冒号的加括号）。
+                let formattedHost: String = {
+                    guard !host.isEmpty else { return "" }
+                    if host.hasPrefix("[") { return host }
+                    return host.contains(":") ? "[\(host)]" : host
+                }()
+                let hostWithPort = formattedHost.isEmpty ? "" : (effectivePort.isEmpty ? formattedHost : "\(formattedHost):\(effectivePort)")
+                let special = ["http", "https", "ws", "wss", "ftp"].contains(scheme)
+                let origin = (special && !host.isEmpty) ? "\(scheme)://\(hostWithPort)" : "null"
+                // pathname/search/hash 用 URLComponents 的 percentEncoded* 字段（保留百分号编码，
+                // 与 WHATWG 一致）；URLComponents 建不出来时回退到 Foundation 的解码值。
+                let components = URLComponents(url: resolved, resolvingAgainstBaseURL: true)
+                let pathname: String = {
+                    if let p = components?.percentEncodedPath, !p.isEmpty { return p }
+                    let path = resolved.path
+                    return path.isEmpty ? "/" : path
+                }()
+                let search: String = {
+                    if let q = components?.percentEncodedQuery { return "?" + q }
+                    return resolved.query.map { "?\($0)" } ?? ""
+                }()
+                let hash: String = {
+                    if let f = components?.percentEncodedFragment { return "#" + f }
+                    return resolved.fragment.map { "#\($0)" } ?? ""
+                }()
+                return [
+                    "href": resolved.absoluteString,
+                    "protocol": scheme.isEmpty ? "" : "\(scheme):",
+                    "host": hostWithPort,
+                    "hostname": formattedHost,
+                    "port": effectivePort,
+                    "pathname": pathname,
+                    "search": search,
+                    "hash": hash,
+                    "origin": origin,
+                ] as NSDictionary
+            }
+            context.setObject(resolveURL as @convention(block) (String, String?) -> NSDictionary?, forKeyedSubscript: "__fwResolveURL" as NSString)
+            context.evaluateScript("""
+                (function (g) {
+                    if (typeof g.URL === 'function') { return; }
+                    var URL = function (url, base) {
+                        if (!(this instanceof URL)) {
+                            throw new TypeError("Failed to construct 'URL': Please use the 'new' operator");
+                        }
+                        var parts = g.__fwResolveURL(String(url), base == null ? null : String(base));
+                        if (!parts) { throw new TypeError('Invalid URL'); }
+                        this.href = parts.href;
+                        this.protocol = parts.protocol;
+                        this.host = parts.host;
+                        this.hostname = parts.hostname;
+                        this.port = parts.port;
+                        this.pathname = parts.pathname;
+                        this.search = parts.search;
+                        this.hash = parts.hash;
+                        this.origin = parts.origin;
+                    };
+                    URL.prototype.toString = function () { return this.href; };
+                    URL.prototype.toJSON = function () { return this.href; };
+                    g.URL = URL;
+                })(this);
+                """)
+
+
             guard let bundleURL = Bundle.main.url(forResource: "cheerio.min", withExtension: "js.txt"),
                   let bundle = try? String(contentsOf: bundleURL, encoding: .utf8),
                   !bundle.isEmpty else { return false }
             context.evaluateScript(bundle)
-            guard let fn = context.objectForKeyedSubscript("__fwCheerioLoad"), !fn.isUndefined, !fn.isNull else { return false }
+            guard let fn = context.objectForKeyedSubscript("__fwCheerioLoad"), !fn.isUndefined, !fn.isNull else {
+                // 注入失败的诊断：bundle 解析错与资源缺失走同一条 false 路，DEBUG 下把
+                // JS 侧的异常打出来区分（不影响返回值；异常读完就清掉，别让它留着污染后事）。
+                #if DEBUG
+                if let exception = context.exception {
+                    print("[WidgetHost] cheerio bundle 注入失败：\(exception.toString() ?? "")")
+                }
+                #endif
+                context.exception = nil
+                return false
+            }
             return true
         }
         context.setObject(ensureCheerio as @convention(block) () -> Bool, forKeyedSubscript: "__fwEnsureCheerio" as NSString)
