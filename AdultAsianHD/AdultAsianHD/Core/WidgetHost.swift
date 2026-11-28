@@ -565,6 +565,10 @@ final class WidgetHost: @unchecked Sendable {
             let special = specialSchemes.contains(scheme)
             if schemesRequiringHost.contains(scheme) && host.isEmpty { return nil }
             let port = resolved.port
+            // file: URL 不能带端口（WHATWG/Node：new URL('file://a:8080/x') 抛 Invalid URL；
+            // 静默清掉会让 href 与 host/port 字段自相矛盾——ChatGPT R8 P2-1 / Gemini R8 P1。
+            // 这里直接拒绝，protocol setter 切到 file: 时也会因解析失败而忽略，符合 Node 行为）。
+            if scheme == "file" && port != nil { return nil }
             let defaultPort: Int? = {
                 switch scheme {
                 case "http", "ws": return 80
@@ -597,7 +601,13 @@ final class WidgetHost: @unchecked Sendable {
                 // file: host 规范化：localhost 已在 host 归一化里变 ""；host 为空时显式置 ""，
                 // 保证序列化带 "//"（"file:/tmp/a" → "file:///tmp/a"；ChatGPT R7 P2-1）。
                 // 用 "" 而不用 nil（nil 可能把 "//" 也丢掉，变成 "file:/path"）。
-                components.host = host
+                // IPv6 仍走 encodedHost（带括号形式），host 是未编码属性、写裸 "::1" 会被
+                // 百分号编码——ChatGPT R8 P2-2 / Gemini R8 P2-3。
+                if host.contains(":") {
+                    components.encodedHost = formattedHost
+                } else {
+                    components.host = host
+                }
             } else if !host.isEmpty {
                 if host.contains(":") {
                     // IPv6：用 encodedHost 写回（带括号形式 "[::1]"）。host 是未编码属性，
@@ -611,14 +621,16 @@ final class WidgetHost: @unchecked Sendable {
             }
             // host 为空时不动 components.host（file:/// 的空 authority 要保留 "//"，
             // 置 nil 会把它丢掉，变成 "file:/path"）——file: 分支上面已显式置 ""。
-            // file: URL 没有端口（http://a:8080 切 file: 会产出非法带端口 file URL；
-            // Gemini R7 P1-5）：file: 强制 port = nil。
-            components.port = (scheme == "file") ? nil : ((port != nil && port != defaultPort) ? port : nil)
+            // file: 带端口已在前面直接拒绝（return nil），这里不用再特殊处理。
+            components.port = (port != nil && port != defaultPort) ? port : nil
             // percentEncodedPath 是非可选 String（不像 query/fragment 是 String?），
             // 不能用 ?? 或 if let（R6 的 if let 编不过：Initializer for conditional
             // binding must have Optional type——Gemini R6 P0-1 抓到的硬编译错）。
-            if special && components.percentEncodedPath.isEmpty {
-                components.percentEncodedPath = "/"
+            // 特殊协议的 path 必须以 / 开头（空 path 补 "/"；"file:foo" 这种 path 是 "foo" 的
+            // 也补 "/" → "/foo"，不然 components.string 按 RFC 3986 §3.3 返回 nil，
+            // 原本合法的 file:foo 会变成抛 Invalid URL——Gemini R8 P2-2）。
+            if special && !components.percentEncodedPath.hasPrefix("/") {
+                components.percentEncodedPath = "/" + components.percentEncodedPath
             }
             // special-query percent-encode set：单引号 ' 必须编成 %27（WHATWG；
             // Foundation 会把字面 ' 原样留在 percentEncodedQuery 里）。
@@ -1043,6 +1055,12 @@ final class WidgetHost: @unchecked Sendable {
                                 if (newProto.charAt(newProto.length - 1) !== ':') { newProto += ':'; }
                                 // WHATWG：不允许在特殊与非特殊协议之间切换（https: → foo: 拒绝）。
                                 if (isSpecialScheme(_protocol) !== isSpecialScheme(newProto)) { return; }
+                                // 切到 file: 时，当前 URL 不能带端口或账号（file: URL 没有端口和 userinfo；
+                                // Node：http://a:8080/x 切 file: 后 href 不变——ChatGPT R8 P2-3）。
+                                if (newProto.toLowerCase() === 'file:') {
+                                    if (_port) { return; }
+                                    if (_protoAuth.indexOf('@') >= 0) { return; }
+                                }
                                 var p = g.__fwResolveURL(newProto + _protoAuth.slice(_protocol.length) + _pathname + _search + _hash, null);
                                 if (!p) { return; }
                                 applyParts(p);
@@ -1099,9 +1117,9 @@ final class WidgetHost: @unchecked Sendable {
                         Object.defineProperty(this, 'port', {
                             get: function () { return _port; },
                             set: function (v) {
-                                if (_protoAuth.indexOf('://') < 0) { return; }
-                                // file: URL 没有端口（Gemini R7 P1-3），直接忽略。
-                                if (_protocol === 'file:') { return; }
+                                // 无 authority、file:、或空 host 的 URL 不能设端口（foo:///x 设 port 会
+                                // 拼出 foo://:8080/x——ChatGPT R8 P2-4 / Gemini R8 P2-4）。
+                                if (_protoAuth.indexOf('://') < 0 || _protocol === 'file:' || !_hostname) { return; }
                                 var newPort = String(v);
                                 var portPart = '';
                                 if (newPort !== '') {
