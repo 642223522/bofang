@@ -593,10 +593,11 @@ final class WidgetHost: @unchecked Sendable {
             // 回退到未归一化的 resolved.absoluteString（回退串与归一化字段打架）。
             guard var components = URLComponents(url: resolved, resolvingAgainstBaseURL: true) else { return nil }
             components.scheme = scheme
-            if scheme == "file" && (resolved.host ?? "").lowercased() == "localhost" {
-                // file://localhost/path → file:///path：host 规范化为空字符串。
+            if scheme == "file" {
+                // file: host 规范化：localhost 已在 host 归一化里变 ""；host 为空时显式置 ""，
+                // 保证序列化带 "//"（"file:/tmp/a" → "file:///tmp/a"；ChatGPT R7 P2-1）。
                 // 用 "" 而不用 nil（nil 可能把 "//" 也丢掉，变成 "file:/path"）。
-                components.host = ""
+                components.host = host
             } else if !host.isEmpty {
                 if host.contains(":") {
                     // IPv6：用 encodedHost 写回（带括号形式 "[::1]"）。host 是未编码属性，
@@ -609,8 +610,10 @@ final class WidgetHost: @unchecked Sendable {
                 }
             }
             // host 为空时不动 components.host（file:/// 的空 authority 要保留 "//"，
-            // 置 nil 会把它丢掉，变成 "file:/path"）。
-            components.port = (port != nil && port != defaultPort) ? port : nil
+            // 置 nil 会把它丢掉，变成 "file:/path"）——file: 分支上面已显式置 ""。
+            // file: URL 没有端口（http://a:8080 切 file: 会产出非法带端口 file URL；
+            // Gemini R7 P1-5）：file: 强制 port = nil。
+            components.port = (scheme == "file") ? nil : ((port != nil && port != defaultPort) ? port : nil)
             // percentEncodedPath 是非可选 String（不像 query/fragment 是 String?），
             // 不能用 ?? 或 if let（R6 的 if let 编不过：Initializer for conditional
             // binding must have Optional type——Gemini R6 P0-1 抓到的硬编译错）。
@@ -696,13 +699,16 @@ final class WidgetHost: @unchecked Sendable {
                 // 只编 ASCII 结构字符（#、空白、控制字符、"、<、>、'、反引号），非 ASCII 留给
                 // Swift 侧按 UTF-8 编码。不能用 encodeURIComponent（它会把 &、= 等 query 结构
                 // 字符也编了，还会把 %XX 双重编码）。无正则、无反斜杠（Swift 多行字符串转义坑）。
-                var encodeQueryValue = function (s) {
+                var encodeQueryValue = function (s, isSpecial) {
                     var out = '';
                     for (var i = 0; i < s.length; i++) {
                         var c = s.charCodeAt(i);
                         // tab/LF/CR 直接删掉（WHATWG：URL 解析器删 tab/LF/CR；构造器经 Swift clean
                         // 也是删，不删会与构造器行为不一致——R6 是编成 %09/%0A/%0D，错）。
                         if (c === 0x09 || c === 0x0A || c === 0x0D) { continue; }
+                        // ' 只在 special URL 里编成 %27（Swift 侧 special-only 规则；非 special
+                        // 不编，不然与构造器不一致——ChatGPT R7 P2-4 / Gemini R7 P2）。
+                        if (c === 0x27 && !isSpecial) { out += s.charAt(i); continue; }
                         if (c <= 0x20 || c === 0x22 || c === 0x23 || c === 0x3C || c === 0x3E || c === 0x27) {
                             out += '%' + (c < 16 ? '0' : '') + c.toString(16).toUpperCase();
                         } else {
@@ -728,12 +734,18 @@ final class WidgetHost: @unchecked Sendable {
                 // 路径编码器（pathname setter 用）：编 ?、#、控制字符、空格、"、<、>、反引号、反斜杠，
                 // / 保留为路径分隔符（不能用 encodeURIComponent 整段编，会把 / 也编了）。
                 // tab/LF/CR 直接删掉（同上）。
-                var encodePathValue = function (s) {
+                var encodePathValue = function (s, isSpecial) {
                     var out = '';
                     for (var i = 0; i < s.length; i++) {
                         var c = s.charCodeAt(i);
                         if (c === 0x09 || c === 0x0A || c === 0x0D) { continue; }
-                        if (c <= 0x20 || c === 0x7F || c === 0x22 || c === 0x23 || c === 0x3C || c === 0x3E || c === 0x3F || c === 0x5C || c === 0x60) {
+                        // 反斜杠：special URL 里作路径分隔符（变 /）；非 special 编 %5C。
+                        if (c === 0x5C) {
+                            out += isSpecial ? '/' : '%5C';
+                            continue;
+                        }
+                        // path percent-encode set：? # 控制字符 空格 " < > 反引号 ^ { }（ChatGPT R7 P2-2）。
+                        if (c <= 0x20 || c === 0x7F || c === 0x22 || c === 0x23 || c === 0x3C || c === 0x3E || c === 0x3F || c === 0x5E || c === 0x60 || c === 0x7B || c === 0x7D) {
                             out += '%' + (c < 16 ? '0' : '') + c.toString(16).toUpperCase();
                         } else {
                             out += s.charAt(i);
@@ -1007,6 +1019,20 @@ final class WidgetHost: @unchecked Sendable {
                         };
                         this.searchParams = new URLSearchParamsCtor(parts.search);
                         this.searchParams._onChange = onQueryChange;
+                        // 用新的 host[:port] 替换 _protoAuth 里的 host 部分，保留 userinfo
+                        //（_protoAuth 含 user:pass@，直接拼 _protocol + '//' + newHost 会丢掉它——
+                        // ChatGPT R7 P2-3 / Gemini R7 P1-3）。
+                        var protoAuthWithHost = function (newHostPort) {
+                            var auth = _protoAuth;
+                            var schemeEnd = auth.indexOf('://');
+                            if (schemeEnd < 0) { return _protocol + '//' + newHostPort; }
+                            var afterScheme = auth.slice(schemeEnd + 3);
+                            var atIdx = afterScheme.indexOf('@');
+                            if (atIdx >= 0) {
+                                return auth.slice(0, schemeEnd + 3) + afterScheme.slice(0, atIdx + 1) + newHostPort;
+                            }
+                            return _protocol + '//' + newHostPort;
+                        };
                         // protocol/host/hostname/port/pathname：defineProperty 读写闭包状态，
                         // setter 拼候选串重解析 + applyParts 全量同步。origin 只读（WHATWG）。
                         // 全部 setter 按 WHATWG 不抛错：解析失败保持原值（构造器仍抛 Invalid URL）。
@@ -1036,7 +1062,7 @@ final class WidgetHost: @unchecked Sendable {
                                     var c = newHost.charCodeAt(i);
                                     if (c <= 0x20 || c === 0x2F || c === 0x3F || c === 0x23 || c === 0x40 || c === 0x5C) { return; }
                                 }
-                                var p = g.__fwResolveURL(_protocol + '//' + newHost + _pathname + _search + _hash, null);
+                                var p = g.__fwResolveURL(protoAuthWithHost(newHost) + _pathname + _search + _hash, null);
                                 if (!p) { return; }
                                 applyParts(p);
                             },
@@ -1063,7 +1089,7 @@ final class WidgetHost: @unchecked Sendable {
                                     }
                                 }
                                 var portPart = _port ? ':' + _port : '';
-                                var p = g.__fwResolveURL(_protocol + '//' + newHostname + portPart + _pathname + _search + _hash, null);
+                                var p = g.__fwResolveURL(protoAuthWithHost(newHostname + portPart) + _pathname + _search + _hash, null);
                                 if (!p) { return; }
                                 applyParts(p);
                             },
@@ -1074,6 +1100,8 @@ final class WidgetHost: @unchecked Sendable {
                             get: function () { return _port; },
                             set: function (v) {
                                 if (_protoAuth.indexOf('://') < 0) { return; }
+                                // file: URL 没有端口（Gemini R7 P1-3），直接忽略。
+                                if (_protocol === 'file:') { return; }
                                 var newPort = String(v);
                                 var portPart = '';
                                 if (newPort !== '') {
@@ -1083,7 +1111,7 @@ final class WidgetHost: @unchecked Sendable {
                                     if (isNaN(n) || n < 0 || n > 65535) { return; }
                                     portPart = ':' + n;
                                 }
-                                var p = g.__fwResolveURL(_protocol + '//' + _hostname + portPart + _pathname + _search + _hash, null);
+                                var p = g.__fwResolveURL(protoAuthWithHost(_hostname + portPart) + _pathname + _search + _hash, null);
                                 if (!p) { return; }
                                 applyParts(p);
                             },
@@ -1095,7 +1123,7 @@ final class WidgetHost: @unchecked Sendable {
                             set: function (v) {
                                 // 先按 path percent-encode set 编码（?、#、空格等编掉，不能让它们
                                 // 在拼串后被解析器当成 query/fragment 起点，破坏原 search/hash）。
-                                var newPath = encodePathValue(String(v));
+                                var newPath = encodePathValue(String(v), isSpecialScheme(_protocol));
                                 // 有 authority 的 URL 且新 path 非空、不以 / 开头时补一个 /，
                                 // 不然 _protoAuth + newPath 会拼成另一个 host。
                                 if (_protoAuth.indexOf('://') >= 0 && newPath !== '' && newPath.charAt(0) !== '/') {
@@ -1136,7 +1164,7 @@ final class WidgetHost: @unchecked Sendable {
                                 // 侧 clean 会把它静默裁掉），再拼候选串重解析。
                                 var s = String(v);
                                 if (s.charAt(0) === '?') { s = s.slice(1); }
-                                s = encodeQueryValue(s);
+                                s = encodeQueryValue(s, isSpecialScheme(_protocol));
                                 var p = g.__fwResolveURL(_prefix + (s ? '?' + s : '') + _hash, null);
                                 if (!p) { return; }
                                 applyParts(p);
