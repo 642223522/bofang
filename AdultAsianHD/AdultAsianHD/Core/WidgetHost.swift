@@ -565,10 +565,12 @@ final class WidgetHost: @unchecked Sendable {
             let special = specialSchemes.contains(scheme)
             if schemesRequiringHost.contains(scheme) && host.isEmpty { return nil }
             let port = resolved.port
-            // file: URL 不能带端口（WHATWG/Node：new URL('file://a:8080/x') 抛 Invalid URL；
-            // 静默清掉会让 href 与 host/port 字段自相矛盾——ChatGPT R8 P2-1 / Gemini R8 P1。
-            // 这里直接拒绝，protocol setter 切到 file: 时也会因解析失败而忽略，符合 Node 行为）。
-            if scheme == "file" && port != nil { return nil }
+            // file: URL 不能带端口和账号（WHATWG/Node：new URL('file://a:8080/x')、
+            // new URL('file://user:pass@a.com/x') 都抛 Invalid URL；
+            // 静默清掉会让 href 与 host/port 字段自相矛盾——ChatGPT R8 P2-1 / Gemini R8 P1；
+            // 账号这一项是 Gemini R9 P2。这里直接拒绝，protocol setter 切到 file: 时也会
+            // 因解析失败而忽略，符合 Node 行为）。
+            if scheme == "file" && (port != nil || resolved.user != nil || resolved.password != nil) { return nil }
             let defaultPort: Int? = {
                 switch scheme {
                 case "http", "ws": return 80
