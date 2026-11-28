@@ -43,16 +43,18 @@
     var MAX_DOM_DEPTH = 512;
 
     // 解析输入上限：硬上限 5MB，只许调低不许调高（模块是外部 JS，不能拿它给的配置当资源策略）。
-    // 未传或 null → 默认 5MB；无效值（非数/NaN/Infinity/≤0）抛 TypeError，不悄悄回默认。
+    // 未传或 null → 默认 5MB；maxBytes 与 maxHTMLBytes 两个别名都认（maxBytes 优先）；
+    // 无效值（非数/NaN/Infinity/<1）抛 TypeError，不悄悄回默认——注意 0.5 取整是 0，
+    // 所以下限按 >= 1 判，不能只判 > 0。
     function resolveMaxBytes(options) {
-        if (!options || options.maxBytes === undefined || options.maxBytes === null) {
-            return HARD_MAX_HTML_BYTES;
+        if (!options) { return HARD_MAX_HTML_BYTES; }
+        var raw = options.maxBytes;
+        if (raw === undefined || raw === null) { raw = options.maxHTMLBytes; }
+        if (raw === undefined || raw === null) { return HARD_MAX_HTML_BYTES; }
+        if (typeof raw !== 'number' || !isFinite(raw) || raw < 1) {
+            throw new TypeError('Widget.html.load: maxBytes must be a finite number >= 1');
         }
-        var n = options.maxBytes;
-        if (typeof n !== 'number' || !isFinite(n) || n <= 0) {
-            throw new TypeError('Widget.html.load: maxBytes must be a positive finite number');
-        }
-        return Math.min(Math.floor(n), HARD_MAX_HTML_BYTES);
+        return Math.min(Math.floor(raw), HARD_MAX_HTML_BYTES);
     }
 
     // UTF-8 字节数。不用 TextEncoder：它在 JSC 里是否可用不确定，手动算是确定的。
@@ -136,31 +138,40 @@
 
     function loadURLImpl(url, options) {
         options = options || {};
+        // url 必须是字符串；null/undefined 不能 String() 成 "null"/"undefined" 再发出去。
+        if (url == null) {
+            return Promise.reject(new TypeError('Widget.html.loadURL: url must be a string'));
+        }
+        url = String(url);
         var httpOptions = {};
         if (options.headers) { httpOptions.headers = options.headers; }
         if (options.timeout !== undefined && options.timeout !== null) { httpOptions.timeout = options.timeout; }
-        var maxBytes = (options.maxBytes !== undefined && options.maxBytes !== null)
-            ? options.maxBytes
-            : options.maxHTMLBytes;
         var baseURIOverride = options.baseURI;
         // maxBytes 先验（无效就直接拒绝，不发请求；合法值由 loadImpl 里再钳制一次）。
-        try { resolveMaxBytes({ maxBytes: maxBytes }); } catch (e) { return Promise.reject(e); }
-        return g.Widget.http.get(String(url), httpOptions).then(function (res) {
-            if (res.status < 200 || res.status >= 300) {
-                var e = new Error('Widget.html.loadURL: HTTP ' + res.status + ' for ' + url);
+        try { resolveMaxBytes(options); } catch (e) { return Promise.reject(e); }
+        return g.Widget.http.get(url, httpOptions).then(function (res) {
+            // res 可能为空、status 可能不是数字：非数字按 0 算，非 2xx（含 0）按原约定
+            // 抛 HTMLHTTPError（带 .status 与 .finalUrl），不静默返回空文档。
+            var status = (res && typeof res.status === 'number') ? res.status : 0;
+            var finalUrl = (res && res.finalUrl) || url;
+            if (status < 200 || status >= 300) {
+                var e = new Error('Widget.html.loadURL: HTTP ' + status + ' for ' + url);
                 e.name = 'HTMLHTTPError';
-                e.status = res.status;
-                e.finalUrl = res.finalUrl || String(url);
+                e.status = status;
+                e.finalUrl = finalUrl;
                 throw e;
             }
             // data 可能是宿主解析过的 JSON 对象（见 WidgetHost.httpDataObject）：
             // 字符串原样用，对象转 JSON 文本（与注入的 fetch 的 text() 同款处理）。
             var html = (res.data == null) ? '' : (typeof res.data === 'string' ? res.data : JSON.stringify(res.data));
             var loadOptions = {};
-            if (maxBytes !== undefined) { loadOptions.maxBytes = maxBytes; }
+            if (options.maxBytes !== undefined && options.maxBytes !== null) { loadOptions.maxBytes = options.maxBytes; }
+            if (options.maxHTMLBytes !== undefined && options.maxHTMLBytes !== null) { loadOptions.maxHTMLBytes = options.maxHTMLBytes; }
+            if (typeof options.xml === 'boolean') { loadOptions.xml = options.xml; }
+            if (typeof options.decodeEntities === 'boolean') { loadOptions.decodeEntities = options.decodeEntities; }
             loadOptions.baseURI = (typeof baseURIOverride === 'string' && baseURIOverride)
                 ? baseURIOverride
-                : (res.finalUrl || String(url));
+                : finalUrl;
             return loadImpl(html, loadOptions);
         });
     }
@@ -169,4 +180,4 @@
         load: loadImpl,
         loadURL: loadURLImpl
     };
-})(this);
+})(typeof globalThis !== 'undefined' ? globalThis : this);

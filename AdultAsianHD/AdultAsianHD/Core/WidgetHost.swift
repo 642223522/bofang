@@ -71,6 +71,19 @@ final class WidgetHost: @unchecked Sendable {
     private static var categoryIdCache: [String: (id: String, at: Date)] = [:]
     private static let categoryIdCacheTTL: TimeInterval = 3600
 
+    /// Widget.html 的两个 .txt 资源（cheerio bundle + 胶水）：每进程只读一次盘，
+    /// __fwEnsureCheerio / 胶水加载时直接取缓存（读不到就是 nil，按“不可用”走）。
+    private static let cheerioBundle: String? = {
+        guard let url = Bundle.main.url(forResource: "cheerio.min", withExtension: "js.txt"),
+              let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty else { return nil }
+        return text
+    }()
+    private static let widgetHTMLGlue: String? = {
+        guard let url = Bundle.main.url(forResource: "WidgetHTML", withExtension: "js.txt"),
+              let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty else { return nil }
+        return text
+    }()
+
     enum WidgetHostError: Error, LocalizedError {
         case invalidFormat(String)
         case jsException(String)
@@ -571,11 +584,24 @@ final class WidgetHost: @unchecked Sendable {
             // 解析走 Foundation URL（RFC 3986），JS 侧只负责拼对象与抛错。
             // 不提供 createObjectURL/revokeObjectURL（没有 blob URL 的概念）。
             let resolveURL: @convention(block) (String, String?) -> NSDictionary? = { urlString, baseString in
-                let base = baseString.flatMap { URL(string: $0) }
-                guard let resolved = URL(string: urlString, relativeTo: base)?.absoluteURL,
-                      resolved.scheme != nil else { return nil }
+                // WHATWG：先去掉首尾 C0 控制字符与空格（U+0000–U+0020）；空串解析为 base 本身。
+                let stripSet = CharacterSet(charactersIn: UnicodeScalar(0)...UnicodeScalar(0x20))
+                let trimmed = urlString.trimmingCharacters(in: stripSet)
+                let trimmedBase = baseString?.trimmingCharacters(in: stripSet)
+                let base = trimmedBase.flatMap { URL(string: $0) }
+                // base 传了但解析失败 → 无效（WHATWG 会抛），不能悄悄当成没传 base。
+                if baseString != nil, base == nil { return nil }
+                // 空串（或只剩空白）解析为 base 本身；没有 base 时无效。
+                let resolved: URL?
+                if trimmed.isEmpty {
+                    resolved = base?.absoluteURL
+                } else {
+                    resolved = URL(string: trimmed, relativeTo: base)?.absoluteURL
+                }
+                guard let resolved, resolved.scheme != nil else { return nil }
                 let scheme = resolved.scheme!.lowercased()
-                let host = resolved.host ?? ""
+                // host 小写（WHATWG 小写 host，Foundation 保留输入大小写）。
+                let host = (resolved.host ?? "").lowercased()
                 let port = resolved.port
                 let defaultPort: Int? = {
                     switch scheme {
@@ -628,11 +654,110 @@ final class WidgetHost: @unchecked Sendable {
             context.evaluateScript("""
                 (function (g) {
                     if (typeof g.URL === 'function') { return; }
+                    // 最小 URLSearchParams：模块用 typeof URL 做特性探测时，会认为 searchParams
+                    // 可用；没有它，new URL(...).searchParams.get(...) 会抛 TypeError。
+                    // 只实现查询串解析与 get/getAll/has/set/append/delete/toString。
+                    // '+' 按空格解（application/x-www-form-urlencoded）；解码失败时保留原串不抛。
+                    // 注意：这里故意不用正则（Swift 多行字符串里反斜杠要双写，容易错），
+                    // 全部用 split/join 做，JS 文本里一个反斜杠也没有。
+                    var URLSearchParams = function (init) {
+                        this._pairs = [];
+                        var decode = function (s) {
+                            var spaced = s.split('+').join(' ');
+                            try { return decodeURIComponent(spaced); } catch (e) { return spaced; }
+                        };
+                        var parseString = function (str, pairs) {
+                            if (str.charAt(0) === '?') { str = str.slice(1); }
+                            if (!str) { return; }
+                            var parts = str.split('&');
+                            for (var i = 0; i < parts.length; i++) {
+                                var kv = parts[i].split('=');
+                                var k = decode(kv[0]);
+                                var v = kv.length > 1 ? decode(kv.slice(1).join('=')) : '';
+                                pairs.push([k, v]);
+                            }
+                        };
+                        if (typeof init === 'string') {
+                            parseString(init, this._pairs);
+                        } else if (init && typeof init === 'object') {
+                            if (init._pairs && init._pairs.length !== undefined) {
+                                for (var a = 0; a < init._pairs.length; a++) {
+                                    this._pairs.push([String(init._pairs[a][0]), String(init._pairs[a][1])]);
+                                }
+                            } else if (Array.isArray(init)) {
+                                for (var b = 0; b < init.length; b++) {
+                                    this._pairs.push([String(init[b][0]), String(init[b][1])]);
+                                }
+                            } else {
+                                for (var key in init) {
+                                    if (Object.prototype.hasOwnProperty.call(init, key)) {
+                                        this._pairs.push([key, String(init[key])]);
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    URLSearchParams.prototype.get = function (name) {
+                        name = String(name);
+                        for (var i = 0; i < this._pairs.length; i++) {
+                            if (this._pairs[i][0] === name) { return this._pairs[i][1]; }
+                        }
+                        return null;
+                    };
+                    URLSearchParams.prototype.getAll = function (name) {
+                        name = String(name);
+                        var out = [];
+                        for (var i = 0; i < this._pairs.length; i++) {
+                            if (this._pairs[i][0] === name) { out.push(this._pairs[i][1]); }
+                        }
+                        return out;
+                    };
+                    URLSearchParams.prototype.has = function (name) {
+                        return this.get(name) !== null;
+                    };
+                    URLSearchParams.prototype.set = function (name, value) {
+                        name = String(name);
+                        value = String(value);
+                        var kept = [];
+                        var found = false;
+                        for (var i = 0; i < this._pairs.length; i++) {
+                            if (this._pairs[i][0] === name) {
+                                if (!found) { kept.push([name, value]); found = true; }
+                            } else {
+                                kept.push(this._pairs[i]);
+                            }
+                        }
+                        if (!found) { kept.push([name, value]); }
+                        this._pairs = kept;
+                    };
+                    URLSearchParams.prototype.append = function (name, value) {
+                        this._pairs.push([String(name), String(value)]);
+                    };
+                    URLSearchParams.prototype.delete = function (name) {
+                        name = String(name);
+                        var kept = [];
+                        for (var i = 0; i < this._pairs.length; i++) {
+                            if (this._pairs[i][0] !== name) { kept.push(this._pairs[i]); }
+                        }
+                        this._pairs = kept;
+                    };
+                    URLSearchParams.prototype.toString = function () {
+                        var encode = function (s) {
+                            return encodeURIComponent(s).split('%20').join('+');
+                        };
+                        var out = [];
+                        for (var i = 0; i < this._pairs.length; i++) {
+                            out.push(encode(this._pairs[i][0]) + '=' + encode(this._pairs[i][1]));
+                        }
+                        return out.join('&');
+                    };
                     var URL = function (url, base) {
                         if (!(this instanceof URL)) {
                             throw new TypeError("Failed to construct 'URL': Please use the 'new' operator");
                         }
-                        var parts = g.__fwResolveURL(String(url), base == null ? null : String(base));
+                        // base 只有 undefined 算省略；null 要透传成 "null"（WHATWG 里 null 不是省略，
+                        // Swift 侧解析失败会返回 nil，这里抛 Invalid URL）。
+                        var parts = g.__fwResolveURL(String(url), base === undefined ? null : String(base));
                         if (!parts) { throw new TypeError('Invalid URL'); }
                         this.href = parts.href;
                         this.protocol = parts.protocol;
@@ -643,18 +768,19 @@ final class WidgetHost: @unchecked Sendable {
                         this.search = parts.search;
                         this.hash = parts.hash;
                         this.origin = parts.origin;
+                        this.searchParams = new URLSearchParams(this.search);
                     };
                     URL.prototype.toString = function () { return this.href; };
                     URL.prototype.toJSON = function () { return this.href; };
                     g.URL = URL;
+                    g.URLSearchParams = URLSearchParams;
                 })(this);
                 """)
 
 
-            guard let bundleURL = Bundle.main.url(forResource: "cheerio.min", withExtension: "js.txt"),
-                  let bundle = try? String(contentsOf: bundleURL, encoding: .utf8),
-                  !bundle.isEmpty else { return false }
-            context.evaluateScript(bundle)
+            guard let bundle = Self.cheerioBundle else { return false }
+            // withSourceURL 让堆栈里有文件名（否则 bundle 抛错时只剩匿名脚本）。
+            context.evaluateScript(bundle, withSourceURL: URL(string: "host://cheerio.min.js.txt"))
             guard let fn = context.objectForKeyedSubscript("__fwCheerioLoad"), !fn.isUndefined, !fn.isNull else {
                 // 注入失败的诊断：bundle 解析错与资源缺失走同一条 false 路，DEBUG 下把
                 // JS 侧的异常打出来区分（不影响返回值；异常读完就清掉，别让它留着污染后事）。
@@ -666,6 +792,8 @@ final class WidgetHost: @unchecked Sendable {
                 context.exception = nil
                 return false
             }
+            // 成功也清掉（防之前的 eval 留了 stale 异常，误算到后事头上）。
+            context.exception = nil
             return true
         }
         context.setObject(ensureCheerio as @convention(block) () -> Bool, forKeyedSubscript: "__fwEnsureCheerio" as NSString)
@@ -673,9 +801,15 @@ final class WidgetHost: @unchecked Sendable {
         // Widget.html 的胶水（load/loadURL/护栏）在 Core/WidgetHTML.js.txt 里：
         // 读不到就跳过——模块调 Widget.html.load 时再报“不可用”，不连累整个桥。
         // 必须在 Widget 对象挂上之后再评（胶水里写 g.Widget.html = ...）。
-        if let glueURL = Bundle.main.url(forResource: "WidgetHTML", withExtension: "js.txt"),
-           let glue = try? String(contentsOf: glueURL, encoding: .utf8), !glue.isEmpty {
-            context.evaluateScript(glue)
+        // withSourceURL 让堆栈里有文件名；胶水抛错时 DEBUG 下打出来并清掉异常。
+        if let glue = Self.widgetHTMLGlue {
+            context.evaluateScript(glue, withSourceURL: URL(string: "host://WidgetHTML.js.txt"))
+            #if DEBUG
+            if let exception = context.exception {
+                print("[WidgetHost] WidgetHTML 胶水注入失败：\(exception.toString() ?? "")")
+            }
+            #endif
+            context.exception = nil
         }
 
         // __fwArrayBufferFromBytes（内部助手，Widget.http 回值 .arrayBuffer 用）：
