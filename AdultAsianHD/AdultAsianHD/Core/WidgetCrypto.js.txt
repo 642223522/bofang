@@ -34,6 +34,15 @@
 (function (g) {
     'use strict';
 
+    // 把 6 个原生原语收进闭包局部变量（胶水加载后 Swift 侧会删掉全局上的 __fwCrypto*，
+    // 模块就调不到原语、绕不过胶水的校验；胶水内部用这里的局部变量继续调原语）。
+    var _aesEncrypt = g.__fwCryptoAESEncrypt;
+    var _aesDecrypt = g.__fwCryptoAESDecrypt;
+    var _xor = g.__fwCryptoXOR;
+    var _hash = g.__fwCryptoHash;
+    var _hmac = g.__fwCryptoHMAC;
+    var _randomBytes = g.__fwCryptoRandomBytes;
+
     // ---------- 基础工具 ----------
 
     var MAX_INPUT_BYTES = 5 * 1024 * 1024;
@@ -57,12 +66,22 @@
         var bytes = [];
         for (var i = 0; i < str.length; i++) {
             var cp = str.charCodeAt(i);
-            if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < str.length) {
-                var lo = str.charCodeAt(i + 1);
-                if (lo >= 0xDC00 && lo <= 0xDFFF) {
-                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                    i++;
+            // 孤立代理（高代理后不跟低代理，或单独的低代理）是无效 UTF-16，必须抛错，
+            // 不能悄悄编成 3 字节的 CESU-8（那是无效 UTF-8，与 utf8Decode 的拦截不一致）。
+            if (cp >= 0xD800 && cp <= 0xDBFF) {
+                if (i + 1 < str.length) {
+                    var lo = str.charCodeAt(i + 1);
+                    if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        i++;
+                    } else {
+                        throw new TypeError('isolated surrogate in input string');
+                    }
+                } else {
+                    throw new TypeError('isolated surrogate in input string');
                 }
+            } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                throw new TypeError('isolated surrogate in input string');
             }
             if (cp < 0x80) {
                 bytes.push(cp);
@@ -150,6 +169,11 @@
         var t = String(s).replace(/[\t\n\f\r ]/g, '');
         if (urlSafe) { t = t.replace(/-/g, '+').replace(/_/g, '/'); }
         if (/[^A-Za-z0-9+/=]/.test(t)) { throw new TypeError('invalid base64 input'); }
+        // '=' 只能是末尾的填充（最多 2 个）。中间出现（"AB=C"、"AB=A"）是非法输入，
+        // 必须抛错，不能多解出字节。
+        var stripped = t.replace(/=+$/, '');
+        if (stripped.indexOf('=') !== -1) { throw new TypeError('invalid base64 input'); }
+        if (t.length - stripped.length > 2) { throw new TypeError('invalid base64 input'); }
         var rem = t.length % 4;
         if (rem === 1) { throw new TypeError('invalid base64 input'); }
         if (rem !== 0) { t += '==='.slice(0, 4 - rem); }
@@ -331,8 +355,10 @@
         }
 
         var tagB64 = null;
-        if (mode === 'GCM' && opts.tag !== undefined && opts.tag !== null && String(opts.tag) !== '') {
+        if (mode === 'GCM' && opts.tag !== undefined && opts.tag !== null) {
             if (typeof opts.tag !== 'string') { throw new TypeError('tag must be a string'); }
+            // 显式传了空字符串 tag 是错（tag 必须是 16 字节），别当成“没传”去拆输入。
+            if (String(opts.tag) === '') { throw new TypeError('tag must not be empty'); }
             tagB64 = strToB64(opts.tag, tagEnc);
             checkByteLength(tagB64, [16], 'tag');
         }
@@ -380,13 +406,22 @@
             tagB64 = bytesToB64(bytes.slice(bytes.length - 16));
             dataB64 = bytesToB64(bytes.slice(0, bytes.length - 16));
         }
-        var res = checkNative(g.__fwCryptoAESDecrypt(dataB64, p.keyB64, p.ivB64, p.mode, p.padding, tagB64, p.aadB64));
-        return b64ToStr(res.plaintext, p.outputEnc);
+        var res = checkNative(_aesDecrypt(dataB64, p.keyB64, p.ivB64, p.mode, p.padding, tagB64, p.aadB64));
+        // padding:'zero' 的解密：去尾部 0x00（zero padding 的定义；不去的话尾部 \0
+        // 会进 UTF-8 字符串，JSON.parse 直接抛错）。
+        var ptB64 = res.plaintext;
+        if (p.padding === 'zero') {
+            var ptBytes = b64ToBytes(ptB64, false);
+            var end = ptBytes.length;
+            while (end > 0 && ptBytes[end - 1] === 0) { end--; }
+            ptB64 = bytesToB64(ptBytes.slice(0, end));
+        }
+        return b64ToStr(ptB64, p.outputEnc);
     }
 
     function aesEncrypt(data, key, options) {
         var p = prepareAES(data, key, options, true);
-        var res = checkNative(g.__fwCryptoAESEncrypt(p.dataB64, p.keyB64, p.ivB64, p.mode, p.padding, p.aadB64));
+        var res = checkNative(_aesEncrypt(p.dataB64, p.keyB64, p.ivB64, p.mode, p.padding, p.aadB64));
         // GCM：默认把 tag 拼在密文末尾（返回 base64(ciphertext + tag)）。
         var outB64 = res.ciphertext;
         if (p.mode === 'GCM' && res.tag) {
@@ -410,7 +445,7 @@
         var keyB64 = strToB64(key, keyEnc);
         checkMaxBytes(dataB64, 'data');
         if (b64ByteLength(keyB64) === 0) { throw new TypeError('key must not be empty'); }
-        var res = checkNative(g.__fwCryptoXOR(dataB64, keyB64));
+        var res = checkNative(_xor(dataB64, keyB64));
         return b64ToStr(res.result, outputEnc);
     }
 
@@ -458,7 +493,8 @@
     // ---------- hash / hmac ----------
 
     function normHashAlgorithm(algo) {
-        var a = String(algo || 'sha256').toLowerCase().replace(/-/g, '');
+        if (algo === undefined || algo === null) { return 'sha256'; }
+        var a = String(algo).toLowerCase().replace(/-/g, '');
         if (a === 'md5' || a === 'sha1' || a === 'sha256' || a === 'sha512') { return a; }
         throw new TypeError('unknown hash algorithm: ' + String(algo));
     }
@@ -471,7 +507,7 @@
         if (typeof data !== 'string') { throw new TypeError('data must be a string'); }
         var dataB64 = strToB64(data, inputEnc);
         checkMaxBytes(dataB64, 'data');
-        var res = checkNative(g.__fwCryptoHash(algorithm, dataB64));
+        var res = checkNative(_hash(algorithm, dataB64));
         // 原语返回 hex；outputEncoding 为 hex 时直接返回，否则转码。
         if (outputEnc === 'hex') { return res.result; }
         return b64ToStr(bytesToB64(hexToBytes(res.result)), outputEnc);
@@ -488,7 +524,7 @@
         var dataB64 = strToB64(data, inputEnc);
         var keyB64 = strToB64(key, keyEnc);
         checkMaxBytes(dataB64, 'data');
-        var res = checkNative(g.__fwCryptoHMAC(algo, dataB64, keyB64));
+        var res = checkNative(_hmac(algo, dataB64, keyB64));
         if (outputEnc === 'hex') { return res.result; }
         return b64ToStr(bytesToB64(hexToBytes(res.result)), outputEnc);
     }
@@ -501,7 +537,7 @@
         if (typeof n !== 'number' || Math.floor(n) !== n || n < 0 || n > MAX_RANDOM_BYTES) {
             throw new RangeError('n must be an integer 0...' + MAX_RANDOM_BYTES);
         }
-        var res = checkNative(g.__fwCryptoRandomBytes(n));
+        var res = checkNative(_randomBytes(n));
         return b64ToStr(res.result, outputEnc);
     }
 
@@ -517,28 +553,47 @@
         hexDecode: hexDecode,
         hash: hash,
         md5: function (data, options) {
-            var opts = isObject(options) ? options : {};
+            // 浅拷贝：别改写调用方传进来的 options 对象。
+            var opts = {};
+            if (isObject(options)) {
+                for (var k in options) { opts[k] = options[k]; }
+            }
             opts.algorithm = 'md5';
             return hash(data, opts);
         },
         sha1: function (data, options) {
-            var opts = isObject(options) ? options : {};
+            // 浅拷贝：别改写调用方传进来的 options 对象。
+            var opts = {};
+            if (isObject(options)) {
+                for (var k in options) { opts[k] = options[k]; }
+            }
             opts.algorithm = 'sha1';
             return hash(data, opts);
         },
         sha256: function (data, options) {
-            var opts = isObject(options) ? options : {};
+            // 浅拷贝：别改写调用方传进来的 options 对象。
+            var opts = {};
+            if (isObject(options)) {
+                for (var k in options) { opts[k] = options[k]; }
+            }
             opts.algorithm = 'sha256';
             return hash(data, opts);
         },
         sha512: function (data, options) {
-            var opts = isObject(options) ? options : {};
+            // 浅拷贝：别改写调用方传进来的 options 对象。
+            var opts = {};
+            if (isObject(options)) {
+                for (var k in options) { opts[k] = options[k]; }
+            }
             opts.algorithm = 'sha512';
             return hash(data, opts);
         },
         hmac: hmac,
         randomBytes: randomBytes
     };
+
+    // 冻住 Widget.crypto 及其方法，防止模块互相篡改。
+    Object.freeze(crypto);
 
     if (g.Widget) {
         g.Widget.crypto = crypto;

@@ -145,7 +145,7 @@ enum WidgetCrypto {
         let pad = padding.lowercased()
         var options: CCOptions = 0
         if pad == "pkcs7" {
-            options |= CC_OPTIONS_PKCS7_PADDING
+            options |= CCOptions(kCCOptionPKCS7Padding)
         } else if pad == "none" {
             // 不传 PKCS7 选项即无填充。
         } else if pad == "zero" {
@@ -154,7 +154,7 @@ enum WidgetCrypto {
         } else {
             throw CryptoError.invalidParameter("unknown padding: \(padding)")
         }
-        if isECB { options |= CC_OPTIONS_ECB_MODE }
+        if isECB { options |= CCOptions(kCCOptionECBMode) }
 
         let algorithm = CCAlgorithm(kCCAlgorithmAES)
         let op: CCOperation = encrypt ? CCOperation(kCCEncrypt) : CCOperation(kCCDecrypt)
@@ -177,14 +177,27 @@ enum WidgetCrypto {
             )
         }
         guard status == kCCSuccess else {
-            throw CryptoError.failure(code: status == kCCAlignmentError ? "CRYPTO_ALIGNMENT_ERROR" : "CRYPTO_BAD_PADDING",
-                                      message: "CCCrypt failed with status \(status)")
+            // 坏 padding 是 kCCDecodeError；对齐错是 kCCAlignmentError；其余（参数/内存/缓冲）
+            // 不是 padding 问题，报 CRYPTO_OS_ERROR，别一律扣成 BAD_PADDING。
+            let code: String
+            switch status {
+            case kCCAlignmentError: code = "CRYPTO_ALIGNMENT_ERROR"
+            case kCCDecodeError: code = "CRYPTO_BAD_PADDING"
+            default: code = "CRYPTO_OS_ERROR"
+            }
+            throw CryptoError.failure(code: code, message: "CCCrypt failed with status \(status)")
         }
         out.count = outLength
         return out
     }
 
-    // MARK: CTR（ECB 加密计数器块 + XOR，标准 CTR 构造）
+    // MARK: CTR（ECB 批量加密计数器块 + XOR，标准 CTR 构造）
+    //
+    // CCCryptorCreateWithMode 在公开头文件 CommonCryptor.h 里（Gemini 核实），但为稳妥
+    // 仍用肯定公开的 CCCrypt(ECB) 做计数器加密——ECB+计数器就是标准 CTR，NIST 向量验证。
+    // 性能：把所有计数器块拼成一个 Data 单次 ECB 加密（不再每块调一次 CCCrypt；
+    // 5MB 要调 327,680 次会卡死同步 JS 线程）。计数器 16 字节大端整体递增，每块 +1，
+    // 全 FF 回绕到全 0（计数器可从接近上限的值开始，回绕必须正确）。
 
     private static func aesCTRCrypt(data: Data, key: Data, iv: Data?) throws -> Data {
         guard [16, 24, 32].contains(key.count) else {
@@ -193,21 +206,13 @@ enum WidgetCrypto {
         guard let iv = iv, iv.count == 16 else {
             throw CryptoError.invalidParameter("CTR iv must be 16 bytes")
         }
-        // 空数据直接返回空（计数器不用走）。
         if data.isEmpty { return Data() }
-        // 计数器：16 字节大端整数，初始值 = IV，每块 +1（mod 2^128）。
+        let blockCount = (data.count + 15) / 16
+        // 所有计数器块拼成一个 Data（每块 = 当前计数器，16 字节大端，+1）。
+        var counterBlocks = Data(capacity: blockCount * 16)
         var counter = [UInt8](iv)
-        var out = Data(capacity: data.count)
-        var offset = 0
-        while offset < data.count {
-            // 用 ECB 加密当前计数器块，得到 16 字节 keystream。
-            let keystream = try aesECBBlock(key: key, block: counter)
-            let chunkLen = min(16, data.count - offset)
-            for i in 0..<chunkLen {
-                out.append(data[offset + i] ^ keystream[i])
-            }
-            offset += chunkLen
-            // 计数器 +1（大端，从末字节往前加）。
+        for _ in 0..<blockCount {
+            counterBlocks.append(contentsOf: counter)
             var j = 15
             while j >= 0 {
                 if counter[j] == 0xFF {
@@ -219,25 +224,12 @@ enum WidgetCrypto {
                 }
             }
         }
-        return out
-    }
-
-    /// 单块 AES-ECB 加密（16 字节输入 → 16 字节输出），供 CTR 计数器用。
-    private static func aesECBBlock(key: [UInt8], block: [UInt8]) throws -> [UInt8] {
-        precondition(block.count == 16)
-        var out = [UInt8](repeating: 0, count: 16)
-        var outLength: Int = 0
-        let status = CCCrypt(
-            CCOperation(kCCEncrypt), CCAlgorithm(kCCAlgorithmAES),
-            CCOptions(kCCOptionECBMode),
-            key, key.count,
-            nil,
-            block, 16,
-            &out, 16,
-            &outLength
-        )
-        guard status == kCCSuccess, outLength == 16 else {
-            throw CryptoError.failure(code: "CRYPTO_OS_ERROR", message: "ECB block encrypt failed with status \(status)")
+        // 单次 ECB 加密全部计数器块（无填充；长度是 16 的倍数），得到 keystream。
+        let keystream = try aesCCCrypt(data: counterBlocks, key: key, iv: nil, encrypt: true, mode: "ECB", padding: "none")
+        // XOR（最后一块不足 16 字节时只取 keystream 的前 n 字节，不补齐）。
+        var out = Data(capacity: data.count)
+        for i in 0..<data.count {
+            out.append(data[i] ^ keystream[i])
         }
         return out
     }
@@ -254,8 +246,8 @@ enum WidgetCrypto {
         let symKey = SymmetricKey(data: key)
         let nonce: AES.GCM.Nonce
         do {
-            // 12 字节 nonce 用标准构造；16 字节 nonce 也经此构造（CryptoKit 接受任意长度，
-            // 内部按 GCM 规范处理；若将来实测 16 字节被拒，错误会以 CRYPTO_OS_ERROR 抛出）。
+            // Nonce(data:) 只在长度 <12 字节时抛错（Apple 文档 + swift-crypto Nonces.swift
+            // 核实），12 或 16 字节都接受；真机再用 16 字节 nonce 的已知向量做 seal/open 互操作确认。
             nonce = try AES.GCM.Nonce(data: iv)
         } catch {
             throw CryptoError.invalidParameter("invalid GCM nonce: \(error)")
@@ -297,8 +289,12 @@ enum WidgetCrypto {
 
     // MARK: XOR
 
-    static func xor(data: Data, key: Data) -> Data {
-        guard !key.isEmpty else { return data }
+    static func xor(data: Data, key: Data) throws -> Data {
+        // 空 key 取模会除零崩溃；且空 key 时原样返回数据是静默失败，必须抛错。
+        // （JS 胶水已拦空 key，这里是最后一道防线。）
+        guard !key.isEmpty else {
+            throw CryptoError.invalidParameter("key must not be empty")
+        }
         var out = Data(capacity: data.count)
         for (i, byte) in data.enumerated() {
             out.append(byte ^ key[i % key.count])
@@ -360,6 +356,7 @@ enum WidgetCrypto {
         guard count >= 0 && count <= maxRandomBytes else {
             throw CryptoError.outOfRange("randomBytes count must be 0...\(maxRandomBytes), got \(count)")
         }
+        if count == 0 { return Data() }
         var bytes = [UInt8](repeating: 0, count: count)
         let status = SecRandomCopyBytes(kSecRandomDefault, count, &bytes)
         guard status == errSecSuccess else {
@@ -456,7 +453,13 @@ extension WidgetCrypto {
             guard data.count <= maxInputBytes else {
                 return ["ok": false, "code": "RANGE", "message": "input exceeds \(maxInputBytes) bytes"]
             }
-            return ["ok": true, "result": xor(data: data, key: key).base64EncodedString()]
+            do {
+                return ["ok": true, "result": try xor(data: data, key: key).base64EncodedString()]
+            } catch let e as CryptoError {
+                return errDict(e)
+            } catch {
+                return ["ok": false, "code": "CRYPTO_OS_ERROR", "message": "\(error)"]
+            }
         }
 
         // Hash：(algorithm, dataB64) → {ok, result}（result 为 hex 小写）。
@@ -512,9 +515,15 @@ extension WidgetCrypto {
         context.setObject(randomBlock as @convention(block) (Int) -> NSDictionary, forKeyedSubscript: "__fwCryptoRandomBytes" as NSString)
 
         // JS 胶水（Core/WidgetCrypto.js.txt）：组装 Widget.crypto.* 友好 API。
+        // 读不到胶水时打日志（全构建，不只 DEBUG）——否则模块调 Widget.crypto 才报
+        // "不可用"，根因难查。胶水评完后删掉全局上的 6 个原语：胶水已把它们收进闭包
+        // 局部变量，删全局不影响胶水内部调用，但模块就调不到原语、绕不过胶水的校验。
         if let url = Bundle.main.url(forResource: "WidgetCrypto", withExtension: "js.txt"),
            let glue = try? String(contentsOf: url, encoding: .utf8) {
             context.evaluateScript(glue, withSourceURL: URL(string: "host://WidgetCrypto.js.txt"))
+            context.evaluateScript("delete this.__fwCryptoAESEncrypt; delete this.__fwCryptoAESDecrypt; delete this.__fwCryptoXOR; delete this.__fwCryptoHash; delete this.__fwCryptoHMAC; delete this.__fwCryptoRandomBytes;")
+        } else {
+            print("[WidgetCrypto] WidgetCrypto.js.txt 读不到，Widget.crypto 不可用")
         }
     }
 }
