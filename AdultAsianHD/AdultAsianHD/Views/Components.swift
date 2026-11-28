@@ -135,11 +135,18 @@ final class CoverImageCache: @unchecked Sendable {
                 if let prepared = uiImage.preparingForDisplay() {
                     uiImage = prepared
                 }
-                // 更新修改时间用于 LRU 淘汰
-                var mutableURL = fileURL
-                var values = URLResourceValues()
-                values.contentModificationDate = Date()
-                try? mutableURL.setResourceValues(values)
+                // 更新修改时间用于 LRU 淘汰：只在文件超过 1 天没碰过时才写——
+                // 每次磁盘命中都无条件写 contentModificationDate 是一次
+                // 无谓的元数据写盘（高频封面命中时很浪费）；1 天粒度对
+                // 14 天 TTL + 100MB 容量的 LRU 排序已足够。
+                let lastAccess = (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                let staleAccess = lastAccess.map { Date().timeIntervalSince($0) > 24 * 3600 } ?? true
+                if staleAccess {
+                    var mutableURL = fileURL
+                    var values = URLResourceValues()
+                    values.contentModificationDate = Date()
+                    try? mutableURL.setResourceValues(values)
+                }
 
                 self.memoryCache.setObject(uiImage, forKey: key as NSString, cost: Self.memoryCost(of: uiImage))
                 continuation.resume(returning: uiImage)
@@ -319,7 +326,16 @@ struct CoverImage: View {
                           let img = UIImage(data: decoded) else { return nil }
                     return (decoded, img.preparingForDisplay() ?? img)
                 }.value
-                guard let (decoded, uiImage) = decodedImage else { continue }
+                guard let (decoded, uiImage) = decodedImage else {
+                    // 解码失败（非图片、解密失败）也要 500ms 退避再重试一次：
+                    // 以前 continue 直接重发，等于无退避连打两下。
+                    // 不直接退出：数据可能只是下载截断，加密封面（黄果）重试
+                    // 仍有机会拿到完整字节；退避后重试一次即可。
+                    if attempt == 0 {
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                    }
+                    continue
+                }
                 CoverImageCache.shared.store(uiImage, rawDecodedData: decoded, for: urlString)
                 if !Task.isCancelled { image = uiImage }
                 return

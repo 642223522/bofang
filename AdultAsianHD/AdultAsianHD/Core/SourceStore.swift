@@ -1,7 +1,5 @@
 import Foundation
 import Security
-import Network
-import AVFoundation
 
 /// 源管理：导入 / 删除 / 导出 / 码云同步。
 /// 源文件：Documents/Sources/<fileName>（一个模块一个 .js 文件）；
@@ -156,6 +154,11 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             }
             self.saveManifest()
         }
+        // 原地覆盖已有源：同 id 旧源的本会话竞速状态（已竞标记 + 首选线）
+        // 一并清掉，否则新内容沿用旧首选线、且不再自动竞速（与 delete() 同款）。
+        if existing != nil {
+            clearSessionRaceState(for: record.id)
+        }
         // 旧记录换了文件名时清掉旧文件（现逻辑里既有记录沿用旧文件名，
         // 正常走不到这里；留作防卫，避免孤儿 .js 攒在 Sources 里）。
         if let oldFileName = existing?.fileName, oldFileName != finalName {
@@ -171,7 +174,9 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
               url.scheme == "http" || url.scheme == "https" else {
             return .failure(.network("这个链接格式不对，复制完整的 http(s) 链接再试"))
         }
-        let config = URLSessionConfiguration.default
+        // 临时会话：不留持久缓存/凭证，.js 只走这一次下载，不进共享缓存。
+        let config = URLSessionConfiguration.ephemeral
+        config.urlCache = nil
         config.timeoutIntervalForRequest = 15
         config.timeoutIntervalForResource = 30
         let session = URLSession(configuration: config)

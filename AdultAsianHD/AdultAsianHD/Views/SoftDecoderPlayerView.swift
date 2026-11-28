@@ -122,6 +122,13 @@ final class SoftDecoderPlayerController: ObservableObject {
     /// 拖动中：拖动时只改本地 currentTime，不向 KSPlayer 狂发 seek；
     /// handleTime 回写也暂停，松手 endScrub 一次 seek。
     private var isScrubbing = false
+    /// 松手 seek 在途（endScrub 发起、seek 回调回来之前）：handleTime 也要拦，
+    /// 否则 seek 没落点前进度回调会把进度条弹回旧位置；与 isScrubbing 分开，
+    /// 拖动结束（isScrubbing=false）不等于 seek 已完成。
+    private var isSeeking = false
+    /// 松手 seek 代际：beginScrub/endScrub/buildLayer/teardownLayer 递增，
+    /// 旧 seek 回调回来时对不上号就丢弃，不覆盖用户暂停/新拖动/新层。
+    private var seekToken: UInt64 = 0
     private var hideTask: Task<Void, Never>?
     /// 加载超时兜底：15 秒未出帧即按失败走切线（KSPlayer 有些失败只停住
     /// 不调 finish，不能让界面永远卡在“正在解析播放线路…”）。
@@ -211,6 +218,9 @@ final class SoftDecoderPlayerController: ObservableObject {
     /// （Referer/UA/头、续播点、硬解优先、不注册远程控制）。
     /// KSPlayerLayer(url:options:delegate:) 的签名见官方示例原文。
     private func buildLayer(url: URL, headers: [String: String]?, resumeAt: Double) {
+        // 新层：旧 seek 回调作废（代际+1），在途标志清掉。
+        seekToken &+= 1
+        isSeeking = false
         teardownLayer()
         let options = SoftDecoderSupport.makeOptions(headers: headers, startPlayTime: resumeAt)
         let delegate = SoftDecoderLayerDelegate(controller: self)
@@ -224,6 +234,9 @@ final class SoftDecoderPlayerController: ObservableObject {
 
     /// 拆层（换片/停播时调）：停播销毁，不后台继续播；画面 view 一并摘掉。
     private func teardownLayer() {
+        // 拆层：旧 seek 回调作废（代际+1），在途标志清掉（回调永不回来也不卡住）。
+        seekToken &+= 1
+        isSeeking = false
         loadTimeoutTask?.cancel()
         loadTimeoutTask = nil
         playerLayer?.player.view?.removeFromSuperview()
@@ -281,7 +294,7 @@ final class SoftDecoderPlayerController: ObservableObject {
     /// 进度回调：直接记当前时间与总时长（与原生周期观察同义）。
     /// 拖动中不回写（KSPlayer 还没 seek 完，回写会把用户刚拖到的时间 snap 回旧时间）。
     func handleTime(currentTime: TimeInterval, totalTime: TimeInterval) {
-        guard !isScrubbing else { return }
+        guard !isScrubbing, !isSeeking else { return }
         self.currentTime = currentTime
         if totalTime.isFinite, totalTime > 0 { duration = totalTime }
     }
@@ -324,7 +337,7 @@ final class SoftDecoderPlayerController: ObservableObject {
         guard let url = lastURL, didMarkFailedURL != url else { return }
         didMarkFailedURL = url
         loadTimeoutTask?.cancel()
-        viewModel.markFailed(message)
+        viewModel.markFailed(message, failedURL: url)
     }
 
     // MARK: - 播放 / 暂停 / 快进
@@ -355,6 +368,9 @@ final class SoftDecoderPlayerController: ObservableObject {
     /// 松手不续播；shouldPlay 只有用户点暂停才变 false（与原生同款）。
     func beginScrub() {
         isScrubbing = true
+        // 新拖动：旧的松手 seek 回调作废（代际+1），在途标志清掉。
+        seekToken &+= 1
+        isSeeking = false
         wasPlayingBeforeScrub = shouldPlay
         hideTask?.cancel()
         controlsVisible = true
@@ -372,20 +388,37 @@ final class SoftDecoderPlayerController: ObservableObject {
 
     /// 松手：精确定位到拖到的位置；拖之前在播就恢复播放（不拖完停在暂停态）。
     func endScrub(to seconds: Double) {
+        // 先清拖动标志再判时长：duration <= 0 早退也不能把 isScrubbing 落下，
+        // 否则进度条永久冻结。
+        isScrubbing = false
         guard duration > 0 else { return }
         let clamped = min(max(seconds, 0), duration)
         currentTime = clamped
-        isScrubbing = false
         let resume = wasPlayingBeforeScrub
+        // 意图提前在发起 seek 时写入：seek 途中用户点暂停会把 shouldPlay 改 false，
+        // 回调按最新意图决定，不强行续播。
+        shouldPlay = resume
+        seekToken &+= 1
+        let token = seekToken
+        guard let layer = playerLayer else {
+            isSeeking = false
+            return
+        }
+        // isScrubbing 已清、isSeeking 接棒拦 handleTime：seek 没落点前进度条
+        // 锁在拖到的目标不动，不弹回旧位置。
+        isSeeking = true
         // autoPlay 必须 false：续播由 seek 完成回调里显式决定，不能让 seek 自己播
         //（否则拖之前是暂停也会被播起来）；seek 是异步的，play() 必须等 seek
         // 完成回调后再发，立即 play 会从旧位置先播一截再跳，与 seek 抢跑
         //（与原生 playByUser 在 seek 在途时不直接 play 同源）。
-        playerLayer?.seek(time: clamped, autoPlay: false) { [weak self] _ in
+        layer.seek(time: clamped, autoPlay: false) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self, resume else { return }
-                self.shouldPlay = true
-                self.playerLayer?.play()
+                // 代际/层身份双校验：旧回调（用户已暂停/新拖动/切线换层）直接丢弃。
+                guard let self, self.seekToken == token, self.playerLayer === layer else { return }
+                self.isSeeking = false
+                guard !self.isScrubbing, self.shouldPlay else { return }
+                layer.play()
+                self.showControlsTemporarily()
             }
         }
     }
@@ -581,6 +614,10 @@ struct SoftDecoderKSView: UIViewRepresentable {
 /// 全屏按钮（横屏呈现，退出回原位）。离开页面 onDisappear 即停播。
 struct SoftDecoderPlayerView: View {
     @ObservedObject var viewModel: PlayerViewModel
+    /// 全屏状态上行到 DetailView：与 .webView 的 onFullscreenChange 同款回调模式，
+    /// DetailView 接上后与 CustomPlayerView / .webView 共用同一个 @State isFullscreen，
+    /// 靠它判断 onDisappear 是不是全屏引起的。
+    var onFullscreenChange: ((Bool) -> Void)? = nil
 
     @StateObject private var controller: SoftDecoderPlayerController
 
@@ -628,6 +665,9 @@ struct SoftDecoderPlayerView: View {
         .onChange(of: viewModel.currentURL) { _, newURL in controller.load(url: newURL, headers: viewModel.currentHeaders) }
         .onChange(of: viewModel.currentHeaders) { _, newHeaders in controller.load(url: viewModel.currentURL, headers: newHeaders) }
         .onChange(of: controller.isFullscreen) { _, fullscreen in
+            // 全屏状态同步给 DetailView（与 WebViewPlayerView 的
+            // .onChange(of: probe.isFullscreen) 同款；放 present 之前，进出都报）。
+            onFullscreenChange?(fullscreen)
             if fullscreen {
                 SoftDecoderFullscreenPresenter.present(
                     controller: controller,
@@ -637,7 +677,18 @@ struct SoftDecoderPlayerView: View {
                 }
             }
         }
-        .onDisappear { controller.teardown() }
+        // 全屏时不拆：与 HLSJS/DASH 同款 guard。正常进全屏是 overFullScreen 模态，
+        // 不触发这里；引擎切走导致视图卸载时跳过，拆层走 controller 的
+        // $currentEngine 订阅 → load() → teardown()，全屏模态由 teardown()
+        // 里的 dismissActive() 关，不会飘在上面。
+        // 引擎已切走且全屏还开着：视图卸载后 .onChange(of: controller.isFullscreen)
+        // 已失效，controller 随后回 false 也传不上去，DetailView 的 isFullscreen
+        // 会卡 true，离页 guard !isFullscreen 阻断停播。只在引擎已切走时清；
+        // 正常全屏进出时引擎仍是本播放器，条件不成立，不误清。
+        .onDisappear {
+            if viewModel.currentEngine != .softDecoder && controller.isFullscreen { onFullscreenChange?(false) }
+            if !controller.isFullscreen { controller.teardown() }
+        }
     }
 }
 
@@ -790,6 +841,8 @@ enum SoftDecoderFullscreenPresenter {
 // 显示与原来占位视图同一文案的提示，不静默空白。
 struct SoftDecoderPlayerView: View {
     @ObservedObject var viewModel: PlayerViewModel
+    /// 与主分支同款签名（无 KSPlayer 时 DetailView 的调用也要能编译；占位无全屏，不调用）。
+    var onFullscreenChange: ((Bool) -> Void)? = nil
 
     init(viewModel: PlayerViewModel) {
         self.viewModel = viewModel

@@ -144,13 +144,19 @@ struct SourcesView: View {
         .foregroundColor(.secondary)
     }
 
-    private var lastSyncText: String {
-        guard let date = store.lastSyncAt else { return "从未同步" }
+    /// 同步时间的格式器：只在主线程用（lastSyncText 只在 body 里读），
+    /// DateFormatter 不是线程安全的，绝不在后台线程碰这个静态实例。
+    private static let syncDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
         formatter.locale = Locale(identifier: "zh_CN")
-        return formatter.string(from: date)
+        return formatter
+    }()
+
+    private var lastSyncText: String {
+        guard let date = store.lastSyncAt else { return "从未同步" }
+        return Self.syncDateFormatter.string(from: date)
     }
 
     // MARK: - 上传账本操作行
@@ -241,6 +247,9 @@ struct SourcesView: View {
                         }
                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                             Button(role: .destructive) {
+                                // 删掉的是当前源就同步清空 currentSourceId，
+                                // 不然“当前”标记挂在一个已不存在的源 id 上。
+                                if source.id == currentSourceId { currentSourceId = "" }
                                 store.delete(source)
                             } label: {
                                 Label("删除", systemImage: "trash")
@@ -455,12 +464,12 @@ struct SourcesView: View {
                     currentSourceId = first.id
                 }
                 if let warning = store.lastSyncError {
-                    showResultAlert("同步完成，共 \(count) 个源；有个文件没同步上：\(warning)")
+                    showResultAlertAfterSheetDismiss("同步完成，共 \(count) 个源；有个文件没同步上：\(warning)")
                 } else {
-                    showResultAlert("同步完成，共 \(count) 个源")
+                    showResultAlertAfterSheetDismiss("同步完成，共 \(count) 个源")
                 }
             case .failure(let error):
-                showResultAlert(error.localizedDescription)
+                showResultAlertAfterSheetDismiss(error.localizedDescription)
             }
         }
     }
@@ -502,14 +511,16 @@ final class DocumentPicker: NSObject, UIDocumentPickerDelegate {
         let callback = onPick
         onPick = nil
         onCancel = nil
-        // UIKit 回调不保证在 MainActor 上下文，强制回主线程再碰 UI 状态。
-        DispatchQueue.main.async { callback?(urls) }
+        // 本类已标 @MainActor，UIKit 的 picker 回调本来就在主线程跑，
+        // 直接调回调即可；再包一层 DispatchQueue.main.async 反而要把
+        // 非 Sendable 闭包送进 @Sendable 上下文（Swift 6 下不合规）。
+        callback?(urls)
     }
 
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
         let callback = onCancel
         onPick = nil
         onCancel = nil
-        DispatchQueue.main.async { callback?() }
+        callback?()
     }
 }

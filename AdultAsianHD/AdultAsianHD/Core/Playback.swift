@@ -102,10 +102,15 @@ enum PlaybackEngine {
         }
         guard let url = URL(string: urlString),
               url.scheme == "http" || url.scheme == "https" else { return false }
-        // 墙后嵌页家族（dood/playmogo 系）：无 hint、无嵌页路径、无扩展名
-        // 的 /d/xxx、/v/xxx 也认成嵌页（P0-2）。直链（.m3u8/.mp4）优先排除，
-        // 墙后家族的直链仍按媒体走，不误判。
-        if !isDirectMediaURL(urlString), isWalledEmbedHost(url.host) { return true }
+        // 墙后嵌页家族（dood/playmogo 系）：只认已知嵌页路径 /d/、/v/
+        //（P2-3：原来“墙后 host 上只要不是带扩展名直链就判嵌页”，同一 host
+        // 上无扩展名 MP4 直链 + 显式 hint "mp4" 也会被 Step 3a 的
+        // !isEmbedURL guard 拦下走 WebView）。/e/、/embed/、/player/、
+        // .html 等形态仍由下面通用分支认，不受收窄影响。
+        if !isDirectMediaURL(urlString), isWalledEmbedHost(url.host) {
+            let walledPath = url.path.lowercased()
+            if walledPath.contains("/d/") || walledPath.contains("/v/") { return true }
+        }
         let path = url.path.lowercased()
         if path.contains("/e/") || path.contains("/embed/") || path.contains("/player/") {
             return true
@@ -393,6 +398,12 @@ final class PlayerViewModel: ObservableObject {
     /// 正在跑的混合解流（一次只跑一路；换线/停播时取消，旧结果写不回来）。
     private var embedExtractor: EmbedStreamExtractor?
     private var embedTask: Task<Void, Never>?
+    /// 后台备线任务（play(item:host:) 的 loadResource）与分集现铸任务
+    /// （playLine 的 hlsjs 重铸）：只捕获 host/item/generation 等值，
+    /// await 之后才取 self；stop()/play()/playLine()/closeWebView() 取消，
+    /// 关页后不再自动起播。
+    private var backupTask: Task<Void, Never>?
+    private var recastTask: Task<Void, Never>?
 
     /// 回环代理实例（currentEngine == .proxy 时持有；换线/停播时释放，见 releaseProxy）。
     private var proxyServer: LoopbackProxyServer?
@@ -973,6 +984,8 @@ final class PlayerViewModel: ObservableObject {
         webViewURL = nil
         currentURL = nil
         currentHeaders = nil
+        // .nativeIntercepted → .webView 兜底后，整段嵌页播放期不再强持旧拦截器。
+        resourceLoader = nil
         releaseProxy()
         failureReason = nil
         // Fix B wall-first：嵌页 host 属于 playmogo/dood 等墙后家族时，URLSession
@@ -1028,6 +1041,10 @@ final class PlayerViewModel: ObservableObject {
         // finalize 已终局时是空操作，且要在清 resourceLoader/代理之前调
         //（终局要合并它们的账本快照；stop()/play() 也是先终局再清）。
         finalizeLedgerAttempt(outcome: "关闭嵌入播放", playedOK: false)
+        backupTask?.cancel()
+        backupTask = nil
+        recastTask?.cancel()
+        recastTask = nil
         embedTask?.cancel()
         embedTask = nil
         embedExtractor?.cancel()
@@ -1052,6 +1069,10 @@ final class PlayerViewModel: ObservableObject {
     func play(item: VideoItem, host: WidgetHost) async {
         // 上一场的账本尝试若还开着（同一 ViewModel 重播），先按停播终局。
         finalizeLedgerAttempt(outcome: "停播", playedOK: false)
+        backupTask?.cancel()
+        backupTask = nil
+        recastTask?.cancel()
+        recastTask = nil
         let generation = UUID()
         playGeneration = generation
         failedURLs = []
@@ -1113,11 +1134,13 @@ final class PlayerViewModel: ObservableObject {
         // 后台拿备线（模块的 loadResource），不挡快路径起播。
         // （P1-7：不用 Task.detached 强捕 self——未跟踪的 detached 任务
         // 会强持有 ViewModel 直到 loadResource 返回；改成继承 MainActor 的
-        // Task + [weak self]，代际仍由 playGeneration 拦，旧任务回来丢弃；
-        // 不另加 episodeTask 之类的新跟踪机制。）
-        Task { [weak self] in
-            guard let self else { return }
+        // Task + [weak self]，代际仍由 playGeneration 拦，旧任务回来丢弃。
+        // R3：任务存进 backupTask，只捕获 host/item/generation，await 之后
+        // 才取 self；stop()/closeWebView() 取消它，关页后备线回来不再自动起播。）
+        backupTask = Task { [weak self] in
             let backup = (try? await host.loadResource(link: item.link, title: item.title)) ?? []
+            guard !Task.isCancelled else { return }
+            guard let self else { return }
             await MainActor.run {
                 guard self.playGeneration == generation else { return } // 已播别的片，丢弃
                 var merged = self.lines
@@ -1171,6 +1194,17 @@ final class PlayerViewModel: ObservableObject {
     /// DetailView.playEpisode 里把预铸直通分支改成传 epLink 过来）。
     func playLine(_ line: PlayLine, recastLink: String? = nil) {
         playGeneration = UUID()
+        // 先终局上一集账本（在清 resourceLoader/currentURL 之前调，终局要合并
+        // 它们的快照；无在途尝试时是空操作；正常切集记“切集”，不记失败），
+        // 再清当前地址/头：现铸分支要 await loadResource，await 期间 currentURL
+        // 若仍是上一集，旧的 markPlaying/markFailed 会覆盖新一集 .loading 或误切线。
+        finalizeLedgerAttempt(outcome: "切集", playedOK: false)
+        backupTask?.cancel()
+        backupTask = nil
+        recastTask?.cancel()
+        recastTask = nil
+        currentURL = nil
+        currentHeaders = nil
         failedURLs.remove(line.url)
         clearFallbackState(for: line.url) // 手动点播：回退/过期标记全清，重新按路由表定
         // 上一集的播放器/代理/解流先清掉（P1-7）：现铸分支要 await loadResource，
@@ -1197,15 +1231,20 @@ final class PlayerViewModel: ObservableObject {
             status = .loading
             failureReason = nil
             let generation = playGeneration
-            Task { [weak self] in
-                guard let self else { return }
+            // 现铸任务存进 recastTask，只捕获 host/link/line/generation，
+            // await 之后才取 self；stop()/play()/playLine()/closeWebView() 取消它。
+            recastTask = Task { [weak self] in
                 guard let recast = try? await host.loadResource(link: link, title: line.name),
                       let first = recast.first else {
                     // 现铸失败：退回播原线，不直接报错。
+                    guard !Task.isCancelled else { return }
+                    guard let self else { return }
                     guard self.playGeneration == generation else { return }
                     _ = self.routeLine(line)
                     return
                 }
+                guard !Task.isCancelled else { return }
+                guard let self else { return }
                 guard self.playGeneration == generation else { return }
                 if !self.lines.contains(where: { $0.url == first.url }) {
                     self.lines.insert(first, at: 0)
@@ -1501,6 +1540,10 @@ final class PlayerViewModel: ObservableObject {
     /// 失败的嵌入线能重试；play() 开头会重置 lines，不会残留到下一部片。
     func stop() {
         finalizeLedgerAttempt(outcome: "停播", playedOK: false)
+        backupTask?.cancel()
+        backupTask = nil
+        recastTask?.cancel()
+        recastTask = nil
         embedTask?.cancel()
         embedTask = nil
         embedExtractor?.cancel()

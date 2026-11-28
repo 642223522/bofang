@@ -224,10 +224,16 @@ final class WidgetHost: @unchecked Sendable {
         // 校验阶段的读写落在独立前缀下，绝不共用空串前缀；
         // meta.id 到手后下面再以它为准（临时 host 随即丢弃）。
         let moduleIDBox = ModuleIDBox()
+        // 导入校验没有可信 id 时的临时命名空间：记下来，meta 到手后清掉
+        // 它名下的 storage/localStorage 孤儿键（见下面 metaId 校正处）。
+        let tempImportID: String?
         if let preknownModuleID, !preknownModuleID.isEmpty {
             moduleIDBox.id = preknownModuleID
+            tempImportID = nil
         } else {
-            moduleIDBox.id = "__import__." + UUID().uuidString
+            let temp = "__import__." + UUID().uuidString
+            moduleIDBox.id = temp
+            tempImportID = temp
         }
         installWidgetBridge(in: context, interceptor: interceptor, httpRegistry: httpRegistry, timerRegistry: timerRegistry, promiseStore: promiseStore, exceptionBox: box, moduleIDBox: moduleIDBox)
 
@@ -251,6 +257,13 @@ final class WidgetHost: @unchecked Sendable {
         // 不一致时信模块、不信旧记录；导入校验时这里把临时命名空间换成真 id。
         if moduleIDBox.id != metaId {
             moduleIDBox.id = metaId
+        }
+        // 导入校验的临时命名空间清理：顶层 JS 在校验期写 storage/localStorage
+        // 落在 "__import__.<随机>" 前缀下，meta 到手后该前缀永不再用，清掉
+        // 它名下的孤儿键；只清临时前缀，绝不清真实模块前缀。
+        if let temp = tempImportID, temp != metaId {
+            Self.clearUserDefaultsKeys(withPrefix: "fw.storage." + temp + ".")
+            Self.clearUserDefaultsKeys(withPrefix: "fw.localstorage." + temp + ".")
         }
         // 标题缺失不整文件报错：先用调用方给的文件名，再退回 id。
         let metaTitle: String = {
@@ -328,6 +341,15 @@ final class WidgetHost: @unchecked Sendable {
             }
         }
         return nil
+    }
+
+    /// 按前缀删 UserDefaults 键（导入校验临时命名空间清理用；只清给定的
+    /// 临时前缀，调用方保证不传真实模块前缀）。
+    private static func clearUserDefaultsKeys(withPrefix prefix: String) {
+        let keys = UserDefaults.standard.dictionaryRepresentation().keys.filter { $0.hasPrefix(prefix) }
+        for key in keys {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
     }
 
     /// 读全局符号（chunk-1 P1-8）：顶层 const/let/class 不挂在全局对象上，
@@ -559,10 +581,14 @@ final class WidgetHost: @unchecked Sendable {
         let setTimeout: @convention(block) (JSValue, Double) -> Int = { [weak context] callback, delayMs in
             // delay 非数/没传时按 0 算（JS 调 setTimeout(fn) 不带延迟时 JSC 传过来的就是 NaN）。
             let delay = delayMs.isFinite ? delayMs : 0
-            guard let registered = timerRegistry.register({ id in
+            // 回调不直接进 work 闭包，装进 TimerCallbackBox：cancel 时盒子里的
+            // callback 置 nil，GCD 队列里已取消的 work 到期前不再钉住 JSValue/JSContext。
+            let callbackBox = TimerCallbackBox(callback)
+            guard let registered = timerRegistry.register(callbackBox, { id in
                 DispatchWorkItem {
                     timerRegistry.remove(id)
-                    guard let context, !callback.isUndefined, !callback.isNull else { return }
+                    guard let context, let callback = callbackBox.callback,
+                          !callback.isUndefined, !callback.isNull else { return }
                     callback.call(withArguments: [])
                     // P1-4c：回调抛的异常读完即清，不留给下一次调用。
                     if let message = exceptionBox.message, !message.isEmpty {
@@ -598,8 +624,10 @@ final class WidgetHost: @unchecked Sendable {
             // delay 非数/没传时按 4ms 算（JSC 传过来的 NaN 与 setTimeout 同款处理，只是下限不同）。
             let delay = delayMs.isFinite ? max(delayMs, 4) : 4
             guard let context else { return 0 }
-            guard let registered = timerRegistry.register({ id in
-                Self.makeIntervalTickWork(id: id, delayMs: delay, callback: callback, context: context, timerRegistry: timerRegistry, exceptionBox: exceptionBox)
+            // 同 setTimeout：回调走 TimerCallbackBox，cancel 立即释放。
+            let callbackBox = TimerCallbackBox(callback)
+            guard let registered = timerRegistry.register(callbackBox, { id in
+                Self.makeIntervalTickWork(id: id, delayMs: delay, callbackBox: callbackBox, context: context, timerRegistry: timerRegistry, exceptionBox: exceptionBox)
             }) else {
                 #if DEBUG
                 print("[WidgetHost] setInterval 已达上限（\(TimerRegistry.maxTimers) 个），本次调用忽略")
@@ -1546,16 +1574,18 @@ final class WidgetHost: @unchecked Sendable {
 
     /// setInterval 一个 tick 的 work（P1-1）：静态方法，不捕获可变 var，
     /// 不与 setInterval 的 block 相互强捕获。work 闭包只弱持 context
-    ///（[weak context]，context 释放后 tick 自停）；callback 必须强持，
-    /// 否则 JS 函数会被 GC 收掉、tick 再也调不到它。
+    ///（[weak context]，context 释放后 tick 自停）；callback 装在
+    /// TimerCallbackBox 里（盒子强持着 JS 函数才不会被 GC 收掉，cancel 时
+    /// 盒子里的 callback 置 nil 立即释放），tick 触发时再从盒子里取。
     /// tick 触发时先看 id 是否还在表里（clearInterval 已把它拿掉就不触发
     /// 也不重排），回调完、id 还在表里才经 scheduleIntervalTick 排下一次，
     /// 所以回调里调 clearInterval（包括自己清自己）能停。
-    private static func makeIntervalTickWork(id: Int, delayMs: Double, callback: JSValue, context: JSContext, timerRegistry: TimerRegistry, exceptionBox: ExceptionBox) -> DispatchWorkItem {
+    private static func makeIntervalTickWork(id: Int, delayMs: Double, callbackBox: TimerCallbackBox, context: JSContext, timerRegistry: TimerRegistry, exceptionBox: ExceptionBox) -> DispatchWorkItem {
         DispatchWorkItem { [weak context] in
             // 已被 clear（注册表里没这个 id）就停，不触发也不重排。
             guard timerRegistry.contains(id) else { return }
-            guard let context, !callback.isUndefined, !callback.isNull else {
+            guard let context, let callback = callbackBox.callback,
+                  !callback.isUndefined, !callback.isNull else {
                 timerRegistry.remove(id)
                 return
             }
@@ -1569,7 +1599,7 @@ final class WidgetHost: @unchecked Sendable {
             }
             // 回调里可能调了 clearInterval；只有 id 还在表里才排下一次。
             if timerRegistry.contains(id) {
-                Self.scheduleIntervalTick(id: id, delayMs: delayMs, callback: callback, context: context, timerRegistry: timerRegistry, exceptionBox: exceptionBox)
+                Self.scheduleIntervalTick(id: id, delayMs: delayMs, callbackBox: callbackBox, context: context, timerRegistry: timerRegistry, exceptionBox: exceptionBox)
             }
         }
     }
@@ -1577,8 +1607,8 @@ final class WidgetHost: @unchecked Sendable {
     /// 排 setInterval 的下一次 tick（P1-1）：静态递归，不捕获可变 var。
     /// timerRegistry.store 在 id 已被取消时返回 false，这时不再 asyncAfter，
     /// 防取消后僵尸 tick。
-    private static func scheduleIntervalTick(id: Int, delayMs: Double, callback: JSValue, context: JSContext, timerRegistry: TimerRegistry, exceptionBox: ExceptionBox) {
-        let work = makeIntervalTickWork(id: id, delayMs: delayMs, callback: callback, context: context, timerRegistry: timerRegistry, exceptionBox: exceptionBox)
+    private static func scheduleIntervalTick(id: Int, delayMs: Double, callbackBox: TimerCallbackBox, context: JSContext, timerRegistry: TimerRegistry, exceptionBox: ExceptionBox) {
+        let work = makeIntervalTickWork(id: id, delayMs: delayMs, callbackBox: callbackBox, context: context, timerRegistry: timerRegistry, exceptionBox: exceptionBox)
         guard timerRegistry.store(work, for: id) else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + delayMs / 1000.0, execute: work)
     }
@@ -1950,10 +1980,11 @@ final class WidgetHost: @unchecked Sendable {
         arrayBufferPendingLock.lock()
         var pending = arrayBufferPending.object(forKey: context)
         if pending == nil {
-            pending = NSMutableDictionary()
+            pending = ArrayBufferPendingQueue()
             arrayBufferPending.setObject(pending, forKey: context)
         }
-        pending?.setObject(raw as NSData, forKey: token as NSString)
+        // FIFO 封顶：超 4 条或 16 MiB 时最旧 token 在 store 里被淘汰。
+        pending?.store(token: token, data: raw)
         arrayBufferPendingLock.unlock()
         // token 存在 result 的不可枚举内部属性上（getter 运行时从 this 上读）；
         // 不可枚举：模块 for..in / Object.keys / JSON.stringify 看不到它。
@@ -1974,13 +2005,11 @@ final class WidgetHost: @unchecked Sendable {
                   let this = JSContext.currentThis(),
                   let token = this.objectForKeyedSubscript("__fwArrayBufferToken")?.toString() else { return nil }
             arrayBufferPendingLock.lock()
-            let raw = arrayBufferPending.object(forKey: context)?.object(forKey: token) as? Data
+            // take() 读删一次完成：首次访问即删登记，不留窗口。
+            let raw = arrayBufferPending.object(forKey: context)?.take(token: token)
             arrayBufferPendingLock.unlock()
             guard let raw, let buffer = WidgetHost.jsArrayBuffer(from: raw, in: context) else { return nil }
-            // 首次访问：删登记，再用 defineProperty 把访问器覆写成普通数据属性。
-            arrayBufferPendingLock.lock()
-            arrayBufferPending.object(forKey: context)?.removeObject(forKey: token)
-            arrayBufferPendingLock.unlock()
+            // 首次访问后用 defineProperty 把访问器覆写成普通数据属性。
             this.defineProperty(
                 "arrayBuffer",
                 descriptor: [
@@ -2004,10 +2033,39 @@ final class WidgetHost: @unchecked Sendable {
     }
 
     /// 惰性 arrayBuffer 的待装箱 Data 登记表（P0-1，见 installArrayBuffer）：
-    /// 弱键是 JSContext（context 释放时条目自动消失），值是 token → Data 的字典。
-    /// NSMapTable 弱键依赖零化弱引用，JSContext 是 NSObject，可用。
+    /// 弱键是 JSContext（context 释放时条目自动消失），值是每 context 一个
+    /// FIFO 队列。NSMapTable 弱键依赖零化弱引用，JSContext 是 NSObject，可用。
     private static let arrayBufferPendingLock = NSLock()
-    private static let arrayBufferPending = NSMapTable<JSContext, NSMutableDictionary>.weakToStrongObjects()
+    private static let arrayBufferPending = NSMapTable<JSContext, ArrayBufferPendingQueue>.weakToStrongObjects()
+
+    /// 每 context 的惰性 arrayBuffer 待装箱队列（FIFO 封顶：最多最近 4 条
+    /// 或总计 16 MiB，超限淘汰最旧 token）。模块只读 res.data、从不访问
+    /// .arrayBuffer 时，未读的 Data 不再随浏览页数在整个会话里堆积。
+    /// 只在 arrayBufferPendingLock 后访问。
+    private final class ArrayBufferPendingQueue {
+        static let maxEntries = 4
+        static let maxBytes = 16 * 1024 * 1024
+        private var items: [(token: String, data: Data)] = []
+        private var totalBytes = 0
+
+        func store(token: String, data: Data) {
+            items.append((token, data))
+            totalBytes += data.count
+            while items.count > Self.maxEntries || totalBytes > Self.maxBytes {
+                let oldest = items.removeFirst()
+                totalBytes -= oldest.data.count
+            }
+        }
+
+        /// 取出并删除（getter 首次访问用）：读删一次完成，不留窗口。
+        func take(token: String) -> Data? {
+            guard let idx = items.firstIndex(where: { $0.token == token }) else { return nil }
+            let data = items[idx].data
+            items.remove(at: idx)
+            totalBytes -= data.count
+            return data
+        }
+    }
 
     /// 响应体能解析成 JSON 就给对象/数组，否则给文本。
     /// 模块里 `typeof data === "object"` 时直接当 JSON 用，文本时 JSON.parse。
@@ -3000,24 +3058,52 @@ private final class NativePromiseStore: @unchecked Sendable {
 /// 上限 64 个：超限的 setTimeout/setInterval 调用直接忽略并返回 0
 ///（JS 侧拿到 0 这个无效 id，与原来“注册失败”的行为一致——原来超限
 /// 是无上限增长，现在宁可丢掉新的也不让旧的泄漏）。
+/// JS 定时器回调的间接持有盒：DispatchWorkItem 只强持盒子、不直接强持
+/// callback: JSValue；cancel/cancelAll 时把盒子里的 callback 置 nil，
+/// GCD 队列里已取消的 work 到期前不再钉住 JSValue/JSContext（长延时
+/// 定时器取消后立即释放）。只在主线程读写 callback 时仍加锁，防
+/// clearTimeout 与 tick 回调并发取。
+private final class TimerCallbackBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _callback: JSValue?
+    init(_ callback: JSValue) { _callback = callback }
+    var callback: JSValue? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _callback
+    }
+    func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+        _callback = nil
+    }
+}
+
+/// 一条定时器的登记项：work + 回调盒。remove（触发后）不清空盒子——
+/// 正在跑的 work 还要用 callback；只有 cancel/cancelAll 清空。
+private struct TimerEntry {
+    var work: DispatchWorkItem
+    let callbackBox: TimerCallbackBox
+}
+
 private final class TimerRegistry: @unchecked Sendable {
     /// 同时存在的定时器上限。
     static let maxTimers = 64
 
     private let lock = NSLock()
-    private var timers: [Int: DispatchWorkItem] = [:]
+    private var timers: [Int: TimerEntry] = [:]
     private var counter = 0
 
     /// 分配 id 并登记一份 work；满上限返回 nil（调用方不得再排这个定时器）。
     /// makeWork 只负责建 DispatchWorkItem，不跑用户代码，持锁调它不会死锁。
-    func register(_ makeWork: (Int) -> DispatchWorkItem) -> (id: Int, work: DispatchWorkItem)? {
+    func register(_ callbackBox: TimerCallbackBox, _ makeWork: (Int) -> DispatchWorkItem) -> (id: Int, work: DispatchWorkItem)? {
         lock.lock()
         defer { lock.unlock() }
         guard timers.count < Self.maxTimers else { return nil }
         counter += 1
         let id = counter
         let work = makeWork(id)
-        timers[id] = work
+        timers[id] = TimerEntry(work: work, callbackBox: callbackBox)
         return (id, work)
     }
 
@@ -3028,8 +3114,9 @@ private final class TimerRegistry: @unchecked Sendable {
     func store(_ work: DispatchWorkItem, for id: Int) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard timers[id] != nil else { return false }
-        timers[id] = work
+        guard var entry = timers[id] else { return false }
+        entry.work = work
+        timers[id] = entry
         return true
     }
 
@@ -3041,19 +3128,21 @@ private final class TimerRegistry: @unchecked Sendable {
     }
 
     /// 从表里拿掉（setTimeout 触发一次后、setInterval 回调发现 context 没了时用），
-    /// 不 cancel——work 正在跑，cancel 也没意义。
+    /// 不 cancel——work 正在跑，cancel 也没意义；不清空 callbackBox——
+    /// 正在跑的 work 还要用 callback，work 跑完盒子随 work 一起释放。
     func remove(_ id: Int) {
         lock.lock()
         defer { lock.unlock() }
         timers.removeValue(forKey: id)
     }
 
-    /// 取消一个定时器（clearTimeout/clearInterval 用）：拿掉并 cancel。
+    /// 取消一个定时器（clearTimeout/clearInterval 用）：拿掉、清空回调、cancel。
     func cancel(_ id: Int) {
         lock.lock()
-        let work = timers.removeValue(forKey: id)
+        let entry = timers.removeValue(forKey: id)
         lock.unlock()
-        work?.cancel()
+        entry?.callbackBox.clear()
+        entry?.work.cancel()
     }
 
     /// 取消全部在途定时器（host deinit 用）。
@@ -3062,7 +3151,10 @@ private final class TimerRegistry: @unchecked Sendable {
         let current = timers
         timers.removeAll()
         lock.unlock()
-        for work in current.values { work.cancel() }
+        for entry in current.values {
+            entry.callbackBox.clear()
+            entry.work.cancel()
+        }
     }
 }
 
@@ -3080,17 +3172,21 @@ private final class HTTPRequestRegistry: @unchecked Sendable {
 
     /// 建 Task 之前先定 id（调用方 `let taskID = UUID()`），再把同一个 id
     /// 传进来登记；defer 里的 unregister 用同一个 id，锁内对齐。
+    /// 无界增长修法：unregister 只在 tasks 里没这个 id（早于 register
+    /// 到达）时才记 finishedIDs；register 命中 finishedIDs 时把它删掉
+    ///（任务已跑完，不再登记），finishedIDs 不再随请求数永久累积。
     func register(_ task: Task<Void, Never>, id: UUID) {
         lock.lock()
         defer { lock.unlock() }
-        guard !finishedIDs.contains(id) else { return }
+        guard finishedIDs.remove(id) == nil else { return }
         tasks[id] = task
     }
 
     func unregister(_ id: UUID) {
         lock.lock()
-        tasks.removeValue(forKey: id)
-        finishedIDs.insert(id)
+        if tasks.removeValue(forKey: id) == nil {
+            finishedIDs.insert(id)
+        }
         lock.unlock()
     }
 

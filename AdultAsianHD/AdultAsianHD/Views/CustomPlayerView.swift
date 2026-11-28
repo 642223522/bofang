@@ -270,6 +270,11 @@ final class CustomPlayerController: ObservableObject {
             return
         }
         if engine == .proxy, url.host != "127.0.0.1" {
+            // 回环监听还没就绪、playerURL 还是原地址：不建 asset（免得裸播原地址
+            // 把代理绕过去）；上一引擎不是 proxy 时先拆旧 item，免得旧画面残留。
+            if lastEngine != nil && lastEngine != .proxy {
+                unloadCurrentItem()
+            }
             return
         }
         // 代理时头由代理统一带（UA/Referer/模块头/Cookie），不挂到回环 asset 上；
@@ -328,6 +333,11 @@ final class CustomPlayerController: ObservableObject {
             FullscreenPlayerPresenter.dismissActive()
         }
         replaceItem(nil, headers: nil, resumeAt: nil)
+    }
+
+    /// 请求头大小写不敏感取值（模块可能给 "user-agent" 等写法）。
+    private static func headerValue(_ headers: [String: String]?, _ name: String) -> String? {
+        headers?.first(where: { $0.key.lowercased() == name.lowercased() })?.value
     }
 
     /// 换播项：带请求头的 AVURLAsset（nmcorp 签名 MP4 用）或普通 item；
@@ -395,7 +405,7 @@ final class CustomPlayerController: ObservableObject {
             // 改用等值字面量（该常量的字符串值就是它自己的名字，运行时等价）。
             // UA 同样走公开 API AVURLAssetHTTPUserAgentKey（等值字面量），不要只塞进
             // header 字典——header 只作用于建 asset 那一次调用，UA 键才管 asset 全程请求。
-            let userAgent = headers["User-Agent"] ?? PlaybackEngine.iPhoneUserAgent
+            let userAgent = Self.headerValue(headers, "User-Agent") ?? PlaybackEngine.iPhoneUserAgent
             let asset = AVURLAsset(url: url, options: [
                 "AVURLAssetHTTPHeaderFieldsKey": headers,
                 "AVURLAssetHTTPUserAgentKey": userAgent,
@@ -707,12 +717,12 @@ final class CustomPlayerController: ObservableObject {
         )
         // FairPlay（skd://）：拦截器或代理已在播单里见到，报明确错误，不走通用失败文案。
         if viewModel.resourceLoader?.encounteredFairPlay == true || viewModel.proxyEncounteredFairPlay {
-            viewModel.markFailed("这条线路用了 FairPlay 加密（skd://），当前播放器不支持，请换一条线路")
+            viewModel.markFailed("这条线路用了 FairPlay 加密（skd://），当前播放器不支持，请换一条线路", failedURL: url)
             return
         }
         let nsError = item.error as NSError?
         if nsError?.code == -12881 {
-            viewModel.markFailed("分片拉取失败（分片可能需要请求头，拦截器覆盖不了）", stage: .segmentFetch)
+            viewModel.markFailed("分片拉取失败（分片可能需要请求头，拦截器覆盖不了）", stage: .segmentFetch, failedURL: url)
             return
         }
         // HTTP 状态码从 errorLog 取（404 这类 HTTP 失败 errorStatusCode 就是状态码，
@@ -738,8 +748,14 @@ final class CustomPlayerController: ObservableObject {
         controlsVisible = true
         player.currentItem?.cancelPendingSeeks()
         // 片尾复位是位置重置、不是用户快进：唯一保留在状态机之外的直接 seek。
+        // 回调只认当初那一项、且不在拖动中：换片/拖动途中回来的旧回调把
+        // currentTime 写 0 会打掉新片时间或用户刚拖到的位置。
+        let finishedItem = currentItem
         player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-            Task { @MainActor in self?.currentTime = 0 }
+            Task { @MainActor [weak self] in
+                guard let self, self.currentItem === finishedItem, !self.isScrubbing else { return }
+                self.currentTime = 0
+            }
         }
     }
 
@@ -918,6 +934,9 @@ final class CustomPlayerController: ObservableObject {
             #if DEBUG
             print("[Seek] far landing: actual=\(actual.seconds) target=\(seekTarget.seconds) tol=\(tol), re-arming watchdog")
             #endif
+            // 远落点重武 3 秒：最近进展时刻归零，否则重武到期时距上次分片落袋
+            // 不足 4 秒会误判“最近 4 秒有进展”白延 10 秒（与 performSeek 初值 0 同理）。
+            seekLastProgressUptime = 0
             stopSeekWatchdog()
             seekWatchdogRemaining = Self.seekFarLandingRearmSeconds
             scheduleSeekWatchdog(operation: operation, token: seekPhaseToken)
@@ -1459,6 +1478,19 @@ struct CustomPlayerView: View {
                 }
             }
         }
+        .onDisappear {
+            // 全屏失败切走非原生引擎时视图卸载，.onChange(of: controller.isFullscreen)
+            // 已失效：即使 unloadCurrentItem 随后关了模态、controller.isFullscreen
+            // 回 false，DetailView 的 isFullscreen 仍可能卡 true，离页 guard
+            // !isFullscreen 会阻断停播。只在引擎已切走非原生时清（原生全屏是
+            // overFullScreen，不触发这里；即使触发，引擎仍是原生三引擎之一，
+            // 条件不成立，不误清正常全屏进出状态）。
+            let engine = viewModel.currentEngine
+            if engine != .native && engine != .nativeIntercepted && engine != .proxy && isFullscreen {
+                isFullscreen = false
+                controller.unloadCurrentItem()
+            }
+        }
     }
 }
 
@@ -1577,12 +1609,16 @@ enum FullscreenPlayerPresenter {
 
     @MainActor
     static func present(player: AVPlayer, controller: CustomPlayerController, viewModel: PlayerViewModel, onExit: @escaping () -> Void) {
-        guard let top = topViewController(), !(top is FullscreenPlayerViewController) else {
-            // 拿不到顶层控制器、或已经在全屏里：直接调 onExit，
-            // 不然 controller.isFullscreen 一直 true、再也退不出来。
+        // 拿不到顶层控制器（转场/退后台瞬间）：直接调 onExit 把 isFullscreen
+        // 复位，不然 controller.isFullscreen 一直 true、再也退不出来。
+        guard let top = topViewController() else {
             onExit()
             return
         }
+        // 已经在全屏里：不调 onExit（调了会把 isFullscreen 复位，全屏 VC 还在上面，
+        // 画面门控会把 video view 从全屏容器摘掉，反而黑屏），直接返回。
+        // （与 SoftDecoderFullscreenPresenter 同款。）
+        if top is FullscreenPlayerViewController { return }
         let vc = FullscreenPlayerViewController(player: player, controller: controller, viewModel: viewModel, onExit: onExit)
         activeVC = vc
         top.present(vc, animated: true, completion: nil)

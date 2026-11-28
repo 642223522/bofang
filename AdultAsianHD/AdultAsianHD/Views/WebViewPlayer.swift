@@ -2310,6 +2310,12 @@ final class EmbedProbeState: ObservableObject {
     @Published var paused = true
     /// CF 质询是不是正在跑（还没出 video）：外层用它显示原生 Loading 遮罩。
     @Published var challengeRunning = false
+    /// 页内 video 是不是在全屏（fullscreenchange 事件回传 + 探针轮询
+    /// document.fullscreenElement 双通道）：外层据此同步 DetailView.isFullscreen，
+    /// 全屏进出触发的 onDisappear 才不会误停播。stop() 故意不重置它——
+    /// 全屏进出也会触发 onDisappear → probe.stop()，清掉就把 DetailView
+    /// 的全屏判断也清掉了。
+    @Published var isFullscreen = false
     /// 底条是否可见（播时 3 秒无操作自动藏，暂停/没 video 时常显，点画面切换）。
     @Published var controlsVisible = true
 
@@ -2439,8 +2445,8 @@ final class EmbedProbeState: ObservableObject {
                 if (document.querySelector('iframe[src*="turnstile"]')) cf = true;
                 if (document.querySelector('#challenge-form, #challenge-running, #challenge-stage, #cf-wrapper, #cf-spinner, #cf-browser-verification, [id*="cf-chl-"], [class*="cf-challenge"], [class*="challenge-running"], [class*="turnstile"]')) cf = true;
               } catch(e){}
-              if (!v) return JSON.stringify({cf: cf, cfTitle: cfTitle});
-              return JSON.stringify({t: v.currentTime, d: v.duration, p: v.paused, cf: cf, cfTitle: cfTitle});
+              if (!v) return JSON.stringify({cf: cf, cfTitle: cfTitle, fs: !!document.fullscreenElement});
+              return JSON.stringify({t: v.currentTime, d: v.duration, p: v.paused, cf: cf, cfTitle: cfTitle, fs: !!document.fullscreenElement});
             })();
             """
         ) { [weak self] result, _ in
@@ -2449,8 +2455,16 @@ final class EmbedProbeState: ObservableObject {
                   let data = str.data(using: .utf8),
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 self.hasVideo = false
+                // JS 求值失败/返回非 JSON 也要跑看门狗：WebContent 进程崩溃或
+                // 页面死锁时 evaluateJavaScript 永远拿不到结果，不调这里就永远
+                // 卡在“正在加载…”不报失败。
+                self.checkWatchdog(challengeRunning: false)
                 return
             }
+            // 全屏状态轮询纠正（与 fullscreenchange 消息双通道）：底条全屏按钮
+            // 是乐观先置 true，页内自带全屏按钮走消息；万一消息漏了，0.5 秒
+            // 一次的轮询也能把状态扳回来。
+            self.isFullscreen = (json["fs"] as? Bool) ?? false
             // CF 质询处理：所有质询信号统一等 12 秒，让挑战 JS 自己完成
             //（iframe 里的勾选框我们点不到，立即 reload 会破坏挑战会话）；
             // 12 秒还没出 video 才关规则重载一次。只重载一次。
@@ -2540,6 +2554,13 @@ final class EmbedProbeState: ObservableObject {
             } else if let since = challengeSince,
                Date().timeIntervalSince(since) >= 45 {
                 failEmbed("Cloudflare 验证一直没通过（45 秒），请开节点或点重试")
+            } else if let started = loadStartedAt,
+                      Date().timeIntervalSince(started) >= 45 {
+                // 总超时兜底：CF 挑战页每 8–10 秒自动刷新一次，刷新瞬间
+                // cfRunning == false 会把 challengeSince 清零（probe 的
+                // else 分支），12 秒重载与 45 秒 challengeSince 永远到不了；
+                // 用 loadStartedAt 算总账，挑战从头跑满 45 秒就终局，不无限循环。
+                failEmbed("Cloudflare 验证超时（45 秒），请开节点或点重试")
             }
             return
         }
@@ -2647,6 +2668,11 @@ final class EmbedProbeState: ObservableObject {
     /// 外层底条的全屏：让页内 video 元素 requestFullscreen（WKWebView 原生接管全屏播放），
     /// 没 video 时退回整个页面全屏；页内播放器自带的全屏按钮同样可用。
     func requestFullscreen() {
+        // 乐观先置 true：fullscreenchange 消息与轮询都可能在
+        // DetailView.onDisappear 之后才到，先置位才能让全屏判断及时生效；
+        // 万一 requestFullscreen 失败，下一轮探针轮询会按
+        // document.fullscreenElement 把它扳回 false。
+        isFullscreen = true
         webView?.evaluateJavaScript(
             """
             (function(){
@@ -2695,7 +2721,7 @@ final class EmbedProbeState: ObservableObject {
 
 /// 嵌入页播放器的 UIViewController：WKWebView 全铺，不带任何按钮。
 /// 按钮/底条都在外层 SwiftUI（和直链自定义播放器同一套 PlayerControlBar）。
-final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UIGestureRecognizerDelegate {
+final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, UIGestureRecognizerDelegate, WKScriptMessageHandler {
     private let url: URL
     private let probe: EmbedProbeState
     private let adStrip: Bool
@@ -2750,6 +2776,20 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
             config.userContentController.addUserScript(script)
         }
 
+        // 全屏状态回传（run #36 R3）：页内 video 进/退全屏时立即通知探针，
+        // 不靠 0.5 秒轮询——轮询可能在 DetailView.onDisappear 之后才跑到，
+        // 全屏一进就被 playerVM.stop() 打断。只报状态，不碰播放；
+        // 与 adStrip 无关，剥离关掉也要报。
+        let fullscreenScript = WKUserScript(source: """
+            (function(){
+              function report(){ try { window.webkit.messageHandlers.xspFullscreen.postMessage(!!document.fullscreenElement); } catch(e){} }
+              document.addEventListener('fullscreenchange', report);
+              document.addEventListener('webkitfullscreenchange', report);
+            })();
+            """, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+        config.userContentController.addUserScript(fullscreenScript)
+        config.userContentController.add(self, name: "xspFullscreen")
+
         // 在屏铁律：解流/过墙用的 WebView 必须全尺寸在屏——四边约束铺满父视图，
         // 绝不宽高 0、绝不移出视图树、绝不 alpha=0（隐藏会被质询判 headless 而
         // 无限刷新）。frame 用 .zero 只是建视图时的占位，约束会把它撑满；
@@ -2787,6 +2827,13 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
         probe.toggleControls()
     }
 
+    /// 全屏状态回传：fullscreenchange/webkitfullscreenchange 事件到即报，
+    /// 主线程回调，直接写探针状态。
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == "xspFullscreen", let fullscreen = message.body as? Bool else { return }
+        probe.isFullscreen = fullscreen
+    }
+
     // 绝不抢 WKWebView 内层手势（播放器按钮/进度条照常用）：两个手势同时识别。
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
         true
@@ -2802,6 +2849,10 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
     /// 完事不改已在加载的页面）。以前：没 clearance 就先暖 3×10 秒，
     /// 暖完才加载——白屏 10–30 秒就是这么来的。
     func loadIfNeeded(url: URL, retryNonce: Int = 0) {
+        // teardown 后 webView 已是 nil：直接早退，绝不把 loadedURL 重新写回非空、
+        // 也不碰探针状态（updateUIViewController 的异步闭包可能在 teardown
+        // 之后才跑到这里）。
+        guard let webView else { return }
         let nonceChanged = lastRetryNonce != nil && lastRetryNonce != retryNonce
         // 本次调用前已载过一页（hadLoadedBefore）：上一页可能走 reloadWithoutRules()
         // 清空了规则，切到新 URL 时也要把规则重装回去——只认 nonceChanged 的话，
@@ -2816,18 +2867,21 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
         // 强制重试 / 换页时：上一页可能走 reloadWithoutRules() 清空了规则，
         // 只把 adRulesDisabled 置回 false 不够（规则已从 userContentController
         // 里摘掉），要把缓存的规则重新装回去，否则后续嵌页第一层广告拦截永久失效。
-        if (nonceChanged || hadLoadedBefore), adStrip, let webView {
+        if (nonceChanged || hadLoadedBefore), adStrip {
             webView.configuration.userContentController.removeAllContentRuleLists()
             AdBlockRuleStore.install(into: webView.configuration.userContentController, siteHost: url.host ?? "") { [weak self] in
                 !(self?.adRulesDisabled ?? true)
             }
         }
-        probe.pageLoaded = false
+        // probe 的 @Published 赋值挪到下一个 runloop：makeUIViewController
+        // 触发的 viewDidLoad 会在 SwiftUI 视图更新期内同步调到这里，直接写
+        // 会撞“Publishing changes from within view updates”。
+        DispatchQueue.main.async { [weak self] in self?.probe.pageLoaded = false }
         // 立即加载（不等预热）。
         load(request: url)
         // 预热并行跑：只做 cookie 预种，不挡加载、不改页面。
         if let host = url.host, CloudflareWarmup.needsWarmup(host: host) {
-            probe.warmingUp = true
+            DispatchQueue.main.async { [weak self] in self?.probe.warmingUp = true }
             CloudflareWarmup.shared.ensureClearance(for: host, webView: webView, container: view) { [weak self] in
                 self?.probe.warmingUp = false
             }
@@ -2846,6 +2900,10 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
         // 顺序反了会崩：stopLoading 期间的回调走到已释放的 delegate。
         webView?.navigationDelegate = nil
         webView?.uiDelegate = nil
+        // 摘全屏消息 handler：userContentController 强持有 handler（即 self），
+        // 不摘掉 VC → webView → configuration → userContentController → self
+        // 的环不断，teardown 后 VC 永远走不到 deinit（真泄漏，见 hlsjs 同款注释）。
+        webView?.configuration.userContentController.removeScriptMessageHandler(forName: "xspFullscreen")
         probe.webView = nil
         probe.onDisableAdRules = nil
         webView?.stopLoading()
@@ -2960,7 +3018,11 @@ struct EmbedWebView: UIViewControllerRepresentable {
         // 不能在 SwiftUI 视图更新期内调（会撞“Publishing changes from within
         // view updates”）；挪到下一个 runloop 再跑。重复调也没事，
         // loadIfNeeded 的 loadedURL/nonce 去重会拦住。
-        DispatchQueue.main.async {
+        // [weak uiViewController]：用户刚进页就退出时 teardown 已跑，
+        // 随后执行的闭包不能强留住已拆的 VC（loadIfNeeded 顶部的
+        // guard let webView 也是第二道防线）。
+        DispatchQueue.main.async { [weak uiViewController] in
+            guard let uiViewController else { return }
             uiViewController.loadIfNeeded(url: url, retryNonce: retryNonce)
         }
     }
@@ -2996,6 +3058,10 @@ struct WebViewPlayerView: View {
     var onPlaying: (() -> Void)? = nil
     /// 嵌页终局失败时调一次（探针看门狗）：外层据此调 ViewModel.markEmbedFailed(reason)。
     var onEmbedFailed: ((String) -> Void)? = nil
+    /// 页内 video 进/退全屏时调（探针的 fullscreenchange 回传 + 轮询）：
+    /// 外层据此同步 DetailView.isFullscreen，全屏进出触发的 onDisappear
+    /// 才不会误停播。与 onPlaying/onEmbedFailed 同款回调模式。
+    var onFullscreenChange: ((Bool) -> Void)? = nil
     /// 嵌入重试计数（DetailView 从 ViewModel 传）：变了就把探针整套状态清掉重开，
     /// 同一 URL 重试也有新鲜的看门狗窗口。
     var retryNonce: Int = 0
@@ -3039,7 +3105,7 @@ struct WebViewPlayerView: View {
                         qualityLabel: nil,
                         qualityOptions: [],
                         onQualitySelected: nil,
-                        isFullscreen: false,
+                        isFullscreen: probe.isFullscreen,
                         onFullscreen: { probe.requestFullscreen() },
                         onClose: onClose,
                         statusText: probe.statusText,
@@ -3072,6 +3138,9 @@ struct WebViewPlayerView: View {
             // 不然重试后 45 秒窗口早已过期、挑战兜底也用过了。
             probe.stop()
             probe.start()
+        }
+        .onChange(of: probe.isFullscreen) { _, fullscreen in
+            onFullscreenChange?(fullscreen)
         }
         .onDisappear {
             probe.stop()

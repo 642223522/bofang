@@ -287,6 +287,9 @@ final class Downloader: ObservableObject {
             //（404 也会“成功”返回一个装着错误页的临时文件）。
             result = .failure(DownloadError.httpStatus(http.statusCode))
         } else if let location {
+            // 已终结（取消路径已先抢到完成权）时不落盘：迟到的 completion
+            // 再 moveItem 会删掉/覆盖后来同名新建的下载文件。
+            guard !box.isFinished else { return }
             do {
                 // 目标已存在（同名残留）先清掉：moveItem 不覆盖已存在文件。
                 if FileManager.default.fileExists(atPath: destURL.path) {
@@ -427,6 +430,14 @@ private final class DownloadRaceBox: @unchecked Sendable {
     private var task: URLSessionDownloadTask?
     private var observation: NSKeyValueObservation?
     private var finished = false
+
+    /// 是否已终结（finish 已被调用过一次，取消或完成任一路径抢到完成权）。
+    /// finishDownload 落盘前用它拦迟到的已取消下载。
+    var isFinished: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return finished
+    }
 
     /// 装 continuation；已 finish 时返回 false（调用方什么都不创建直接返回）。
     /// false 时 pending 里的结果已在这里补恢复，continuation 不会悬空。

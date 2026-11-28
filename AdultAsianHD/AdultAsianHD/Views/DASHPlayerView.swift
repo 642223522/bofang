@@ -127,6 +127,12 @@ final class DASHPlayerController: ObservableObject {
     /// 新 URL 到达时调（DASHPlayerView 传进来的 currentURL/headers 变化）。
     /// URL/请求头没变不重建，避免 SwiftUI 刷新打断正在播的片。
     func load(url: URL?, headers: [String: String]?) {
+        // run #36 R3（P1-1）：引擎门控——切离 .dash 时不重建。teardown 只拆
+        // 本控制器的 VC 与自有状态（VC 与 controller 一一对应），不碰新引擎资源。
+        guard viewModel.currentEngine == .dash else {
+            teardown()
+            return
+        }
         guard let url else {
             lastURL = nil
             lastHeaders = nil
@@ -217,6 +223,8 @@ final class DASHPlayerController: ObservableObject {
         case "ended":
             // 播到片尾：停在 0:00（不循环、不续播），控制条常显，等用户再点播放。
             isPlaying = false
+            // 不清 shouldPlay 的话，片尾拖进度条松手会按旧意图自动续播。
+            shouldPlay = false
             controlsVisible = true
             currentTime = 0
             evaluate("if (window.__webplayer) { window.__webplayer.seek(0); }")
@@ -241,7 +249,8 @@ final class DASHPlayerController: ObservableObject {
     func handleFatalError(_ message: String) {
         guard let url = lastURL, didMarkFailedURL != url else { return }
         didMarkFailedURL = url
-        viewModel.markFailed(message)
+        loadTimeoutTask?.cancel()
+        viewModel.markFailed(message, failedURL: url)
     }
 
     // MARK: - 画质
@@ -374,15 +383,18 @@ final class DASHPlayerController: ObservableObject {
 
     /// 松手：精确定位到拖到的位置；拖之前在播就恢复播放（不拖完停在暂停态）。
     func endScrub(to seconds: Double) {
+        // 先清拖动标志再判时长：duration <= 0 早退也不能把 isScrubbing 落下，
+        // 否则 timeupdate 回写永久被拦、进度条冻结。
+        isScrubbing = false
         guard duration > 0 else { return }
         let clamped = min(max(seconds, 0), duration)
         currentTime = clamped
-        isScrubbing = false
         let resume = wasPlayingBeforeScrub
         evaluate("if (window.__webplayer) { window.__webplayer.seek(\(clamped)); }")
         if resume {
             shouldPlay = true
             evaluate("if (window.__webplayer) { window.__webplayer.play(); }")
+            showControlsTemporarily()
         }
     }
 
@@ -421,6 +433,14 @@ final class DASHPlayerController: ObservableObject {
         hideTask = nil
         loadTimeoutTask?.cancel()
         loadTimeoutTask = nil
+        // 清掉 URL/代际/失败记忆：下次同 URL load 的去重 guard（lastURL == nil
+        // 即通过）会重建，不会被拦；也不残留旧失败态误杀新线。
+        lastURL = nil
+        lastHeaders = nil
+        lastGeneration = nil
+        lastResumeAt = 0
+        didMarkPlayingURL = nil
+        didMarkFailedURL = nil
         isPlaying = false
         isLoading = false
         currentTime = 0
@@ -456,6 +476,8 @@ final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUID
     private var webView: WKWebView?
     private var loadedURL: URL?
     private var loadedHeaders: [String: String]?
+    /// Cookie 注入代际：每次 vc.load 递增，旧的异步注入回调对不上号就丢弃。
+    private var loadToken: UInt64 = 0
     private var isTornDown = false
 
     init(controller: DASHPlayerController) {
@@ -472,6 +494,10 @@ final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUID
         view.backgroundColor = .black
 
         let config = WKWebViewConfiguration()
+        // run #36 R3（P1-4）：非持久化 store——注入的 Cookie 只用于本次播放建页，
+        // 不写进全局持久化库，跨片/跨站不污染其他 WebView；Cookie 每次 load 都
+        // 从 headers 重新注入，不依赖跨页持久化。
+        config.websiteDataStore = .nonPersistent()
         config.defaultWebpagePreferences.allowsContentJavaScript = true
         config.allowsInlineMediaPlayback = true
         // 画中画用户不要，关掉（与 WebViewPlayer 一致）。
@@ -502,10 +528,12 @@ final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUID
         tap.cancelsTouchesInView = false
         tap.delegate = self
         webView.addGestureRecognizer(tap)
-        // controller.load() 可能比 VC 建好更早（onAppear 先跑）：补一次，避免丢首播；
-        // onAppear 随后还会调一次 load()，URL 相同、VC 侧 guard 会拦住，不重复建页。
+        // controller.load() 可能比 VC 建好更早（$currentEngine 订阅在订阅瞬间即触发）：
+        // 补一次，避免丢首播；forceReload: true——首载必须真的建页（见 vc.load 的 guard）。
+        // onAppear 随后还会调一次 controller.load()，URL/代际相同、controller 侧
+        // guard 会拦住，不重复建页。
         if let url = controller.pendingURL {
-            load(url: url, headers: controller.pendingHeaders, resumeAt: controller.pendingResumeAt)
+            load(url: url, headers: controller.pendingHeaders, resumeAt: controller.pendingResumeAt, forceReload: true)
         }
     }
 
@@ -522,10 +550,18 @@ final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUID
     /// resumeAt 只在同 generation 切线时 > 0，新片/新一集为 0，从 0:00 起播。
     func load(url: URL?, headers: [String: String]?, resumeAt: Double, forceReload: Bool = false) {
         guard !isTornDown else { return }
+        // run #36 R3（P0-1）：webView 未建好时不写 loadedURL/loadedHeaders，
+        // 否则 viewDidLoad 的首载补调会被去重 guard 拦住、页面永不建页。
+        // （controller.load 已先把 lastURL 写好，pendingURL 不丢，viewDidLoad 会补调。）
+        guard webView != nil else { return }
         // forceReload：controller.load() 校验通过后的重建（同 URL 重试/重播），
         // 跳过这层 URL/头去重——否则 controller 已把 isLoading 置 true，
         // 这里早退不调 loadHTMLString，页面永久卡死在转圈。
         guard forceReload || url != loadedURL || headers != loadedHeaders else { return }
+        // 代际令牌：连续 forceReload 同 URL 时，旧的异步 Cookie 注入回调
+        // 不得覆盖新加载（group.notify 内校验）。
+        loadToken &+= 1
+        let token = loadToken
         loadedURL = url
         loadedHeaders = headers
         guard let url else {
@@ -535,7 +571,7 @@ final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUID
         }
         // UA：模块给了就用模块的，否则 iPhone UA。WKWebView 的 UA 对 XHR 同样生效，
         // 这是禁设头 User-Agent 唯一能走的路（RequestModifier 里 setRequestHeader 改不了它）。
-        webView?.customUserAgent = headers?["User-Agent"] ?? NetConstants.iPhoneUserAgent
+        webView?.customUserAgent = Self.headerValue(headers, "User-Agent") ?? NetConstants.iPhoneUserAgent
         guard let library = WebPlayerLibraries.dashSource else {
             Task { @MainActor in self.controller.handleFatalError("dash.js 库文件缺失，播不了") }
             return
@@ -546,7 +582,7 @@ final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUID
         // ① manifest/分片请求与文档同源，不触发 CORS 预检；
         // ② 文档 URL 就是子请求带上的 Referer（Referer 是禁设头，改不了）；
         // ③ https baseURL 保证安全上下文（MSE 要求）。
-        loadHTMLWithCookies(html, baseURL: url, headers: headers)
+        loadHTMLWithCookies(html, baseURL: url, headers: headers, token: token)
     }
 
     /// Cookie 注入：模块给的 Cookie 头是 XHR 禁设头，RequestModifier 里
@@ -554,7 +590,7 @@ final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUID
     /// xhr.withCredentials 才能带上（只认 Cookie 头，不管 Set-Cookie）。
     /// 先把 Cookie 写完再建页，否则首个 manifest 请求可能赶在写 Cookie 之前发出；
     /// 写完后 URL 已换就不再建旧页。
-    private func loadHTMLWithCookies(_ html: String, baseURL: URL, headers: [String: String]?) {
+    private func loadHTMLWithCookies(_ html: String, baseURL: URL, headers: [String: String]?, token: UInt64) {
         guard let webView else { return }
         let cookies = Self.cookies(from: headers, for: baseURL)
         guard !cookies.isEmpty else {
@@ -568,18 +604,25 @@ final class DASHWebViewController: UIViewController, WKNavigationDelegate, WKUID
             store.setCookie(cookie) { group.leave() }
         }
         group.notify(queue: .main) { [weak self, weak webView] in
-            guard let self, !self.isTornDown, self.loadedURL == baseURL else { return }
+            guard let self, !self.isTornDown, self.loadToken == token, self.loadedURL == baseURL else { return }
             webView?.loadHTMLString(html, baseURL: baseURL)
         }
     }
 
+    /// 请求头大小写不敏感取值（模块可能给 "cookie"/"COOKIE"、"user-agent" 等写法）。
+    private static func headerValue(_ headers: [String: String]?, _ name: String) -> String? {
+        headers?.first(where: { $0.key.lowercased() == name.lowercased() })?.value
+    }
+
     private static func cookies(from headers: [String: String]?, for url: URL) -> [HTTPCookie] {
         guard let host = url.host else { return [] }
-        let raw = headers?["Cookie"] ?? headers?["cookie"] ?? ""
+        let raw = Self.headerValue(headers, "Cookie") ?? ""
         guard !raw.isEmpty else { return [] }
         var out: [HTTPCookie] = []
         for pair in raw.split(separator: ";") {
-            let parts = pair.split(separator: "=", maxSplits: 1)
+            // omittingEmptySubsequences: false：空值 Cookie（如 flag=）不能丢，
+            // 否则分段丢值；HTTPCookie 收不收空值由它自己定，这里不预判。
+            let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
             guard parts.count == 2 else { continue }
             let name = parts[0].trimmingCharacters(in: .whitespaces)
             let value = parts[1].trimmingCharacters(in: .whitespaces)
@@ -811,6 +854,10 @@ struct DASHWebView: UIViewControllerRepresentable {
 /// 全屏按钮（页内 video requestFullscreen）。离开页面 onDisappear 即停播。
 struct DASHPlayerView: View {
     @ObservedObject var viewModel: PlayerViewModel
+    /// 全屏状态上行到 DetailView：与 .webView 的 onFullscreenChange 同款回调模式，
+    /// DetailView 接上后与 CustomPlayerView / .webView 共用同一个 @State isFullscreen，
+    /// 靠它判断 onDisappear 是不是全屏引起的。
+    var onFullscreenChange: ((Bool) -> Void)? = nil
 
     @StateObject private var controller: DASHPlayerController
 
@@ -858,6 +905,18 @@ struct DASHPlayerView: View {
         .onAppear { controller.load(url: viewModel.currentURL, headers: viewModel.currentHeaders) }
         .onChange(of: viewModel.currentURL) { _, newURL in controller.load(url: newURL, headers: viewModel.currentHeaders) }
         .onChange(of: viewModel.currentHeaders) { _, newHeaders in controller.load(url: viewModel.currentURL, headers: newHeaders) }
-        .onDisappear { controller.teardown() }
+        // 全屏状态同步给 DetailView（JS fullscreenchange 回传的 controller.isFullscreen，
+        // 与 WebViewPlayerView 的 .onChange(of: probe.isFullscreen) 同款）。
+        .onChange(of: controller.isFullscreen) { _, fullscreen in onFullscreenChange?(fullscreen) }
+        // 全屏时不拆：页内 video 全屏期间的 onDisappear 不是真离页，拆了
+        // isTornDown = true 会永久杀死 WKWebView，回来黑屏无法恢复。
+        // 引擎已切走且全屏还开着：视图卸载后 .onChange(of: controller.isFullscreen)
+        // 已失效，controller 随后回 false 也传不上去，DetailView 的 isFullscreen
+        // 会卡 true，离页 guard !isFullscreen 阻断停播。只在引擎已切走时清；
+        // 正常全屏进出时引擎仍是本播放器，条件不成立，不误清。
+        .onDisappear {
+            if viewModel.currentEngine != .dash && controller.isFullscreen { onFullscreenChange?(false) }
+            if !controller.isFullscreen { controller.teardown() }
+        }
     }
 }

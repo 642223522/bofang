@@ -51,6 +51,10 @@ struct DetailView: View {
     /// 分集现铸的异步任务（run #36 P0-10）：保存下来才能在离页/点别的集时
     /// 取消；不保存的话，点第 2 集后离页，loadResource 返回后会在后台重新起播。
     @State private var episodeTask: Task<Void, Never>?
+    /// onAppear 起的任务（起播 + 分集加载）：保存下来才能在离页时取消；
+    /// 不保存的话，刚进页就退出，迟到的 play() 还会在后台起播、迟到的
+    /// loadDetail 还会往已拆的视图写 detail。
+    @State private var appearTasks: [Task<Void, Never>] = []
 
     var body: some View {
         ScrollView {
@@ -67,23 +71,23 @@ struct DetailView: View {
                 //（代理时 AVPlayer 只能看到回环地址，原始 https 地址只留在 ViewModel 里）。
                 switch playerVM.currentEngine {
                 case .hlsjs:
-                    HLSJSPlayerView(viewModel: playerVM)
+                    HLSJSPlayerView(viewModel: playerVM, onFullscreenChange: { isFullscreen = $0 })
                         .aspectRatio(16.0 / 9.0, contentMode: .fit)
                         .background(Color.black)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                 case .dash:
-                    DASHPlayerView(viewModel: playerVM)
+                    DASHPlayerView(viewModel: playerVM, onFullscreenChange: { isFullscreen = $0 })
                         .aspectRatio(16.0 / 9.0, contentMode: .fit)
                         .background(Color.black)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                 case .softDecoder:
-                    SoftDecoderPlayerView(viewModel: playerVM)
+                    SoftDecoderPlayerView(viewModel: playerVM, onFullscreenChange: { isFullscreen = $0 })
                         .aspectRatio(16.0 / 9.0, contentMode: .fit)
                         .background(Color.black)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                 case .webView:
                     if let webViewURL = playerVM.webViewURL {
-                        WebViewPlayerView(url: webViewURL, onClose: { playerVM.closeWebView() }, onPlaying: { playerVM.markPlaying() }, onEmbedFailed: { playerVM.markEmbedFailed($0) }, retryNonce: playerVM.embedRetryNonce)
+                        WebViewPlayerView(url: webViewURL, onClose: { playerVM.closeWebView() }, onPlaying: { playerVM.markPlaying() }, onEmbedFailed: { playerVM.markEmbedFailed($0) }, onFullscreenChange: { isFullscreen = $0 }, retryNonce: playerVM.embedRetryNonce)
                             .aspectRatio(16.0 / 9.0, contentMode: .fit)
                             .background(Color.black)
                             .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -129,10 +133,6 @@ struct DetailView: View {
                 Text(item.title)
                     .font(.title3)
                     .fontWeight(.semibold)
-
-                Text("时长 --:--")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
 
                 if !item.description.isEmpty {
                     Text(item.description)
@@ -244,18 +244,22 @@ struct DetailView: View {
         .onAppear {
             // 起播只做一次（首进）：全屏进出也会触发 onAppear，回来不重播、不从头。
             // 分集加载不受影响（每次出现都取，幂等）。
+            // 旧的 onAppear 任务先取消：全屏回来会再跑一次 onAppear，上一轮的
+            // loadDetail 没跑完就别让它继续占着（新的那轮会重新取）。
+            appearTasks.forEach { $0.cancel() }
+            appearTasks = []
             if !hasStartedPlayback {
                 hasStartedPlayback = true
-                Task {
+                appearTasks.append(Task {
                     await playerVM.play(item: item, host: host)
-                }
+                })
             }
-            Task {
+            appearTasks.append(Task {
                 // 分集：模块有 loadDetail 就取详情（短剧站）；没有就当没有分集，不报错。
                 if let d = try? await host.loadDetail(link: item.link) {
                     detail = d
                 }
-            }
+            })
         }
         .onChange(of: playerVM.isResolvingEmbed) { _, resolving in
             // 开始解嵌入页时，停掉正在播的直链（不然旧的直链会继续出声）。
@@ -272,6 +276,8 @@ struct DetailView: View {
             guard !isFullscreen else { return }
             episodeTask?.cancel()
             episodeTask = nil
+            appearTasks.forEach { $0.cancel() }
+            appearTasks = []
             // 重置起播旗：从“相关视频”点返回时 onAppear 会再跑，旗不重置就
             // 永远不重播（离页时播放器已被停掉），只剩黑屏。
             hasStartedPlayback = false

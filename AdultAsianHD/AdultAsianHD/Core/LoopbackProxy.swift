@@ -268,6 +268,13 @@ final class LoopbackProxyServer: NSObject {
             return
         }
         stateLock.lock()
+        // TOCTOU：NWListener 构造期间 stop() 可能已跑过，第二次加锁写
+        // self.listener 前再查一次 stopped，已停就取消刚建的监听直接收手。
+        guard !stopped else {
+            stateLock.unlock()
+            listener.cancel()
+            return
+        }
         self.listener = listener
         stateLock.unlock()
         listener.stateUpdateHandler = { [weak self] state in
@@ -816,6 +823,9 @@ final class LoopbackProxyServer: NSObject {
     private func kindFor(tag: String, url: URL) -> BookKind {
         if tag.hasPrefix("#EXT-X-KEY") || tag.hasPrefix("#EXT-X-SESSION-KEY") { return .key }
         if tag.hasPrefix("#EXT-X-MAP") { return .map }
+        // 无 .m3u8 扩展名的音轨/字幕/I 帧子播单也走变体（缓冲改写），
+        // 不当分片原样流式转发。
+        if tag.hasPrefix("#EXT-X-MEDIA") || tag.hasPrefix("#EXT-X-I-FRAME-STREAM-INF") { return .variant }
         if isPlaylistURL(url) { return .variant }
         return .segment
     }
@@ -1131,6 +1141,18 @@ extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
             if redirected.value(forHTTPHeaderField: key) == nil {
                 redirected.setValue(value, forHTTPHeaderField: key)
             }
+        }
+        if !sameOrigin {
+            // CFNetwork 会把上一跳的自定义头自动复制到 redirected 上；只跳过
+            // 从 self.headers 补加敏感头不够，必须把 redirected 上已继承的
+            // 敏感头也删掉，否则凭据跨域泄漏。
+            if let fields = redirected.allHTTPHeaderFields {
+                for key in fields.keys where NetConstants.isSensitiveHeader(key) {
+                    redirected.setValue(nil, forHTTPHeaderField: key)
+                }
+            }
+            // 跨域重定向也要原样字节，不让上游 gzip。
+            redirected.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         }
         completionHandler(redirected)
     }
