@@ -1,0 +1,548 @@
+// WidgetCrypto.js.txt — Widget.crypto JS 胶水（run #35 第二轮，二进制桥）
+//
+// 组装 Widget.crypto.* 友好 API。原生原语（__fwCryptoAESEncrypt / __fwCryptoAESDecrypt /
+// __fwCryptoXOR / __fwCryptoHash / __fwCryptoHMAC / __fwCryptoRandomBytes）由
+// Core/WidgetCrypto.swift 挂到 JSContext 全局；输入输出全是 base64 字符串。
+// 本文件只做：按字段编码转换、校验、错误映射、GCM tag/aad 组装。
+//
+// 编码约定（三家 AI 评审定稿）：
+// - 不自动识别编码。每个字节参数的编码按字段显式声明：inputEncoding（数据/密文）、
+//   keyEncoding、ivEncoding、outputEncoding，GCM 加 tagEncoding/aadEncoding。
+// - 默认值：解密 in=base64、key/iv=utf8、out=utf8；加密 out=base64。
+//   （全局二进制默认是 base64；key/iv 默认 utf8，因为视频站的 key/iv 常是可读字符串。）
+// - 编码名大小写不敏感，"utf-8" 归一为 "utf8"；支持 utf8 / base64 / base64url / hex。
+// - 解密结果不是合法 UTF-8 时抛错（不静默替换字符）；outputEncoding 可取 base64/hex 拿原始字节。
+//
+// 错误约定：
+// - 参数/契约错 → TypeError（key/iv/tag 长度、未知 mode/padding/编码、ECB 带 iv、
+//   CTR/GCM 传 pkcs7/zero、非法 hex/base64、randomBytes 越界、超 5MB）。
+// - 运行时失败 → Error，带稳定 .code（CRYPTO_BAD_PADDING / CRYPTO_ALIGNMENT_ERROR /
+//   CRYPTO_AUTH_FAILED / CRYPTO_INVALID_UTF8 / CRYPTO_OS_ERROR）。
+// - 超限（输入 > 5MB、randomBytes n 越界）→ RangeError。
+// - 绝不静默返回 null/空串/原样数据；错误信息只写长度和期望长度，不回显 key/iv 内容。
+//
+// GCM 约定：
+// - tag 固定 16 字节。加密默认把 tag 拼在密文末尾（返回 base64(ciphertext + tag)）；
+//   解密默认从输入末尾 16 字节拆 tag；options.tag 单独传时按单独的 tag 用，数据即纯密文。
+// - aad 经 options.aad + options.aadEncoding 传入（默认 utf8，可为空）。
+// - nonce（iv）12 或 16 字节；加密时 iv 必传（不自动生成——返回值是单个字符串，
+//   装不下自动生成的 nonce；要随机 nonce 先调 randomBytes(12) 再传进来）。
+//
+// 注意：本文件是 .txt 资源（Bundle 读盘后 evaluateScript），不是 Swift """ 字符串，
+// 所以反斜杠可用；但 harness 把它嵌进 JS 模板字面量，故不用反引号与 ${。
+
+(function (g) {
+    'use strict';
+
+    // ---------- 基础工具 ----------
+
+    var MAX_INPUT_BYTES = 5 * 1024 * 1024;
+    var MAX_RANDOM_BYTES = 65536;
+
+    function isObject(v) {
+        return v !== null && typeof v === 'object' && !Array.isArray(v);
+    }
+
+    function normEncoding(enc, def) {
+        if (enc === undefined || enc === null) { return def; }
+        var e = String(enc).toLowerCase().replace(/-/g, '');
+        if (e === 'utf8' || e === 'base64' || e === 'base64url' || e === 'hex') { return e; }
+        throw new TypeError('unknown encoding: ' + String(enc));
+    }
+
+    // ---------- UTF-8 编解码（裸 JSContext 没有 TextEncoder/TextDecoder，手工实现） ----------
+
+    // UTF-16 字符串 → UTF-8 字节数组（处理代理对）。
+    function utf8Encode(str) {
+        var bytes = [];
+        for (var i = 0; i < str.length; i++) {
+            var cp = str.charCodeAt(i);
+            if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < str.length) {
+                var lo = str.charCodeAt(i + 1);
+                if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    i++;
+                }
+            }
+            if (cp < 0x80) {
+                bytes.push(cp);
+            } else if (cp < 0x800) {
+                bytes.push(0xC0 | (cp >> 6), 0x80 | (cp & 0x3F));
+            } else if (cp < 0x10000) {
+                bytes.push(0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
+            } else {
+                bytes.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
+            }
+        }
+        return bytes;
+    }
+
+    // UTF-8 字节数组 → UTF-16 字符串。严格解码：非法序列（超长编码、代理区码点、
+    // 超出 U+10FFFF、截断）抛 CRYPTO_INVALID_UTF8，不静默替换字符。
+    function utf8Decode(bytes) {
+        var out = '';
+        var i = 0;
+        while (i < bytes.length) {
+            var b0 = bytes[i];
+            var cp, need;
+            if (b0 < 0x80) {
+                cp = b0; need = 0;
+            } else if ((b0 & 0xE0) === 0xC0) {
+                cp = b0 & 0x1F; need = 1;
+                if (cp < 2) { throw invalidUtf8(); }
+            } else if ((b0 & 0xF0) === 0xE0) {
+                cp = b0 & 0x0F; need = 2;
+            } else if ((b0 & 0xF8) === 0xF0) {
+                cp = b0 & 0x07; need = 3;
+                if (cp > 4) { throw invalidUtf8(); }
+            } else {
+                throw invalidUtf8();
+            }
+            if (i + need >= bytes.length) { throw invalidUtf8(); }
+            for (var j = 1; j <= need; j++) {
+                var bj = bytes[i + j];
+                if ((bj & 0xC0) !== 0x80) { throw invalidUtf8(); }
+                cp = (cp << 6) | (bj & 0x3F);
+            }
+            // 拒绝超长编码与非法码点。
+            if ((need === 2 && cp < 0x800) || (need === 3 && cp < 0x10000)) { throw invalidUtf8(); }
+            if (cp >= 0xD800 && cp <= 0xDFFF) { throw invalidUtf8(); }
+            if (cp > 0x10FFFF) { throw invalidUtf8(); }
+            if (cp < 0x10000) {
+                out += String.fromCharCode(cp);
+            } else {
+                cp -= 0x10000;
+                out += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
+            }
+            i += need + 1;
+        }
+        return out;
+    }
+
+    function invalidUtf8() {
+        var e = new Error('result is not valid UTF-8');
+        e.code = 'CRYPTO_INVALID_UTF8';
+        return e;
+    }
+
+    // ---------- base64 / hex ----------
+
+    var B64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    var B64_REV = {};
+    for (var k = 0; k < 64; k++) { B64_REV[B64_ALPHABET.charAt(k)] = k; }
+
+    // 字节数组 → base64（标准，带 = 填充）。
+    function bytesToB64(bytes) {
+        var out = '';
+        for (var i = 0; i < bytes.length; i += 3) {
+            var b0 = bytes[i], b1 = i + 1 < bytes.length ? bytes[i + 1] : 0, b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+            var n = (b0 << 16) | (b1 << 8) | b2;
+            out += B64_ALPHABET.charAt((n >> 18) & 63);
+            out += B64_ALPHABET.charAt((n >> 12) & 63);
+            out += i + 1 < bytes.length ? B64_ALPHABET.charAt((n >> 6) & 63) : '=';
+            out += i + 2 < bytes.length ? B64_ALPHABET.charAt(n & 63) : '=';
+        }
+        return out;
+    }
+
+    // base64/base64url 字符串 → 字节数组。容忍缺 = 填充与空白；非法字符抛 TypeError。
+    function b64ToBytes(s, urlSafe) {
+        var t = String(s).replace(/[\t\n\f\r ]/g, '');
+        if (urlSafe) { t = t.replace(/-/g, '+').replace(/_/g, '/'); }
+        if (/[^A-Za-z0-9+/=]/.test(t)) { throw new TypeError('invalid base64 input'); }
+        var rem = t.length % 4;
+        if (rem === 1) { throw new TypeError('invalid base64 input'); }
+        if (rem !== 0) { t += '==='.slice(0, 4 - rem); }
+        var bytes = [];
+        for (var i = 0; i < t.length; i += 4) {
+            var c0 = B64_REV[t.charAt(i)], c1 = B64_REV[t.charAt(i + 1)];
+            var c2 = t.charAt(i + 2) === '=' ? 0 : B64_REV[t.charAt(i + 2)];
+            var c3 = t.charAt(i + 3) === '=' ? 0 : B64_REV[t.charAt(i + 3)];
+            if (c0 === undefined || c1 === undefined || c2 === undefined || c3 === undefined) {
+                throw new TypeError('invalid base64 input');
+            }
+            var n = (c0 << 18) | (c1 << 12) | (c2 << 6) | c3;
+            bytes.push((n >> 16) & 0xFF);
+            if (t.charAt(i + 2) !== '=') { bytes.push((n >> 8) & 0xFF); }
+            if (t.charAt(i + 3) !== '=') { bytes.push(n & 0xFF); }
+        }
+        return bytes;
+    }
+
+    // 字节数组 → base64url（无 = 填充）。
+    function bytesToB64Url(bytes) {
+        return bytesToB64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    // hex 字符串 → 字节数组。容忍 0x 前缀；奇数长度或非法字符抛 TypeError。
+    function hexToBytes(s) {
+        var t = String(s);
+        if (t.slice(0, 2) === '0x' || t.slice(0, 2) === '0X') { t = t.slice(2); }
+        if (t.length % 2 !== 0) { throw new TypeError('invalid hex input: odd length'); }
+        if (/[^0-9a-fA-F]/.test(t)) { throw new TypeError('invalid hex input'); }
+        var bytes = [];
+        for (var i = 0; i < t.length; i += 2) {
+            bytes.push(parseInt(t.slice(i, i + 2), 16));
+        }
+        return bytes;
+    }
+
+    // 字节数组 → hex（小写）。
+    function bytesToHex(bytes) {
+        var out = '';
+        for (var i = 0; i < bytes.length; i++) {
+            var h = bytes[i].toString(16);
+            out += h.length === 1 ? '0' + h : h;
+        }
+        return out;
+    }
+
+    // ---------- 编码转换（字符串 → base64 / base64 → 字符串） ----------
+
+    // 任意编码的字符串 → base64（给 Swift 原语用）。
+    function strToB64(s, enc) {
+        if (typeof s !== 'string') { throw new TypeError('expected a string'); }
+        switch (enc) {
+            case 'utf8': return bytesToB64(utf8Encode(s));
+            case 'base64': return bytesToB64(b64ToBytes(s, false));
+            case 'base64url': return bytesToB64(b64ToBytes(s, true));
+            case 'hex': return bytesToB64(hexToBytes(s));
+            default: throw new TypeError('unknown encoding: ' + enc);
+        }
+    }
+
+    // base64 → 目标编码的字符串。
+    function b64ToStr(b64, enc) {
+        var bytes = b64ToBytes(b64, false);
+        switch (enc) {
+            case 'utf8': return utf8Decode(bytes);
+            case 'base64': return b64;
+            case 'base64url': return bytesToB64Url(bytes);
+            case 'hex': return bytesToHex(bytes);
+            default: throw new TypeError('unknown encoding: ' + enc);
+        }
+    }
+
+    // base64 → 字节数组（供长度校验用）。
+    function b64ByteLength(b64) {
+        return b64ToBytes(b64, false).length;
+    }
+
+    // ---------- 错误映射 ----------
+
+    // Swift 原语返回 {ok:false, code, message} 时，按 code 抛对应的 JS 错误。
+    function throwNativeError(res) {
+        var code = res.code || 'CRYPTO_OS_ERROR';
+        var message = res.message || 'crypto operation failed';
+        if (code === 'INVALID_PARAMETER') {
+            throw new TypeError(message);
+        }
+        if (code === 'RANGE') {
+            throw new RangeError(message);
+        }
+        var e = new Error(message);
+        e.code = code;
+        throw e;
+    }
+
+    function checkNative(res) {
+        if (!res || res.ok !== true) {
+            throwNativeError(res || { code: 'CRYPTO_OS_ERROR', message: 'crypto operation failed' });
+        }
+        return res;
+    }
+
+    // ---------- 校验 ----------
+
+    function checkByteLength(b64, allowed, name) {
+        var len = b64ByteLength(b64);
+        if (allowed.indexOf(len) < 0) {
+            throw new TypeError(name + ' must be ' + allowed.join('/') + ' bytes, got ' + len);
+        }
+        return len;
+    }
+
+    function checkMaxBytes(b64, name) {
+        if (b64ByteLength(b64) > MAX_INPUT_BYTES) {
+            throw new RangeError(name + ' exceeds ' + MAX_INPUT_BYTES + ' bytes');
+        }
+    }
+
+    // ---------- AES ----------
+
+    function normMode(mode) {
+        if (mode === undefined || mode === null) { return 'CBC'; }
+        var m = String(mode).toUpperCase();
+        if (m === 'CBC' || m === 'ECB' || m === 'CTR' || m === 'GCM') { return m; }
+        throw new TypeError('unknown mode: ' + String(mode));
+    }
+
+    function normPadding(padding, mode) {
+        var p = padding === undefined || padding === null
+            ? (mode === 'CBC' || mode === 'ECB' ? 'pkcs7' : 'none')
+            : String(padding).toLowerCase();
+        if (p !== 'pkcs7' && p !== 'none' && p !== 'zero') {
+            throw new TypeError('unknown padding: ' + String(padding));
+        }
+        // CTR/GCM 不需要 padding，显式传 pkcs7/zero 直接抛错（不能含糊）。
+        if ((mode === 'CTR' || mode === 'GCM') && p !== 'none') {
+            throw new TypeError('padding must be none for ' + mode);
+        }
+        return p;
+    }
+
+    // 把 options 里的 iv/key/data 按字段编码转成 base64，并做长度校验。
+    // 返回 {dataB64, keyB64, ivB64, tagB64, aadB64}（缺失的为 null）。
+    function prepareAES(data, key, options, isEncrypt) {
+        var opts = isObject(options) ? options : {};
+        var mode = normMode(opts.mode);
+        var padding = normPadding(opts.padding, mode);
+        var inputEnc = normEncoding(opts.inputEncoding, isEncrypt ? 'utf8' : 'base64');
+        var keyEnc = normEncoding(opts.keyEncoding, 'utf8');
+        var ivEnc = normEncoding(opts.ivEncoding, 'utf8');
+        var outputEnc = normEncoding(opts.outputEncoding, isEncrypt ? 'base64' : 'utf8');
+        var tagEnc = normEncoding(opts.tagEncoding, 'base64');
+        var aadEnc = normEncoding(opts.aadEncoding, 'utf8');
+
+        if (typeof data !== 'string') { throw new TypeError('data must be a string'); }
+        if (typeof key !== 'string') { throw new TypeError('key must be a string'); }
+        var dataB64 = strToB64(data, inputEnc);
+        var keyB64 = strToB64(key, keyEnc);
+        checkMaxBytes(dataB64, 'data');
+        checkByteLength(keyB64, [16, 24, 32], 'key');
+
+        var ivB64 = null;
+        if (mode === 'ECB') {
+            if (opts.iv !== undefined && opts.iv !== null && String(opts.iv) !== '') {
+                throw new TypeError('ECB must not carry an iv');
+            }
+        } else {
+            // CBC/CTR/GCM 的 iv 必传（加密不自动生成——返回值是单个字符串，装不下自动生成的 nonce）。
+            if (opts.iv === undefined || opts.iv === null || String(opts.iv) === '') {
+                throw new TypeError('iv is required for ' + mode);
+            }
+            if (typeof opts.iv !== 'string') { throw new TypeError('iv must be a string'); }
+            ivB64 = strToB64(opts.iv, ivEnc);
+            if (mode === 'GCM') {
+                checkByteLength(ivB64, [12, 16], 'iv');
+            } else {
+                checkByteLength(ivB64, [16], 'iv');
+            }
+        }
+
+        var tagB64 = null;
+        if (mode === 'GCM' && opts.tag !== undefined && opts.tag !== null && String(opts.tag) !== '') {
+            if (typeof opts.tag !== 'string') { throw new TypeError('tag must be a string'); }
+            tagB64 = strToB64(opts.tag, tagEnc);
+            checkByteLength(tagB64, [16], 'tag');
+        }
+
+        var aadB64 = null;
+        if (opts.aad !== undefined && opts.aad !== null && String(opts.aad) !== '') {
+            if (typeof opts.aad !== 'string') { throw new TypeError('aad must be a string'); }
+            aadB64 = strToB64(opts.aad, aadEnc);
+            checkMaxBytes(aadB64, 'aad');
+        }
+
+        // padding:'none' 时数据长度必须是 16 的倍数（CBC/ECB）。
+        if ((mode === 'CBC' || mode === 'ECB') && padding === 'none') {
+            if (b64ByteLength(dataB64) % 16 !== 0) {
+                throw new TypeError('data length must be a multiple of 16 with padding none');
+            }
+        }
+        // padding:'zero' 的加密：JS 侧先把明文补零到 16 倍数，再按 none 调原语。
+        if (isEncrypt && (mode === 'CBC' || mode === 'ECB') && padding === 'zero') {
+            var bytes = b64ToBytes(dataB64, false);
+            var rem = bytes.length % 16;
+            if (rem !== 0) {
+                for (var i = rem; i < 16; i++) { bytes.push(0); }
+                dataB64 = bytesToB64(bytes);
+            }
+            padding = 'none';
+        }
+
+        return {
+            dataB64: dataB64, keyB64: keyB64, ivB64: ivB64, tagB64: tagB64, aadB64: aadB64,
+            mode: mode, padding: padding, outputEnc: outputEnc
+        };
+    }
+
+    function aesDecrypt(data, key, options) {
+        var p = prepareAES(data, key, options, false);
+        // GCM 且没单独传 tag：默认从输入末尾 16 字节拆 tag。
+        var tagB64 = p.tagB64;
+        var dataB64 = p.dataB64;
+        if (p.mode === 'GCM' && tagB64 === null) {
+            var bytes = b64ToBytes(dataB64, false);
+            if (bytes.length < 16) {
+                throw new TypeError('GCM input must include a 16-byte tag');
+            }
+            tagB64 = bytesToB64(bytes.slice(bytes.length - 16));
+            dataB64 = bytesToB64(bytes.slice(0, bytes.length - 16));
+        }
+        var res = checkNative(g.__fwCryptoAESDecrypt(dataB64, p.keyB64, p.ivB64, p.mode, p.padding, tagB64, p.aadB64));
+        return b64ToStr(res.plaintext, p.outputEnc);
+    }
+
+    function aesEncrypt(data, key, options) {
+        var p = prepareAES(data, key, options, true);
+        var res = checkNative(g.__fwCryptoAESEncrypt(p.dataB64, p.keyB64, p.ivB64, p.mode, p.padding, p.aadB64));
+        // GCM：默认把 tag 拼在密文末尾（返回 base64(ciphertext + tag)）。
+        var outB64 = res.ciphertext;
+        if (p.mode === 'GCM' && res.tag) {
+            var cb = b64ToBytes(outB64, false);
+            var tb = b64ToBytes(res.tag, false);
+            outB64 = bytesToB64(cb.concat(tb));
+        }
+        return b64ToStr(outB64, p.outputEnc);
+    }
+
+    // ---------- XOR ----------
+
+    function xor(data, key, options) {
+        var opts = isObject(options) ? options : {};
+        var inputEnc = normEncoding(opts.inputEncoding, 'base64');
+        var keyEnc = normEncoding(opts.keyEncoding, 'utf8');
+        var outputEnc = normEncoding(opts.outputEncoding, 'base64');
+        if (typeof data !== 'string') { throw new TypeError('data must be a string'); }
+        if (typeof key !== 'string') { throw new TypeError('key must be a string'); }
+        var dataB64 = strToB64(data, inputEnc);
+        var keyB64 = strToB64(key, keyEnc);
+        checkMaxBytes(dataB64, 'data');
+        if (b64ByteLength(keyB64) === 0) { throw new TypeError('key must not be empty'); }
+        var res = checkNative(g.__fwCryptoXOR(dataB64, keyB64));
+        return b64ToStr(res.result, outputEnc);
+    }
+
+    // ---------- base64 / hex ----------
+
+    function base64Encode(data, options) {
+        var opts = isObject(options) ? options : {};
+        var inputEnc = normEncoding(opts.inputEncoding, 'utf8');
+        if (typeof data !== 'string') { throw new TypeError('data must be a string'); }
+        var b64 = strToB64(data, inputEnc);
+        checkMaxBytes(b64, 'data');
+        if (opts.urlSafe) { return bytesToB64Url(b64ToBytes(b64, false)); }
+        if (opts.noPadding) { return b64.replace(/=+$/, ''); }
+        return b64;
+    }
+
+    function base64Decode(data, options) {
+        var opts = isObject(options) ? options : {};
+        var outputEnc = normEncoding(opts.outputEncoding, 'utf8');
+        if (typeof data !== 'string') { throw new TypeError('data must be a string'); }
+        var urlSafe = !!opts.urlSafe;
+        var b64 = bytesToB64(b64ToBytes(data, urlSafe));
+        checkMaxBytes(b64, 'data');
+        return b64ToStr(b64, outputEnc);
+    }
+
+    function hexEncode(data, options) {
+        var opts = isObject(options) ? options : {};
+        var inputEnc = normEncoding(opts.inputEncoding, 'utf8');
+        if (typeof data !== 'string') { throw new TypeError('data must be a string'); }
+        var b64 = strToB64(data, inputEnc);
+        checkMaxBytes(b64, 'data');
+        return bytesToHex(b64ToBytes(b64, false));
+    }
+
+    function hexDecode(data, options) {
+        var opts = isObject(options) ? options : {};
+        var outputEnc = normEncoding(opts.outputEncoding, 'utf8');
+        if (typeof data !== 'string') { throw new TypeError('data must be a string'); }
+        var b64 = bytesToB64(hexToBytes(data));
+        checkMaxBytes(b64, 'data');
+        return b64ToStr(b64, outputEnc);
+    }
+
+    // ---------- hash / hmac ----------
+
+    function normHashAlgorithm(algo) {
+        var a = String(algo || 'sha256').toLowerCase().replace(/-/g, '');
+        if (a === 'md5' || a === 'sha1' || a === 'sha256' || a === 'sha512') { return a; }
+        throw new TypeError('unknown hash algorithm: ' + String(algo));
+    }
+
+    function hash(data, options) {
+        var opts = isObject(options) ? options : {};
+        var algorithm = normHashAlgorithm(opts.algorithm);
+        var inputEnc = normEncoding(opts.inputEncoding, 'utf8');
+        var outputEnc = normEncoding(opts.outputEncoding, 'hex');
+        if (typeof data !== 'string') { throw new TypeError('data must be a string'); }
+        var dataB64 = strToB64(data, inputEnc);
+        checkMaxBytes(dataB64, 'data');
+        var res = checkNative(g.__fwCryptoHash(algorithm, dataB64));
+        // 原语返回 hex；outputEncoding 为 hex 时直接返回，否则转码。
+        if (outputEnc === 'hex') { return res.result; }
+        return b64ToStr(bytesToB64(hexToBytes(res.result)), outputEnc);
+    }
+
+    function hmac(algorithm, data, key, options) {
+        var opts = isObject(options) ? options : {};
+        var algo = normHashAlgorithm(algorithm);
+        var inputEnc = normEncoding(opts.inputEncoding, 'utf8');
+        var keyEnc = normEncoding(opts.keyEncoding, 'utf8');
+        var outputEnc = normEncoding(opts.outputEncoding, 'hex');
+        if (typeof data !== 'string') { throw new TypeError('data must be a string'); }
+        if (typeof key !== 'string') { throw new TypeError('key must be a string'); }
+        var dataB64 = strToB64(data, inputEnc);
+        var keyB64 = strToB64(key, keyEnc);
+        checkMaxBytes(dataB64, 'data');
+        var res = checkNative(g.__fwCryptoHMAC(algo, dataB64, keyB64));
+        if (outputEnc === 'hex') { return res.result; }
+        return b64ToStr(bytesToB64(hexToBytes(res.result)), outputEnc);
+    }
+
+    // ---------- random ----------
+
+    function randomBytes(n, options) {
+        var opts = isObject(options) ? options : {};
+        var outputEnc = normEncoding(opts.outputEncoding, 'base64');
+        if (typeof n !== 'number' || Math.floor(n) !== n || n < 0 || n > MAX_RANDOM_BYTES) {
+            throw new RangeError('n must be an integer 0...' + MAX_RANDOM_BYTES);
+        }
+        var res = checkNative(g.__fwCryptoRandomBytes(n));
+        return b64ToStr(res.result, outputEnc);
+    }
+
+    // ---------- 挂到 Widget.crypto ----------
+
+    var crypto = {
+        aesDecrypt: aesDecrypt,
+        aesEncrypt: aesEncrypt,
+        xor: xor,
+        base64Encode: base64Encode,
+        base64Decode: base64Decode,
+        hexEncode: hexEncode,
+        hexDecode: hexDecode,
+        hash: hash,
+        md5: function (data, options) {
+            var opts = isObject(options) ? options : {};
+            opts.algorithm = 'md5';
+            return hash(data, opts);
+        },
+        sha1: function (data, options) {
+            var opts = isObject(options) ? options : {};
+            opts.algorithm = 'sha1';
+            return hash(data, opts);
+        },
+        sha256: function (data, options) {
+            var opts = isObject(options) ? options : {};
+            opts.algorithm = 'sha256';
+            return hash(data, opts);
+        },
+        sha512: function (data, options) {
+            var opts = isObject(options) ? options : {};
+            opts.algorithm = 'sha512';
+            return hash(data, opts);
+        },
+        hmac: hmac,
+        randomBytes: randomBytes
+    };
+
+    if (g.Widget) {
+        g.Widget.crypto = crypto;
+    } else {
+        g.Widget = { crypto: crypto };
+    }
+})(this);

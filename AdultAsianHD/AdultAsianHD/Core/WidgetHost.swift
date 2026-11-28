@@ -1335,6 +1335,19 @@ final class WidgetHost: @unchecked Sendable {
             exceptionBox.message = nil
         }
 
+        // Widget.crypto（原生解密/编解码，二进制桥，见 Core/WidgetCrypto.swift +
+        // Core/WidgetCrypto.js.txt）：在 installWidgetBridge 末尾挂一次注册，不碰现有
+        // Widget.*。原语挂全局 __fwCrypto*，胶水组装 Widget.crypto.*。读不到胶水时
+        // install 内部跳过，模块调 Widget.crypto 时再报"不可用"，不连累整个桥。
+        WidgetCrypto.install(into: context)
+        #if DEBUG
+        if let exception = context.exception {
+            print("[WidgetHost] WidgetCrypto 胶水注入失败：\(exception.toString() ?? "")")
+        }
+        #endif
+        context.exception = nil
+        exceptionBox.message = nil
+
         // __fwArrayBufferFromBytes（内部助手，Widget.http 回值 .arrayBuffer 用）：
         // JS 数字数组（0–255）→ ArrayBuffer。只在 Swift 侧的 jsArrayBuffer 里调，模块不用直接调它。
         context.evaluateScript("""
