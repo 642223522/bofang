@@ -2007,7 +2007,9 @@ final class WidgetHost: @unchecked Sendable {
         // 超限即拒：arrayBuffer 定义成 undefined 数据属性（JS 侧与原来一致，
         // 不抛错、不改接口），但这里明确记一条日志，不静默。
         if raw.count > ArrayBufferPendingQueue.maxSingleBytes {
+            #if DEBUG
             print("[WidgetHost] arrayBuffer 响应过大（\(raw.count) 字节 > 128 MiB），拒绝入队，arrayBuffer 缺省")
+            #endif
             if let undefined = JSValue(undefinedIn: context) {
                 result.defineProperty(
                     "arrayBuffer",
@@ -2140,10 +2142,10 @@ final class WidgetHost: @unchecked Sendable {
             totalBytes += data.count
             // FIFO 只限制未读累计量：淘汰最旧项，但刚存进来的这一项自己
             // 绝不被淘汰（items.count > 1 守卫：超限时先淘汰旧项，只剩
-            // 新项时即便仍超累计上限也留着它，不静默丢弃。注：旧
-            // installArrayBuffer 的 >16 MiB guard 在进队前就 return，
-            // store() 实际从未见过超限项，守卫是防超限项进队后自淘汰，
-            // 不是修已发生的旧行为）。
+            // 新项时即便仍超累计上限也留着它，不静默丢弃。注：installArrayBuffer
+            // 的入队前 guard 现在是 >128 MiB 单项上限，store() 会常规见到
+            // 17–128 MiB 的单项（它们超过 16 MiB 累计上限，全靠这道守卫才
+            // 不被自己一入队就淘汰）；守卫是现行必需，不是纯防御代码）。
             while (items.count > Self.maxEntries || totalBytes > Self.maxBytes) && items.count > 1 {
                 let oldest = items.removeFirst()
                 totalBytes -= oldest.data.count
