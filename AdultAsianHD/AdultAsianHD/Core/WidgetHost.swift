@@ -303,8 +303,9 @@ final class WidgetHost: @unchecked Sendable {
     /// 前缀 fw.localstorage.）、全局 fetch（GET/POST 最小实现）、setTimeout / clearTimeout、
     /// setInterval / clearInterval、console.log / info / debug / warn / error（多参数拼接）。
     /// Widget.html.load / loadURL（Cheerio DOM 解析，见 Core/WidgetHTML.js.txt；
-    /// 底层 cheerio bundle 与最小 URL 构造器都由 __fwEnsureCheerio 懒注入——
-    /// 只在第一次调 html.load/loadURL 时装，不用的模块看不到新的全局 URL；
+    /// URL/URLSearchParams 在建桥时就装（模块可能在第一次调 html.load 之前就 new URL，
+    /// 懒装会让它 ReferenceError）；只有 cheerio bundle 由 __fwEnsureCheerio 懒注入——
+    /// 只在第一次调 html.load/loadURL 时装，不用的模块不付这个钱；
     /// 裸 JSC 没有 URL，cheerio 的 prop('href')/prop('src') 靠它解析相对地址）。
     /// 模块发现三路超集、loadDetail/childItems/relatedItems 解析、分类拦截器都不在这里动。
     private static func installWidgetBridge(in context: JSContext, interceptor: CategoryRequestInterceptor, httpRegistry: HTTPRequestRegistry, exceptionBox: ExceptionBox) {
@@ -518,17 +519,27 @@ final class WidgetHost: @unchecked Sendable {
             // WHATWG 预处理：先全局删掉 ASCII tab/LF/CR（URL 内部的也删，不只首尾；
             // 脏 HTML 的多行 href 属性里常有换行，不删会被编成 %0A 导致 404），
             // 再去掉首尾 C0 控制字符与空格（U+0000–U+0020）。
+            // 注意："\r\n" 在 Swift 里是单个字形簇（Character），Character.filter
+            // 认不出它（既不等于 "\r" 也不等于 "\n"，会漏网），所以先整体替换掉
+            // "\r\n"，再用 filter 删剩余的单个 \t \n \r。
             let stripSet = CharacterSet(charactersIn: UnicodeScalar(0)...UnicodeScalar(0x20))
             let clean = { (s: String) -> String in
-                s.trimmingCharacters(in: stripSet).filter { $0 != "\t" && $0 != "\n" && $0 != "\r" }
+                s.replacingOccurrences(of: "\r\n", with: "")
+                 .trimmingCharacters(in: stripSet)
+                 .filter { $0 != "\t" && $0 != "\n" && $0 != "\r" }
             }
             let trimmed = clean(urlString)
             let trimmedBase = baseString.map(clean)
             let base: URL? = trimmedBase.flatMap { URL(string: $0) }
+            // 特殊协议集合（WHATWG 特殊 scheme）：host 必须非空，空路径补 "/"。
+            let specialSchemes: Set<String> = ["http", "https", "ws", "wss", "ftp"]
             // base 传了但解析失败、或解析出来没有 scheme（Foundation 能建出无 scheme 的
             // 相对 URL，非 nil）→ 无效（WHATWG 会抛），不能悄悄当成没传 base。
+            // 特殊协议的 base 还必须有 host（Foundation 能建出 "https:" 这种无 host 的，
+            // WHATWG 不认；"http:///foo" 同理）。
             if baseString != nil {
                 guard let b = base, b.scheme != nil else { return nil }
+                if specialSchemes.contains(b.scheme!.lowercased()), (b.host ?? "").isEmpty { return nil }
             }
             // 空串（或只剩空白）解析为 base 本身，但要剥掉 base 的 #fragment
             //（WHATWG：空引用指向 base 文档，不带 fragment）；没有 base 时无效。
@@ -545,6 +556,10 @@ final class WidgetHost: @unchecked Sendable {
             let scheme = resolved.scheme!.lowercased()
             // host 小写（WHATWG 小写 host，Foundation 保留输入大小写）。
             let host = (resolved.host ?? "").lowercased()
+            // 特殊协议必须有 host（"https:"、"http:///foo" 这种 Foundation 能建出来，
+            // WHATWG 不认；不拦会产出 hostname:""、origin:"null" 的坏 URL）。
+            let special = specialSchemes.contains(scheme)
+            if special && host.isEmpty { return nil }
             let port = resolved.port
             let defaultPort: Int? = {
                 switch scheme {
@@ -563,27 +578,41 @@ final class WidgetHost: @unchecked Sendable {
                 return host.contains(":") ? "[\(host)]" : host
             }()
             let hostWithPort = formattedHost.isEmpty ? "" : (effectivePort.isEmpty ? formattedHost : "\(formattedHost):\(effectivePort)")
-            let special = ["http", "https", "ws", "wss", "ftp"].contains(scheme)
             let origin = (special && !host.isEmpty) ? "\(scheme)://\(hostWithPort)" : "null"
-            // pathname/search/hash 用 URLComponents 的 percentEncoded* 字段（保留百分号编码，
-            // 与 WHATWG 一致）；URLComponents 建不出来时回退到 Foundation 的解码值。
-            let components = URLComponents(url: resolved, resolvingAgainstBaseURL: true)
+            // href 归一化：把算好的值写回一份可变的 URLComponents 再序列化（上轮的 bug：
+            // components 是 let 且一个值都没写回，components?.string 输出的是未归一化的
+            // 原串——大写 host、默认端口、空路径都没修，href 与 origin/pathname 矛盾）。
+            // 只改这几项：scheme 小写、host 小写、默认端口置 nil、特殊协议空路径补 "/"、
+            // 空 query/fragment 置 nil（不然会序列化成 "?" / "#"）；其余字段原样保留。
+            var components = URLComponents(url: resolved, resolvingAgainstBaseURL: true)
+            components?.scheme = scheme
+            if host.isEmpty {
+                components?.host = nil
+            } else if host.hasPrefix("[") && host.hasSuffix("]") {
+                // IPv6：URLComponents.host 存不带括号的地址，序列化时它自己加括号。
+                components?.host = String(host.dropFirst().dropLast())
+            } else {
+                components?.host = host
+            }
+            components?.port = (port != nil && port != defaultPort) ? port : nil
+            if special && (components?.percentEncodedPath ?? "").isEmpty {
+                components?.percentEncodedPath = "/"
+            }
+            if (components?.percentEncodedQuery ?? "").isEmpty { components?.percentEncodedQuery = nil }
+            if (components?.percentEncodedFragment ?? "").isEmpty { components?.percentEncodedFragment = nil }
+            // pathname/search/hash 从归一化后的 components 读（与 href 同一套值，不再各读各的）。
             let pathname: String = {
                 if let p = components?.percentEncodedPath, !p.isEmpty { return p }
-                let path = resolved.path
-                return path.isEmpty ? "/" : path
+                return special ? "/" : ""
             }()
             let search: String = {
-                if let q = components?.percentEncodedQuery { return "?" + q }
-                return resolved.query.map { "?\($0)" } ?? ""
+                if let q = components?.percentEncodedQuery, !q.isEmpty { return "?" + q }
+                return ""
             }()
             let hash: String = {
-                if let f = components?.percentEncodedFragment { return "#" + f }
-                return resolved.fragment.map { "#\($0)" } ?? ""
+                if let f = components?.percentEncodedFragment, !f.isEmpty { return "#" + f }
+                return ""
             }()
-            // href 用 URLComponents 的归一化序列化（host 小写、默认端口剥离），与
-            // origin/host/port/pathname 保持一致（模块常写 u.href.startsWith(u.origin)）；
-            // URLComponents 建不出来时回退到 Foundation 的原串。
             let href = components?.string ?? resolved.absoluteString
             return [
                 "href": href,
@@ -604,7 +633,7 @@ final class WidgetHost: @unchecked Sendable {
         // 两个构造器各装各的（JSC 哪天自带了其中一个就用原生的，另一个照样补）。
         // searchParams 是活的：set/append/delete 后回写 URL 的 search 与 href（WHATWG 行为），
         // 否则模块 u.searchParams.set('page','2') 再拿 u.href 发请求会发旧地址。
-        context.evaluateScript("""
+                context.evaluateScript("""
             (function (g) {
                 // form-urlencoded 编码：encodeURIComponent 保留 ! ' ( ) ~，但 URLSearchParams
                 // 的序列化要把这 5 个也编成 %XX；空格编成 +。lone surrogate 先替成 U+FFFD
@@ -650,23 +679,40 @@ final class WidgetHost: @unchecked Sendable {
                         pairs.push([decode(k), decode(v)]);
                     }
                 };
-                // 最小 URLSearchParams：第二参数 onChange 是可选的回写回调（URL 构造器传进来，
-                // set/append/delete 后调它同步回 URL 的 search/href；独立 new 出来的没有回调）。
-                // 构造器先定义成本地变量，再按需挂到全局——这样 URL 内部永远用自己这份
-                //（带回写回调），不依赖全局是不是原生实现。
-                var URLSearchParamsCtor = function (init, onChange) {
-                    this._pairs = [];
-                    this._onChange = (typeof onChange === 'function') ? onChange : null;
+                // 最小 URLSearchParams。
+                // 构造器先定义成本地变量，再按需挂到全局——这样 URL 内部永远用自己这份，
+                // 不依赖全局是不是原生实现。
+                // _pairs/_onChange 用 defineProperty 设成不可枚举（模块 for..in / Object.keys
+                // 不该看到它们；new URLSearchParams(sp) 时也不会把它们当成 query key）。
+                // 公开构造器不收 onChange 参数（URL 构造器在内部给 searchParams 赋值
+                // sp._onChange = onQueryChange，避免内部回调暴露在公开 API 上）。
+                // init 识别：字符串 → parseQuery；同款实例 → instanceof 拷 pairs；
+                // 数组 → [k, v] 对；Map / 原生 URLSearchParams / 其他可迭代 → Symbol.iterator；
+                // 普通对象 → 自有可枚举 key（旧代码的 init._pairs 鸭子类型会误判普通对象，
+                // { _pairs: "abc" } 会被拆成 a=undefined&b=undefined&c=undefined，已删）。
+                var URLSearchParamsCtor = function (init) {
+                    if (!(this instanceof URLSearchParamsCtor)) {
+                        throw new TypeError("Failed to construct 'URLSearchParams': Please use the 'new' operator");
+                    }
+                    Object.defineProperty(this, '_pairs', { value: [], writable: true, enumerable: false, configurable: true });
+                    Object.defineProperty(this, '_onChange', { value: null, writable: true, enumerable: false, configurable: true });
                     if (typeof init === 'string') {
                         parseQuery(init, this._pairs);
                     } else if (init && typeof init === 'object') {
-                        if (init._pairs && init._pairs.length !== undefined) {
+                        if (init instanceof URLSearchParamsCtor) {
                             for (var a = 0; a < init._pairs.length; a++) {
-                                this._pairs.push([String(init._pairs[a][0]), String(init._pairs[a][1])]);
+                                this._pairs.push([init._pairs[a][0], init._pairs[a][1]]);
                             }
                         } else if (Array.isArray(init)) {
                             for (var b = 0; b < init.length; b++) {
                                 this._pairs.push([String(init[b][0]), String(init[b][1])]);
+                            }
+                        } else if (typeof Symbol !== 'undefined' && Symbol.iterator && typeof init[Symbol.iterator] === 'function') {
+                            var it = init[Symbol.iterator]();
+                            var step;
+                            while (!(step = it.next()).done) {
+                                var pair = step.value;
+                                this._pairs.push([String(pair[0]), String(pair[1])]);
                             }
                         } else {
                             for (var key in init) {
@@ -731,6 +777,32 @@ final class WidgetHost: @unchecked Sendable {
                     }
                     return out.join('&');
                 };
+                // forEach/keys/values/entries：最小实现，keys/values/entries 返回数组
+                //（数组本身可迭代，for (const k of sp.keys()) 能用；标准返回的是迭代器，
+                // 这里图简单返回数组，模块按数组用也行）。
+                URLSearchParamsCtor.prototype.forEach = function (cb, thisArg) {
+                    for (var i = 0; i < this._pairs.length; i++) {
+                        cb.call(thisArg, this._pairs[i][1], this._pairs[i][0], this);
+                    }
+                };
+                URLSearchParamsCtor.prototype.keys = function () {
+                    var out = [];
+                    for (var i = 0; i < this._pairs.length; i++) { out.push(this._pairs[i][0]); }
+                    return out;
+                };
+                URLSearchParamsCtor.prototype.values = function () {
+                    var out = [];
+                    for (var i = 0; i < this._pairs.length; i++) { out.push(this._pairs[i][1]); }
+                    return out;
+                };
+                URLSearchParamsCtor.prototype.entries = function () {
+                    return this._pairs.slice();
+                };
+                if (typeof Symbol !== 'undefined' && Symbol.iterator) {
+                    URLSearchParamsCtor.prototype[Symbol.iterator] = function () {
+                        return this.entries()[Symbol.iterator]();
+                    };
+                }
                 if (typeof g.URLSearchParams !== 'function') { g.URLSearchParams = URLSearchParamsCtor; }
                 if (typeof g.URL !== 'function') {
                     var URLCtor = function (url, base) {
@@ -742,39 +814,80 @@ final class WidgetHost: @unchecked Sendable {
                         var parts = g.__fwResolveURL(String(url), base === undefined ? null : String(base));
                         if (!parts) { throw new TypeError('Invalid URL'); }
                         var self = this;
+                        // 闭包里维护唯一真相：_prefix（search 之前的部分）、_search、_hash、_href。
+                        // 公开的 href/search/hash 都走 defineProperty 读写这份状态，不再用可变的
+                        // this.hash/this.href 反推（上轮的 bug：先改 hash 再改 searchParams，
+                        // prefix 切片会用变长的 hash 截断 pathname；先改 href 再改 searchParams
+                        // 会把 href 回滚回旧值）。
+                        var _prefix = parts.href.slice(0, parts.href.length - parts.search.length - parts.hash.length);
                         var _search = parts.search;
+                        var _hash = parts.hash;
                         var _href = parts.href;
+                        // 从 parts 重建全部状态（href/search/hash 三个 setter 共用：先拼候选串，
+                        // 再调 __fwResolveURL 重解析，让 Swift 侧做归一化与编码；searchParams
+                        // 原地重建，不换对象，模块手里的引用不断）。
+                        var applyParts = function (p) {
+                            _prefix = p.href.slice(0, p.href.length - p.search.length - p.hash.length);
+                            _search = p.search;
+                            _hash = p.hash;
+                            _href = p.href;
+                            self.protocol = p.protocol;
+                            self.host = p.host;
+                            self.hostname = p.hostname;
+                            self.port = p.port;
+                            self.pathname = p.pathname;
+                            self.origin = p.origin;
+                            self.searchParams._pairs.length = 0;
+                            parseQuery(p.search, self.searchParams._pairs);
+                        };
                         // searchParams 改动后回写：只换查询串，path 与 fragment 原样保留
-                        //（href = 旧 href 去掉旧 search 与 hash，再拼新 search 与 hash）。
+                        //（_href = _prefix + 新 search + _hash；query 已由 formEncode 编过，
+                        // 没有空格/#，直接拼是安全的）。
                         var onQueryChange = function (query) {
                             var newSearch = query ? '?' + query : '';
-                            var prefix = _href.slice(0, _href.length - _search.length - self.hash.length);
                             _search = newSearch;
-                            _href = prefix + newSearch + self.hash;
-                            self.href = _href;
+                            _href = _prefix + _search + _hash;
                         };
-                        this.href = _href;
                         this.protocol = parts.protocol;
                         this.host = parts.host;
                         this.hostname = parts.hostname;
                         this.port = parts.port;
                         this.pathname = parts.pathname;
-                        this.hash = parts.hash;
                         this.origin = parts.origin;
-                        this.searchParams = new URLSearchParamsCtor(parts.search, onQueryChange);
-                        // search 有 setter：改 search 就重建查询串与 href，并把同一份
-                        // searchParams 对象的内容换成新查询串（不换对象，模块手里的引用不断）。
+                        this.searchParams = new URLSearchParamsCtor(parts.search);
+                        this.searchParams._onChange = onQueryChange;
+                        Object.defineProperty(this, 'href', {
+                            get: function () { return _href; },
+                            set: function (v) {
+                                var p = g.__fwResolveURL(String(v), null);
+                                if (!p) { throw new TypeError('Invalid URL'); }
+                                applyParts(p);
+                            },
+                            enumerable: true,
+                            configurable: true
+                        });
                         Object.defineProperty(this, 'search', {
                             get: function () { return _search; },
                             set: function (v) {
-                                var s = (v == null) ? '' : String(v);
+                                // String(v) 直转：null → "null"（WHATWG 字符串化语义），
+                                // 不再特殊处理成空串（上轮 u.search = null 会错误清空 query）。
+                                var s = String(v);
                                 if (s && s.charAt(0) !== '?') { s = '?' + s; }
-                                var prefix = _href.slice(0, _href.length - _search.length - self.hash.length);
-                                _search = s;
-                                _href = prefix + s + self.hash;
-                                self.href = _href;
-                                self.searchParams._pairs.length = 0;
-                                parseQuery(s, self.searchParams._pairs);
+                                var p = g.__fwResolveURL(_prefix + s + _hash, null);
+                                if (!p) { throw new TypeError('Invalid URL'); }
+                                applyParts(p);
+                            },
+                            enumerable: true,
+                            configurable: true
+                        });
+                        Object.defineProperty(this, 'hash', {
+                            get: function () { return _hash; },
+                            set: function (v) {
+                                var h = String(v);
+                                if (h && h.charAt(0) !== '#') { h = '#' + h; }
+                                var p = g.__fwResolveURL(_prefix + _search + h, null);
+                                if (!p) { throw new TypeError('Invalid URL'); }
+                                applyParts(p);
                             },
                             enumerable: true,
                             configurable: true
@@ -865,6 +978,13 @@ final class WidgetHost: @unchecked Sendable {
             guard let bundle = Self.cheerioBundle else { return false }
             // withSourceURL 让堆栈里有文件名（否则 bundle 抛错时只剩匿名脚本）。
             context.evaluateScript(bundle, withSourceURL: URL(string: "host://cheerio.min.js.txt"))
+            // bundle 抛错就直接清掉异常返回 false，不要继续检查 __fwCheerioLoad
+            //（上轮的隐患：万一 __fwCheerioLoad 残留着旧值，会把失败当成功）。
+            if context.exception != nil {
+                context.exception = nil
+                exceptionBox.message = nil
+                return false
+            }
             guard let fn = context.objectForKeyedSubscript("__fwCheerioLoad"), !fn.isUndefined, !fn.isNull else {
                 // 注入失败的诊断：bundle 解析错与资源缺失走同一条 false 路，DEBUG 下把
                 // JS 侧的异常打出来区分（不影响返回值；异常读完就清掉，别让它留着污染后事）。
