@@ -520,26 +520,27 @@ final class WidgetHost: @unchecked Sendable {
             // 脏 HTML 的多行 href 属性里常有换行，不删会被编成 %0A 导致 404），
             // 再去掉首尾 C0 控制字符与空格（U+0000–U+0020）。
             // 注意："\r\n" 在 Swift 里是单个字形簇（Character），Character.filter
-            // 认不出它（既不等于 "\r" 也不等于 "\n"，会漏网），所以先整体替换掉
-            // "\r\n"，再用 filter 删剩余的单个 \t \n \r。
+            // 认不出它（既不等于 "\r" 也不等于 "\n"，会漏网）；这里按 Unicode 标量
+            // 值过滤，"\r\n" 是两个标量，直接处理，不用先整体替换。
             let stripSet = CharacterSet(charactersIn: UnicodeScalar(0)...UnicodeScalar(0x20))
             let clean = { (s: String) -> String in
-                s.replacingOccurrences(of: "\r\n", with: "")
-                 .trimmingCharacters(in: stripSet)
-                 .filter { $0 != "\t" && $0 != "\n" && $0 != "\r" }
+                let filtered = String(s.unicodeScalars.filter { $0.value != 0x09 && $0.value != 0x0A && $0.value != 0x0D })
+                return filtered.trimmingCharacters(in: stripSet)
             }
             let trimmed = clean(urlString)
             let trimmedBase = baseString.map(clean)
             let base: URL? = trimmedBase.flatMap { URL(string: $0) }
-            // 特殊协议集合（WHATWG 特殊 scheme）：host 必须非空，空路径补 "/"。
-            let specialSchemes: Set<String> = ["http", "https", "ws", "wss", "ftp"]
+            // 特殊协议集合（WHATWG 特殊 scheme，含 file）：空路径补 "/"。
+            // file 是特殊协议但允许空 host，所以"必须有 host"另用一套集合。
+            let specialSchemes: Set<String> = ["http", "https", "ws", "wss", "ftp", "file"]
+            let schemesRequiringHost: Set<String> = ["http", "https", "ws", "wss", "ftp"]
             // base 传了但解析失败、或解析出来没有 scheme（Foundation 能建出无 scheme 的
             // 相对 URL，非 nil）→ 无效（WHATWG 会抛），不能悄悄当成没传 base。
             // 特殊协议的 base 还必须有 host（Foundation 能建出 "https:" 这种无 host 的，
-            // WHATWG 不认；"http:///foo" 同理）。
+            // WHATWG 不认；"http:///foo" 同理）。file 不要求 host。
             if baseString != nil {
                 guard let b = base, b.scheme != nil else { return nil }
-                if specialSchemes.contains(b.scheme!.lowercased()), (b.host ?? "").isEmpty { return nil }
+                if schemesRequiringHost.contains(b.scheme!.lowercased()), (b.host ?? "").isEmpty { return nil }
             }
             // 空串（或只剩空白）解析为 base 本身，但要剥掉 base 的 #fragment
             //（WHATWG：空引用指向 base 文档，不带 fragment）；没有 base 时无效。
@@ -557,9 +558,9 @@ final class WidgetHost: @unchecked Sendable {
             // host 小写（WHATWG 小写 host，Foundation 保留输入大小写）。
             let host = (resolved.host ?? "").lowercased()
             // 特殊协议必须有 host（"https:"、"http:///foo" 这种 Foundation 能建出来，
-            // WHATWG 不认；不拦会产出 hostname:""、origin:"null" 的坏 URL）。
+            // WHATWG 不认；不拦会产出 hostname:""、origin:"null" 的坏 URL）。file 除外。
             let special = specialSchemes.contains(scheme)
-            if special && host.isEmpty { return nil }
+            if schemesRequiringHost.contains(scheme) && host.isEmpty { return nil }
             let port = resolved.port
             let defaultPort: Int? = {
                 switch scheme {
@@ -578,42 +579,53 @@ final class WidgetHost: @unchecked Sendable {
                 return host.contains(":") ? "[\(host)]" : host
             }()
             let hostWithPort = formattedHost.isEmpty ? "" : (effectivePort.isEmpty ? formattedHost : "\(formattedHost):\(effectivePort)")
-            let origin = (special && !host.isEmpty) ? "\(scheme)://\(hostWithPort)" : "null"
+            // file: 的 origin 恒为 opaque（"null"，WHATWG），即使有 host 也不例外。
+            let origin = (special && scheme != "file" && !host.isEmpty) ? "\(scheme)://\(hostWithPort)" : "null"
             // href 归一化：把算好的值写回一份可变的 URLComponents 再序列化（上轮的 bug：
             // components 是 let 且一个值都没写回，components?.string 输出的是未归一化的
             // 原串——大写 host、默认端口、空路径都没修，href 与 origin/pathname 矛盾）。
             // 只改这几项：scheme 小写、host 小写、默认端口置 nil、特殊协议空路径补 "/"、
             // 空 query/fragment 置 nil（不然会序列化成 "?" / "#"）；其余字段原样保留。
-            var components = URLComponents(url: resolved, resolvingAgainstBaseURL: true)
-            components?.scheme = scheme
-            if host.isEmpty {
-                components?.host = nil
-            } else if host.hasPrefix("[") && host.hasSuffix("]") {
-                // IPv6：URLComponents.host 存不带括号的地址，序列化时它自己加括号。
-                components?.host = String(host.dropFirst().dropLast())
-            } else {
-                components?.host = host
+            // URLComponents 建不出来就返回 nil（让 JS 侧抛 Invalid URL），不再静默
+            // 回退到未归一化的 resolved.absoluteString（回退串与归一化字段打架）。
+            guard var components = URLComponents(url: resolved, resolvingAgainstBaseURL: true) else { return nil }
+            components.scheme = scheme
+            if !host.isEmpty {
+                // IPv6：写回要带括号（formattedHost 已加括号）。上轮剥括号再写回是错的：
+                // URLComponents.host 存 IPv6 要求带括号，裸 "::1" 写回去会被百分号编码，
+                // href 变成 "https://%3A%3A1:8443/a"。普通 host 的 formattedHost 就是 host 本身。
+                components.host = formattedHost
             }
-            components?.port = (port != nil && port != defaultPort) ? port : nil
-            if special && (components?.percentEncodedPath ?? "").isEmpty {
-                components?.percentEncodedPath = "/"
+            // host 为空时不动 components.host（file:/// 的空 authority 要保留 "//"，
+            // 置 nil 会把它丢掉，变成 "file:/path"）。
+            components.port = (port != nil && port != defaultPort) ? port : nil
+            if special && (components.percentEncodedPath ?? "").isEmpty {
+                components.percentEncodedPath = "/"
             }
-            if (components?.percentEncodedQuery ?? "").isEmpty { components?.percentEncodedQuery = nil }
-            if (components?.percentEncodedFragment ?? "").isEmpty { components?.percentEncodedFragment = nil }
+            // special-query percent-encode set：单引号 ' 必须编成 %27（WHATWG；
+            // Foundation 会把字面 ' 原样留在 percentEncodedQuery 里）。
+            // 只替换字面 '（已编好的 %27 里没有字面 '，不会双重编码；&、= 等结构字符不动）。
+            if special, var q = components.percentEncodedQuery, q.contains("'") {
+                q = q.replacingOccurrences(of: "'", with: "%27")
+                components.percentEncodedQuery = q
+            }
+            if (components.percentEncodedQuery ?? "").isEmpty { components.percentEncodedQuery = nil }
+            if (components.percentEncodedFragment ?? "").isEmpty { components.percentEncodedFragment = nil }
             // pathname/search/hash 从归一化后的 components 读（与 href 同一套值，不再各读各的）。
             let pathname: String = {
-                if let p = components?.percentEncodedPath, !p.isEmpty { return p }
+                if let p = components.percentEncodedPath, !p.isEmpty { return p }
                 return special ? "/" : ""
             }()
             let search: String = {
-                if let q = components?.percentEncodedQuery, !q.isEmpty { return "?" + q }
+                if let q = components.percentEncodedQuery, !q.isEmpty { return "?" + q }
                 return ""
             }()
             let hash: String = {
-                if let f = components?.percentEncodedFragment, !f.isEmpty { return "#" + f }
+                if let f = components.percentEncodedFragment, !f.isEmpty { return "#" + f }
                 return ""
             }()
-            let href = components?.string ?? resolved.absoluteString
+            // components.string 建不出来也返回 nil（不再回退未归一化原串）。
+            guard let href = components.string else { return nil }
             return [
                 "href": href,
                 "protocol": scheme.isEmpty ? "" : "\(scheme):",
@@ -663,6 +675,34 @@ final class WidgetHost: @unchecked Sendable {
                 };
                 // 查询串解析（共用）：跳过空段（连续 && 不产空参数）；用 indexOf('=')，
                 // 等号后的内容原样保留（含 =）。'+' 按空格解；解码失败保留原串不抛。
+                // 查询串/片段拼进完整 URL 前的轻量编码（WHATWG query/fragment percent-encode set）。
+                // 只编 ASCII 结构字符（#、空白、控制字符、"、<、>、'、反引号），非 ASCII 留给
+                // Swift 侧按 UTF-8 编码。不能用 encodeURIComponent（它会把 &、= 等 query 结构
+                // 字符也编了，还会把 %XX 双重编码）。无正则、无反斜杠（Swift 多行字符串转义坑）。
+                var encodeQueryValue = function (s) {
+                    var out = '';
+                    for (var i = 0; i < s.length; i++) {
+                        var c = s.charCodeAt(i);
+                        if (c <= 0x20 || c === 0x22 || c === 0x23 || c === 0x3C || c === 0x3E || c === 0x27) {
+                            out += '%' + (c < 16 ? '0' : '') + c.toString(16).toUpperCase();
+                        } else {
+                            out += s.charAt(i);
+                        }
+                    }
+                    return out;
+                };
+                var encodeFragmentValue = function (s) {
+                    var out = '';
+                    for (var i = 0; i < s.length; i++) {
+                        var c = s.charCodeAt(i);
+                        if (c <= 0x20 || c === 0x22 || c === 0x3C || c === 0x3E || c === 0x60) {
+                            out += '%' + (c < 16 ? '0' : '') + c.toString(16).toUpperCase();
+                        } else {
+                            out += s.charAt(i);
+                        }
+                    }
+                    return out;
+                };
                 var parseQuery = function (str, pairs) {
                     if (str.charAt(0) === '?') { str = str.slice(1); }
                     if (!str) { return; }
@@ -705,13 +745,20 @@ final class WidgetHost: @unchecked Sendable {
                             }
                         } else if (Array.isArray(init)) {
                             for (var b = 0; b < init.length; b++) {
-                                this._pairs.push([String(init[b][0]), String(init[b][1])]);
+                                var pair = init[b];
+                                if (!pair || pair.length !== 2) {
+                                    throw new TypeError("Failed to construct 'URLSearchParams': The provided value cannot be converted to a sequence.");
+                                }
+                                this._pairs.push([String(pair[0]), String(pair[1])]);
                             }
                         } else if (typeof Symbol !== 'undefined' && Symbol.iterator && typeof init[Symbol.iterator] === 'function') {
                             var it = init[Symbol.iterator]();
                             var step;
                             while (!(step = it.next()).done) {
                                 var pair = step.value;
+                                if (!pair || pair.length !== 2) {
+                                    throw new TypeError("Failed to construct 'URLSearchParams': The provided value cannot be converted to a sequence.");
+                                }
                                 this._pairs.push([String(pair[0]), String(pair[1])]);
                             }
                         } else {
@@ -721,6 +768,9 @@ final class WidgetHost: @unchecked Sendable {
                                 }
                             }
                         }
+                    } else if (init !== undefined && init !== null) {
+                        // 原始值（数字、布尔等）：String(init) 再按查询串解析（123 → "123="）。
+                        parseQuery(String(init), this._pairs);
                     }
                 };
                 URLSearchParamsCtor.prototype.get = function (name) {
@@ -777,30 +827,52 @@ final class WidgetHost: @unchecked Sendable {
                     }
                     return out.join('&');
                 };
-                // forEach/keys/values/entries：最小实现，keys/values/entries 返回数组
-                //（数组本身可迭代，for (const k of sp.keys()) 能用；标准返回的是迭代器，
-                // 这里图简单返回数组，模块按数组用也行）。
+                // forEach/keys/values/entries/sort：见下面 toIter 与 sort 的说明。
                 URLSearchParamsCtor.prototype.forEach = function (cb, thisArg) {
                     for (var i = 0; i < this._pairs.length; i++) {
                         cb.call(thisArg, this._pairs[i][1], this._pairs[i][0], this);
                     }
                 };
+                // forEach/keys/values/entries：返回迭代器（数组的 Symbol.iterator 自带
+                // .next()，for..of、[...]、Array.from()、.next() 都能用；返回的是快照，
+                // 之后改 _pairs 不影响它）。entries 深拷贝内层 [k, v]，外部改 entry[1]
+                // 不会篡改 _pairs。sort 按 key 排序（稳定排序），改完触发 _onChange。
+                var toIter = function (arr) {
+                    if (typeof Symbol !== 'undefined' && Symbol.iterator) {
+                        return arr[Symbol.iterator]();
+                    }
+                    return arr;
+                };
                 URLSearchParamsCtor.prototype.keys = function () {
                     var out = [];
                     for (var i = 0; i < this._pairs.length; i++) { out.push(this._pairs[i][0]); }
-                    return out;
+                    return toIter(out);
                 };
                 URLSearchParamsCtor.prototype.values = function () {
                     var out = [];
                     for (var i = 0; i < this._pairs.length; i++) { out.push(this._pairs[i][1]); }
-                    return out;
+                    return toIter(out);
                 };
                 URLSearchParamsCtor.prototype.entries = function () {
-                    return this._pairs.slice();
+                    var out = [];
+                    for (var i = 0; i < this._pairs.length; i++) {
+                        out.push([this._pairs[i][0], this._pairs[i][1]]);
+                    }
+                    return toIter(out);
+                };
+                URLSearchParamsCtor.prototype.sort = function () {
+                    var sorted = this._pairs.slice();
+                    sorted.sort(function (a, b) {
+                        if (a[0] < b[0]) { return -1; }
+                        if (a[0] > b[0]) { return 1; }
+                        return 0;
+                    });
+                    this._pairs = sorted;
+                    if (this._onChange) { this._onChange(this.toString()); }
                 };
                 if (typeof Symbol !== 'undefined' && Symbol.iterator) {
                     URLSearchParamsCtor.prototype[Symbol.iterator] = function () {
-                        return this.entries()[Symbol.iterator]();
+                        return this.entries();
                     };
                 }
                 if (typeof g.URLSearchParams !== 'function') { g.URLSearchParams = URLSearchParamsCtor; }
@@ -814,29 +886,41 @@ final class WidgetHost: @unchecked Sendable {
                         var parts = g.__fwResolveURL(String(url), base === undefined ? null : String(base));
                         if (!parts) { throw new TypeError('Invalid URL'); }
                         var self = this;
-                        // 闭包里维护唯一真相：_prefix（search 之前的部分）、_search、_hash、_href。
-                        // 公开的 href/search/hash 都走 defineProperty 读写这份状态，不再用可变的
-                        // this.hash/this.href 反推（上轮的 bug：先改 hash 再改 searchParams，
+                        // 闭包里维护唯一真相：_prefix（search 之前的部分）、_search、_hash、_href，
+                        // 再加 _protocol/_host/_hostname/_port/_pathname/_origin/_protoAuth
+                        //（scheme + authority 部分）。公开的 protocol/host/hostname/port/
+                        // pathname/origin/href/search/hash 全走 defineProperty 读写这份状态，
+                        // 不再用可变的 this.xxx 反推（上轮的 bug：先改 hash 再改 searchParams，
                         // prefix 切片会用变长的 hash 截断 pathname；先改 href 再改 searchParams
-                        // 会把 href 回滚回旧值）。
+                        // 会把 href 回滚回旧值；pathname 等字段是普通属性，改完不同步 _href/_prefix，
+                        // 下次改 search 会把它静默覆盖回旧路径）。
                         var _prefix = parts.href.slice(0, parts.href.length - parts.search.length - parts.hash.length);
                         var _search = parts.search;
                         var _hash = parts.hash;
                         var _href = parts.href;
-                        // 从 parts 重建全部状态（href/search/hash 三个 setter 共用：先拼候选串，
-                        // 再调 __fwResolveURL 重解析，让 Swift 侧做归一化与编码；searchParams
-                        // 原地重建，不换对象，模块手里的引用不断）。
+                        var _protocol = parts.protocol;
+                        var _host = parts.host;
+                        var _hostname = parts.hostname;
+                        var _port = parts.port;
+                        var _pathname = parts.pathname;
+                        var _origin = parts.origin;
+                        // _protoAuth = href 去掉 pathname/search/hash（即 scheme + authority）。
+                        var _protoAuth = parts.href.slice(0, parts.href.length - parts.pathname.length - parts.search.length - parts.hash.length);
+                        // 从 parts 重建全部状态（所有 setter 共用：先拼候选串，再调 __fwResolveURL
+                        // 重解析，让 Swift 侧做归一化与编码；searchParams 原地重建，不换对象，
+                        // 模块手里的引用不断）。
                         var applyParts = function (p) {
                             _prefix = p.href.slice(0, p.href.length - p.search.length - p.hash.length);
                             _search = p.search;
                             _hash = p.hash;
                             _href = p.href;
-                            self.protocol = p.protocol;
-                            self.host = p.host;
-                            self.hostname = p.hostname;
-                            self.port = p.port;
-                            self.pathname = p.pathname;
-                            self.origin = p.origin;
+                            _protocol = p.protocol;
+                            _host = p.host;
+                            _hostname = p.hostname;
+                            _port = p.port;
+                            _pathname = p.pathname;
+                            _origin = p.origin;
+                            _protoAuth = p.href.slice(0, p.href.length - p.pathname.length - p.search.length - p.hash.length);
                             self.searchParams._pairs.length = 0;
                             parseQuery(p.search, self.searchParams._pairs);
                         };
@@ -848,19 +932,95 @@ final class WidgetHost: @unchecked Sendable {
                             _search = newSearch;
                             _href = _prefix + _search + _hash;
                         };
-                        this.protocol = parts.protocol;
-                        this.host = parts.host;
-                        this.hostname = parts.hostname;
-                        this.port = parts.port;
-                        this.pathname = parts.pathname;
-                        this.origin = parts.origin;
                         this.searchParams = new URLSearchParamsCtor(parts.search);
                         this.searchParams._onChange = onQueryChange;
+                        // protocol/host/hostname/port/pathname：defineProperty 读写闭包状态，
+                        // setter 拼候选串重解析 + applyParts 全量同步。origin 只读（WHATWG）。
+                        // 全部 setter 按 WHATWG 不抛错：解析失败保持原值（构造器仍抛 Invalid URL）。
+                        Object.defineProperty(this, 'protocol', {
+                            get: function () { return _protocol; },
+                            set: function (v) {
+                                var newProto = String(v);
+                                if (newProto.charAt(newProto.length - 1) !== ':') { newProto += ':'; }
+                                var p = g.__fwResolveURL(newProto + _protoAuth.slice(_protocol.length) + _pathname + _search + _hash, null);
+                                if (!p) { return; }
+                                applyParts(p);
+                            },
+                            enumerable: true,
+                            configurable: true
+                        });
+                        Object.defineProperty(this, 'host', {
+                            get: function () { return _host; },
+                            set: function (v) {
+                                // 无 authority 的 URL（如 mailto:）不能设 host，直接忽略。
+                                if (_protoAuth.indexOf('://') < 0) { return; }
+                                var p = g.__fwResolveURL(_protocol + '//' + String(v) + _pathname + _search + _hash, null);
+                                if (!p) { return; }
+                                applyParts(p);
+                            },
+                            enumerable: true,
+                            configurable: true
+                        });
+                        Object.defineProperty(this, 'hostname', {
+                            get: function () { return _hostname; },
+                            set: function (v) {
+                                if (_protoAuth.indexOf('://') < 0) { return; }
+                                var newHostname = String(v);
+                                if (newHostname.indexOf(':') >= 0 && newHostname.charAt(0) !== '[') {
+                                    newHostname = '[' + newHostname + ']';
+                                }
+                                var portPart = _port ? ':' + _port : '';
+                                var p = g.__fwResolveURL(_protocol + '//' + newHostname + portPart + _pathname + _search + _hash, null);
+                                if (!p) { return; }
+                                applyParts(p);
+                            },
+                            enumerable: true,
+                            configurable: true
+                        });
+                        Object.defineProperty(this, 'port', {
+                            get: function () { return _port; },
+                            set: function (v) {
+                                if (_protoAuth.indexOf('://') < 0) { return; }
+                                var newPort = String(v);
+                                var portPart = '';
+                                if (newPort !== '') {
+                                    var n = parseInt(newPort, 10);
+                                    if (isNaN(n) || n < 0 || n > 65535) { return; }
+                                    portPart = ':' + n;
+                                }
+                                var p = g.__fwResolveURL(_protocol + '//' + _hostname + portPart + _pathname + _search + _hash, null);
+                                if (!p) { return; }
+                                applyParts(p);
+                            },
+                            enumerable: true,
+                            configurable: true
+                        });
+                        Object.defineProperty(this, 'pathname', {
+                            get: function () { return _pathname; },
+                            set: function (v) {
+                                var newPath = String(v);
+                                // 特殊 URL 的 pathname 必须以 / 开头；不以 / 开头时补一个，
+                                // 不然 _protoAuth + newPath 会拼成另一个 host。
+                                if (_protoAuth.indexOf('://') >= 0 && newPath.charAt(0) !== '/') {
+                                    newPath = '/' + newPath;
+                                }
+                                var p = g.__fwResolveURL(_protoAuth + newPath + _search + _hash, null);
+                                if (!p) { return; }
+                                applyParts(p);
+                            },
+                            enumerable: true,
+                            configurable: true
+                        });
+                        Object.defineProperty(this, 'origin', {
+                            get: function () { return _origin; },
+                            enumerable: true,
+                            configurable: true
+                        });
                         Object.defineProperty(this, 'href', {
                             get: function () { return _href; },
                             set: function (v) {
                                 var p = g.__fwResolveURL(String(v), null);
-                                if (!p) { throw new TypeError('Invalid URL'); }
+                                if (!p) { return; }
                                 applyParts(p);
                             },
                             enumerable: true,
@@ -871,10 +1031,14 @@ final class WidgetHost: @unchecked Sendable {
                             set: function (v) {
                                 // String(v) 直转：null → "null"（WHATWG 字符串化语义），
                                 // 不再特殊处理成空串（上轮 u.search = null 会错误清空 query）。
+                                // 先按 query percent-encode set 编码输入（# 编成 %23，不能让它
+                                // 在拼串后被解析器当成 fragment 起点；尾随空格也编掉，不然 Swift
+                                // 侧 clean 会把它静默裁掉），再拼候选串重解析。
                                 var s = String(v);
-                                if (s && s.charAt(0) !== '?') { s = '?' + s; }
-                                var p = g.__fwResolveURL(_prefix + s + _hash, null);
-                                if (!p) { throw new TypeError('Invalid URL'); }
+                                if (s.charAt(0) === '?') { s = s.slice(1); }
+                                s = encodeQueryValue(s);
+                                var p = g.__fwResolveURL(_prefix + (s ? '?' + s : '') + _hash, null);
+                                if (!p) { return; }
                                 applyParts(p);
                             },
                             enumerable: true,
@@ -884,9 +1048,10 @@ final class WidgetHost: @unchecked Sendable {
                             get: function () { return _hash; },
                             set: function (v) {
                                 var h = String(v);
-                                if (h && h.charAt(0) !== '#') { h = '#' + h; }
-                                var p = g.__fwResolveURL(_prefix + _search + h, null);
-                                if (!p) { throw new TypeError('Invalid URL'); }
+                                if (h.charAt(0) === '#') { h = h.slice(1); }
+                                h = encodeFragmentValue(h);
+                                var p = g.__fwResolveURL(_prefix + _search + (h ? '#' + h : ''), null);
+                                if (!p) { return; }
                                 applyParts(p);
                             },
                             enumerable: true,
