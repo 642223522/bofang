@@ -94,7 +94,7 @@ for SLICE in ios-arm64 ios-arm64_x86_64-simulator; do
     echo "❌ $SLICE 里没找到 Libbox 二进制"
     exit 1
   fi
-  echo "--- $SLICE：$BIN ---"
+  echo "--- ${SLICE}：${BIN} ---"
   lipo -info "$BIN"
 done
 echo "--- 体积 ---"
