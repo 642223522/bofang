@@ -35,9 +35,16 @@
 #   .gitignore 里有 AdultAsianHD/Libbox.xcframework/，CI 用 actions/cache 缓存。）
 set -eu
 
-SING_BOX_VERSION="1.14.6"
-GOMOBILE_VERSION="v0.1.13"
-TAGS="with_gvisor,with_quic,with_wireguard,with_utls,with_low_memory,grpcnotrace,badlinkname,tfogo_checklinkname0"
+SING_BOX_VERSION="${SING_BOX_VERSION:-1.14.6}"
+GOMOBILE_VERSION="${GOMOBILE_VERSION:-v0.1.13}"
+TAGS="${TAGS:-with_gvisor,with_quic,with_wireguard,with_utls,with_low_memory,grpcnotrace,badlinkname,tfogo_checklinkname0}"
+# 探针（2026-11-28 试验构建 #83 的教训）：runner（macOS /bin/sh）上裸赋值
+# SING_BOX_VERSION="1.14.6" 后，第 54 行在 set -u 下仍报未定义；但文件 SHA 与本地逐字节一致、
+# 本地 dash/bash/bash --posix 都能过。上面已改成默认值写法绕过，这里留一个裸赋值当金丝雀，
+# 看 runner 的 sh 是不是丢裸赋值（若印 <丢了>，即为 runner 侧 shell 问题；若印 canary-ok，
+# 则 #83 的失败另有原因，可能是那次 checkout 异常）。
+CANARY_PROBE="canary-ok"
+echo "探针：裸赋值金丝雀=${CANARY_PROBE:-<丢了>} sing-box=$SING_BOX_VERSION gomobile=$GOMOBILE_VERSION"
 
 WORKSPACE="${GITHUB_WORKSPACE:-$PWD}"
 OUT="$WORKSPACE/AdultAsianHD/Libbox.xcframework"
