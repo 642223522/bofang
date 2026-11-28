@@ -19,11 +19,21 @@ final class WidgetHost: @unchecked Sendable {
     /// 分类请求拦截器（一个 host 一个，跟着它自己的 JSContext 走）。
     private let requestInterceptor: CategoryRequestInterceptor
     /// 在途 Widget.http 请求登记表（见 HTTPRequestRegistry）：executor Task
-    /// 是 detached 的，host 释放/一次模块调用失败时没人取消，记在这里统一取消。
+    /// 是 detached 的，host 释放时没人取消，记在这里统一取消。
     /// 注意：声明上不带初值（初值在 init 里从 built.httpRegistry 拿）——
     /// let 带了初值又在 init 里再赋一次会编译失败（run #15 的 originalHost
     /// 同款坑，run #17 第二轮又栽了一次）。
     private let httpRegistry: HTTPRequestRegistry
+    /// 在途定时器登记表（见 TimerRegistry，chunk-1 P1-6）：setTimeout/setInterval
+    /// 不再用 installWidgetBridge 里的局部变量，host 释放时统一取消，
+    /// 不让定时器在 host 释放后还跑模块代码。声明上不带初值（与 httpRegistry 同款原因）。
+    private let timerRegistry: TimerRegistry
+    /// 安装桥时从全新 context 上取下的原生 Promise 构造器（chunk-1 P1-3）：
+    /// 模块改写全局 Promise 后，Widget.http 仍用它造 Promise，不 fatalError。
+    /// 强引用放在 host 身上（host → 构造器 → context，不成环）；桥里的
+    /// http.get/post block 只拿弱盒 NativePromiseStore（见 installWidgetBridge）。
+    /// 声明上不带初值（与 httpRegistry 同款原因）。
+    private let nativePromiseConstructor: JSValue?
     /// 线路竞速（进模块时跑一次）：本次该模块的首选线。
     /// 本会话（开软件到关软件）每个模块只自动竞速一次：首选线记在 SourceStore
     /// 的会话缓存里，新 host 不重竞时 preferredLine 兜底读它（见下面 getter）。
@@ -106,6 +116,27 @@ final class WidgetHost: @unchecked Sendable {
         }
     }
 
+    /// 超时一本账（chunk-1 P1-10）：全文件共用的超时常量，集中在这里，
+    /// 不再让超时数字散落在各处（Widget.http 默认 12s、awaitPromise 30s、
+    /// parseMs 可声明到 60s 等各说各话）。
+    /// promiseWindowMs 是 awaitPromise 的窗口；CheckTimeouts.effectiveMs
+    /// （Models.swift）夹到窗口减余量，不再让模块声明的 parseMs 被静默截断。
+    /// http 超时是秒（timeoutInterval 用）；其余是毫秒。
+    enum WidgetTimeoutBudget {
+        /// awaitPromise 窗口：模块一次调用最长等 30 秒。
+        static let promiseWindowMs = 30_000
+        /// 窗口内给 Swift 侧收尾留的余量（毫秒）。
+        static let reserveMs = 2_000
+        /// Widget.http 默认超时（秒）。
+        static let httpDefaultSeconds: TimeInterval = 12
+        /// Widget.http 超时夹值下限（秒）。
+        static let httpMinSeconds: TimeInterval = 3
+        /// Widget.http 超时夹值上限（秒）。
+        static let httpMaxSeconds: TimeInterval = 25
+        /// options.timeout 的启发式分界：> 120 当毫秒，否则当秒。
+        static let timeoutMillisThreshold: Double = 120
+    }
+
     // MARK: - 初始化
 
     /// 建 context、注入 Widget 桥接、evaluate 模块源码、取出元数据与模块清单。
@@ -119,6 +150,8 @@ final class WidgetHost: @unchecked Sendable {
         self.exceptionBox = built.exceptionBox
         self.requestInterceptor = built.requestInterceptor
         self.httpRegistry = built.httpRegistry
+        self.timerRegistry = built.timerRegistry
+        self.nativePromiseConstructor = built.nativePromiseConstructor
         self.sourceGeneration = sourceGeneration
         // 模块声明的强制传输 host 交给网络层登记（宿主不硬编码任何 host）。
         if !built.meta.forceTransportHosts.isEmpty {
@@ -130,6 +163,9 @@ final class WidgetHost: @unchecked Sendable {
         // host 释放：在途的 Widget.http 请求全部取消，不让 detached 的
         // executor Task 继续跑、继续 resolve 已释放的 JSContext。
         httpRegistry.cancelAll()
+        // host 释放：在途的定时器全部取消，不让 setTimeout/setInterval
+        // 在 host 释放后还在主线程跑模块代码（chunk-1 P1-6）。
+        timerRegistry.cancelAll()
     }
 
     private struct BuiltHost {
@@ -139,6 +175,8 @@ final class WidgetHost: @unchecked Sendable {
         let exceptionBox: ExceptionBox
         let requestInterceptor: CategoryRequestInterceptor
         let httpRegistry: HTTPRequestRegistry
+        let timerRegistry: TimerRegistry
+        let nativePromiseConstructor: JSValue?
     }
 
     private static func buildOnMainThread(jsSource: String, fallbackTitle: String? = nil) throws -> BuiltHost {
@@ -159,21 +197,35 @@ final class WidgetHost: @unchecked Sendable {
             throw WidgetHostError.invalidFormat("创建 JS 环境失败")
         }
         let box = ExceptionBox()
+        // P1-5 方案 (ii)：自定义 handler 会替代默认 handler，context.exception
+        // 恒为 nil，所以全文件只读/写 box.message，不再碰 context.exception。
         context.exceptionHandler = { _, exception in
             box.message = exception?.toString()
         }
 
         let interceptor = CategoryRequestInterceptor()
         let httpRegistry = HTTPRequestRegistry()
-        installWidgetBridge(in: context, interceptor: interceptor, httpRegistry: httpRegistry, exceptionBox: box)
+        let timerRegistry = TimerRegistry()
+        // 原生 Promise 构造器（P1-3）：context 刚建、模块源码还没跑，
+        // 全局 Promise 一定是内建的；现在取下强引用，之后模块再怎么改写
+        // 全局 Promise 都不影响 Widget.http。强引用走 BuiltHost 进 host，
+        // 桥里的 block 只拿弱盒 promiseStore（不成环）。
+        let nativePromiseConstructor = context.objectForKeyedSubscript("Promise")
+        let promiseStore = NativePromiseStore()
+        promiseStore.constructor = nativePromiseConstructor
+        // P1-11：模块 id 的盒子——桥安装时 id 还不知道（id 在 WidgetMetadata 里，
+        // evaluateScript 之后才取得到），桥里的 storage/localStorage block 只拿
+        // 这个盒子、每次调用现算前缀；取到 meta.id 后立刻填进去（见下面 metaId 处）。
+        let moduleIDBox = ModuleIDBox()
+        installWidgetBridge(in: context, interceptor: interceptor, httpRegistry: httpRegistry, timerRegistry: timerRegistry, promiseStore: promiseStore, exceptionBox: box, moduleIDBox: moduleIDBox)
 
         context.evaluateScript(jsSource)
         if let message = box.message, !message.isEmpty {
             throw WidgetHostError.jsException(message)
         }
 
-        // 取 WidgetMetadata
-        guard let metaValue = context.objectForKeyedSubscript("WidgetMetadata"),
+        // 取 WidgetMetadata（顶层 const 写法走 globalSymbol 的求值回退，chunk-1 P1-8）
+        guard let metaValue = Self.globalSymbol(in: context, named: "WidgetMetadata"),
               !metaValue.isUndefined, !metaValue.isNull,
               let metaDict = metaValue.toDictionary() as? [String: Any] else {
             throw WidgetHostError.invalidFormat("这个脚本不是 ForwardWidget 模块格式（缺 WidgetMetadata）")
@@ -182,6 +234,9 @@ final class WidgetHost: @unchecked Sendable {
         guard !metaId.isEmpty else {
             throw WidgetHostError.invalidFormat("这个脚本不是 ForwardWidget 模块格式（模块信息不完整，缺 id）")
         }
+        // P1-11：id 一到手就填进盒子，之后模块调 Widget.storage / localStorage
+        // 用的就是带本模块 id 的前缀（fw.storage.<moduleId>. / fw.localstorage.<moduleId>.）。
+        moduleIDBox.id = metaId
         // 标题缺失不整文件报错：先用调用方给的文件名，再退回 id。
         let metaTitle: String = {
             if let t = metaDict["title"] as? String, !t.isEmpty { return t }
@@ -247,7 +302,7 @@ final class WidgetHost: @unchecked Sendable {
             throw WidgetHostError.invalidFormat("这个脚本的模块清单是空的，没有可用的功能")
         }
 
-        return BuiltHost(context: context, meta: meta, modules: modules, exceptionBox: box, requestInterceptor: interceptor, httpRegistry: httpRegistry)
+        return BuiltHost(context: context, meta: meta, modules: modules, exceptionBox: box, requestInterceptor: interceptor, httpRegistry: httpRegistry, timerRegistry: timerRegistry, nativePromiseConstructor: nativePromiseConstructor)
     }
 
     /// 站点字段有多个叫法（site / siteUrl / homepage），哪个有取哪个；都没有或为空就 nil。
@@ -260,12 +315,32 @@ final class WidgetHost: @unchecked Sendable {
         return nil
     }
 
+    /// 读全局符号（chunk-1 P1-8）：顶层 const/let/class 不挂在全局对象上，
+    /// objectForKeyedSubscript 读不到；读不到时回退到直接求值。
+    /// 名字先校验标识符格式（^[A-Za-z_$][A-Za-z0-9_$]*$），否则就是脚本注入。
+    /// 回退只在首次读取为 nil/undefined/null 时触发，不每次都走 evaluateScript。
+    /// 只能在主线程调（调用处都在 build / MainActor.run 里）。
+    private static func globalSymbol(in context: JSContext, named name: String) -> JSValue? {
+        if let value = context.objectForKeyedSubscript(name),
+           !value.isUndefined, !value.isNull {
+            return value
+        }
+        guard name.range(of: "^[A-Za-z_$][A-Za-z0-9_$]*$", options: .regularExpression) != nil else {
+            return nil
+        }
+        guard let value = context.evaluateScript("typeof \(name) !== 'undefined' ? \(name) : undefined"),
+              !value.isUndefined, !value.isNull else {
+            return nil
+        }
+        return value
+    }
+
     /// 找模块清单（超集，三路）：(1) 全局 JS_MODULES；(2) WidgetMetadata.modules；
     /// (3) 兜底扫顶层变量：任何一个元素含 id + functionName 的数组（变量名任意，比 Rex 更宽松）。
     /// 返回解析好的 [[String: Any]]，三路都找不到返回 nil。
     private static func findModuleList(in context: JSContext, metaDict: [String: Any]) -> [[String: Any]]? {
-        // (1) 全局 JS_MODULES（pornjav.js 那套老格式）
-        if let value = context.objectForKeyedSubscript("JS_MODULES"),
+        // (1) 全局 JS_MODULES（pornjav.js 那套老格式；const 写法走 globalSymbol 回退，P1-8）
+        if let value = Self.globalSymbol(in: context, named: "JS_MODULES"),
            !value.isUndefined, !value.isNull,
            let raw = value.toArray() {
             let dicts = raw.compactMap { $0 as? [String: Any] }
@@ -282,7 +357,7 @@ final class WidgetHost: @unchecked Sendable {
               let keys = keysValue.toArray() as? [String] else { return nil }
         for key in keys {
             guard key != "JS_MODULES", key != "WidgetMetadata", key != "Widget" else { continue }
-            guard let value = context.objectForKeyedSubscript(key),
+            guard let value = Self.globalSymbol(in: context, named: key),
                   !value.isUndefined, !value.isNull,
                   value.isArray,
                   let raw = value.toArray(), !raw.isEmpty,
@@ -300,7 +375,7 @@ final class WidgetHost: @unchecked Sendable {
     /// 注入全局 Widget 对象与 JS 全局 API：
     /// Widget.http.get / post（回值 {status, data, headers, arrayBuffer}）、
     /// Widget.storage.get / set / remove / clear、localStorage（getItem/setItem/removeItem/clear，
-    /// 前缀 fw.localstorage.）、全局 fetch（GET/POST 最小实现）、setTimeout / clearTimeout、
+    /// 前缀 fw.localstorage.<moduleId>.）、全局 fetch（GET/POST 最小实现）、setTimeout / clearTimeout、
     /// setInterval / clearInterval、console.log / info / debug / warn / error（多参数拼接）。
     /// Widget.html.load / loadURL（Cheerio DOM 解析，见 Core/WidgetHTML.js.txt；
     /// URL/URLSearchParams 在建桥时就装（模块可能在第一次调 html.load 之前就 new URL，
@@ -308,7 +383,7 @@ final class WidgetHost: @unchecked Sendable {
     /// 只在第一次调 html.load/loadURL 时装，不用的模块不付这个钱；
     /// 裸 JSC 没有 URL，cheerio 的 prop('href')/prop('src') 靠它解析相对地址）。
     /// 模块发现三路超集、loadDetail/childItems/relatedItems 解析、分类拦截器都不在这里动。
-    private static func installWidgetBridge(in context: JSContext, interceptor: CategoryRequestInterceptor, httpRegistry: HTTPRequestRegistry, exceptionBox: ExceptionBox) {
+    private static func installWidgetBridge(in context: JSContext, interceptor: CategoryRequestInterceptor, httpRegistry: HTTPRequestRegistry, timerRegistry: TimerRegistry, promiseStore: NativePromiseStore, exceptionBox: ExceptionBox, moduleIDBox: ModuleIDBox) {
         let widget = JSValue(newObjectIn: context)!
         let http = JSValue(newObjectIn: context)!
         let storage = JSValue(newObjectIn: context)!
@@ -325,7 +400,7 @@ final class WidgetHost: @unchecked Sendable {
                 // JS 正在执行时 context 不可能已释放；这行理论上走不到。
                 fatalError("WidgetHost: JSContext 已释放，无法发起请求")
             }
-            return makeHttpGetPromise(in: context, urlString: urlString, options: options, interceptor: interceptor, httpRegistry: httpRegistry)
+            return makeHttpGetPromise(in: context, urlString: urlString, options: options, interceptor: interceptor, httpRegistry: httpRegistry, nativePromiseConstructor: promiseStore.constructor, exceptionBox: exceptionBox)
         }
         http.setValue(httpGet, forProperty: "get")
 
@@ -336,27 +411,34 @@ final class WidgetHost: @unchecked Sendable {
             guard let context else {
                 fatalError("WidgetHost: JSContext 已释放，无法发起请求")
             }
-            return makeHttpPostPromise(in: context, urlString: urlString, body: body, options: options, httpRegistry: httpRegistry)
+            return makeHttpPostPromise(in: context, urlString: urlString, body: body, options: options, httpRegistry: httpRegistry, nativePromiseConstructor: promiseStore.constructor, exceptionBox: exceptionBox)
         }
         http.setValue(httpPost, forProperty: "post")
         widget.setValue(http, forProperty: "http")
 
-        // Widget.storage.get(key) / set(key, value)：同步，UserDefaults，前缀 fw.storage.。
+        // Widget.storage.get(key) / set(key, value)：同步，UserDefaults，按模块 id 隔离，
+        // 前缀 fw.storage.<moduleId>.（P1-11：原来是固定前缀 fw.storage.，任何模块都能
+        // 读写别家模块存的 token）。id 在 build() 里 evaluateScript 之后才取到，桥必须
+        // 先装，所以前缀不在安装时拼死——block 每次调用现算（盒子里的 id 在 meta 取到后填）。
+        // 前缀末尾带 "."：clear() 按前缀枚举删键时，"user.pornjav" 不会误删 "user.pornjav2" 的键。
         // get 不存在返回 JS null（模块里 `if (raw)` 判空能正常工作）。
+        let storagePrefix: () -> String = { "fw.storage." + moduleIDBox.id + "." }
+        let localStoragePrefix: () -> String = { "fw.localstorage." + moduleIDBox.id + "." }
         let storageGet: @convention(block) (String) -> JSValue = { [weak context] key in
             guard let context else {
                 fatalError("WidgetHost: JSContext 已释放")
             }
-            if let value = UserDefaults.standard.string(forKey: "fw.storage." + key) {
+            if let value = UserDefaults.standard.string(forKey: storagePrefix() + key) {
                 return JSValue(object: value, in: context)!
             }
             return JSValue(nullIn: context)!
         }
         let storageSet: @convention(block) (String, JSValue) -> Void = { key, value in
-            UserDefaults.standard.set(value.toString(), forKey: "fw.storage." + key)
+            UserDefaults.standard.set(value.toString(), forKey: storagePrefix() + key)
         }
-        // Widget.storage.remove(key) / clear()：与 get/set 同一套 UserDefaults 前缀。
-        // clear 只清 fw.storage. 前缀的 key，不动 localStorage（前缀不同）与别的 key。
+        // Widget.storage.remove(key) / clear()：与 get/set 同一套按模块隔离的前缀。
+        // clear 只清本模块 fw.storage.<moduleId>. 前缀的 key，不动 localStorage（前缀不同）、
+        // 不动别家模块的 key、不动别的 key。
         let clearKeysWithPrefix: (String) -> Void = { prefix in
             let keys = UserDefaults.standard.dictionaryRepresentation().keys.filter { $0.hasPrefix(prefix) }
             for key in keys {
@@ -364,10 +446,10 @@ final class WidgetHost: @unchecked Sendable {
             }
         }
         let storageRemove: @convention(block) (String) -> Void = { key in
-            UserDefaults.standard.removeObject(forKey: "fw.storage." + key)
+            UserDefaults.standard.removeObject(forKey: storagePrefix() + key)
         }
         let storageClear: @convention(block) () -> Void = {
-            clearKeysWithPrefix("fw.storage.")
+            clearKeysWithPrefix(storagePrefix())
         }
         storage.setValue(storageGet, forProperty: "get")
         storage.setValue(storageSet, forProperty: "set")
@@ -376,7 +458,7 @@ final class WidgetHost: @unchecked Sendable {
         widget.setValue(storage, forProperty: "storage")
 
         // localStorage：与 Widget.storage 同款持久化（UserDefaults），前缀分开
-        //（fw.localstorage.，与 fw.storage. 互不干扰），值按字符串存。
+        //（fw.localstorage.<moduleId>.，与 fw.storage.<moduleId>. 互不干扰，也与别家模块互不干扰），值按字符串存。
         // getItem 不存在返回 JS null（与 Widget.storage.get 同款，模块里 `if (raw)` 判空能正常工作）。
         // 只实现 getItem/setItem/removeItem/clear（任务定的四件套）；length/key(index) 未实现。
         let localStorage = JSValue(newObjectIn: context)!
@@ -384,19 +466,19 @@ final class WidgetHost: @unchecked Sendable {
             guard let context else {
                 fatalError("WidgetHost: JSContext 已释放")
             }
-            if let value = UserDefaults.standard.string(forKey: "fw.localstorage." + key) {
+            if let value = UserDefaults.standard.string(forKey: localStoragePrefix() + key) {
                 return JSValue(object: value, in: context)!
             }
             return JSValue(nullIn: context)!
         }
         let localStorageSetItem: @convention(block) (String, JSValue) -> Void = { key, value in
-            UserDefaults.standard.set(value.toString(), forKey: "fw.localstorage." + key)
+            UserDefaults.standard.set(value.toString(), forKey: localStoragePrefix() + key)
         }
         let localStorageRemoveItem: @convention(block) (String) -> Void = { key in
-            UserDefaults.standard.removeObject(forKey: "fw.localstorage." + key)
+            UserDefaults.standard.removeObject(forKey: localStoragePrefix() + key)
         }
         let localStorageClear: @convention(block) () -> Void = {
-            clearKeysWithPrefix("fw.localstorage.")
+            clearKeysWithPrefix(localStoragePrefix())
         }
         localStorage.setValue(localStorageGetItem, forProperty: "getItem")
         localStorage.setValue(localStorageSetItem, forProperty: "setItem")
@@ -444,63 +526,93 @@ final class WidgetHost: @unchecked Sendable {
         // 没有它模块调 setTimeout 会直接报 ReferenceError。补一个最小实现：
         // 主线程延时回调，返回一个数字 id 供 clearTimeout 取消。
         // 注意：回调里 JSContext 可能已释放，调之前先判空，不 crash。
-        var timerCounter = 0
-        var timers: [Int: DispatchWorkItem] = [:]
+        // 定时器状态不再放 installWidgetBridge 的局部变量（chunk-1 P1-6）：
+        // 局部 timers/timerCounter 会让 DispatchWorkItem 强引用的 callback
+        //（JSValue 强引用 context）把 context 永远钉住，setInterval 不清就永不释放，
+        // host 释放后定时器还在主线程跑模块代码。改走 TimerRegistry
+        //（与 HTTPRequestRegistry 同构，见文件末尾），deinit 时 cancelAll。
         let setTimeout: @convention(block) (JSValue, Double) -> Int = { [weak context] callback, delayMs in
-            timerCounter += 1
-            let id = timerCounter
             // delay 非数/没传时按 0 算（JS 调 setTimeout(fn) 不带延迟时 JSC 传过来的就是 NaN）。
             let delay = delayMs.isFinite ? delayMs : 0
-            let work = DispatchWorkItem {
-                timers.removeValue(forKey: id)
-                guard let context, !callback.isUndefined, !callback.isNull else { return }
-                callback.call(withArguments: [])
+            guard let registered = timerRegistry.register({ id in
+                DispatchWorkItem {
+                    timerRegistry.remove(id)
+                    guard let context, !callback.isUndefined, !callback.isNull else { return }
+                    callback.call(withArguments: [])
+                    // P1-4c：回调抛的异常读完即清，不留给下一次调用。
+                    if let message = exceptionBox.message, !message.isEmpty {
+                        #if DEBUG
+                        print("[WidgetHost] setTimeout 回调抛错：\(message)")
+                        #endif
+                        exceptionBox.message = nil
+                    }
+                }
+            }) else {
+                #if DEBUG
+                print("[WidgetHost] setTimeout 已达上限（\(TimerRegistry.maxTimers) 个），本次调用忽略")
+                #endif
+                return 0
             }
-            timers[id] = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay / 1000.0, execute: work)
-            return id
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay / 1000.0, execute: registered.work)
+            return registered.id
         }
         let clearTimeout: @convention(block) (Int) -> Void = { id in
-            timers.removeValue(forKey: id)?.cancel()
+            timerRegistry.cancel(id)
         }
         context.setObject(setTimeout as @convention(block) (JSValue, Double) -> Int, forKeyedSubscript: "setTimeout" as NSString)
         context.setObject(clearTimeout as @convention(block) (Int) -> Void, forKeyedSubscript: "clearTimeout" as NSString)
 
         // setInterval / clearInterval：与上面 setTimeout/clearTimeout 同款机制
-        //（主线程延时回调、数字 id、DispatchWorkItem，共用同一个 timerCounter/timers 表，
+        //（主线程延时回调、数字 id、DispatchWorkItem，共用同一个 TimerRegistry，
         // 所以 clearTimeout 也能停 interval、clearInterval 也能停 timeout，与浏览器一致）。
         // 每次 tick 都是一次新的 DispatchWorkItem：tick 触发时先看 id 是否还在表里
         //（clearInterval 已把它拿掉就不触发也不重排），回调完、id 还在表里才排下一次，
         // 所以回调里调 clearInterval（包括自己清自己）能停。delay 下限 4ms，
         // 免得 setInterval(fn, 0) 在主线程空转（浏览器同款钳制；setTimeout 不动，仍按 0 算）。
         let setInterval: @convention(block) (JSValue, Double) -> Int = { [weak context] callback, delayMs in
-            timerCounter += 1
-            let id = timerCounter
             // delay 非数/没传时按 4ms 算（JSC 传过来的 NaN 与 setTimeout 同款处理，只是下限不同）。
             let delay = delayMs.isFinite ? max(delayMs, 4) : 4
-            var scheduleNext: (() -> Void)!
-            scheduleNext = {
-                let work = DispatchWorkItem {
+            var scheduleNext: ((Int) -> Void)!
+            // 一个 tick 的 work：检查、回调、（id 还在表里就）排下一次。
+            // 首个 tick 与后续 tick 共用这一份，不再各写一份。
+            let makeTickWork: (Int) -> DispatchWorkItem = { id in
+                DispatchWorkItem {
                     // 已被 clear（注册表里没这个 id）就停，不触发也不重排。
-                    guard timers[id] != nil else { return }
+                    guard timerRegistry.contains(id) else { return }
                     guard let context, !callback.isUndefined, !callback.isNull else {
-                        timers.removeValue(forKey: id)
+                        timerRegistry.remove(id)
                         return
                     }
                     callback.call(withArguments: [])
+                    // P1-4c：同 setTimeout，读完即清。
+                    if let message = exceptionBox.message, !message.isEmpty {
+                        #if DEBUG
+                        print("[WidgetHost] setInterval 回调抛错：\(message)")
+                        #endif
+                        exceptionBox.message = nil
+                    }
                     // 回调里可能调了 clearInterval；只有 id 还在表里才排下一次。
-                    if timers[id] != nil {
-                        scheduleNext()
+                    if timerRegistry.contains(id) {
+                        scheduleNext(id)
                     }
                 }
-                timers[id] = work
+            }
+            scheduleNext = { id in
+                let work = makeTickWork(id)
+                timerRegistry.store(work, for: id)
                 DispatchQueue.main.asyncAfter(deadline: .now() + delay / 1000.0, execute: work)
             }
-            scheduleNext()
-            return id
+            guard let registered = timerRegistry.register(makeTickWork) else {
+                #if DEBUG
+                print("[WidgetHost] setInterval 已达上限（\(TimerRegistry.maxTimers) 个），本次调用忽略")
+                #endif
+                return 0
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay / 1000.0, execute: registered.work)
+            return registered.id
         }
         let clearInterval: @convention(block) (Int) -> Void = { id in
-            timers.removeValue(forKey: id)?.cancel()
+            timerRegistry.cancel(id)
         }
         context.setObject(setInterval as @convention(block) (JSValue, Double) -> Int, forKeyedSubscript: "setInterval" as NSString)
         context.setObject(clearInterval as @convention(block) (Int) -> Void, forKeyedSubscript: "clearInterval" as NSString)
@@ -1213,7 +1325,6 @@ final class WidgetHost: @unchecked Sendable {
             })(this);
             """)
         // 内部 eval 的异常也要清掉盒子里的那份（同胶水那处）。
-        context.exception = nil
         exceptionBox.message = nil
 
         // __fwEnsureCheerio：懒注入 cheerio bundle + atob（第一次调 load/loadURL 时
@@ -1285,7 +1396,6 @@ final class WidgetHost: @unchecked Sendable {
                     })(this);
                     """)
                 // atob 注入的异常也要清掉（同胶水那处：不然 takeException 会误算到模块头上）。
-                context.exception = nil
                 exceptionBox.message = nil
             }
             guard let bundle = Self.cheerioBundle else { return false }
@@ -1293,8 +1403,7 @@ final class WidgetHost: @unchecked Sendable {
             context.evaluateScript(bundle, withSourceURL: URL(string: "host://cheerio.min.js.txt"))
             // bundle 抛错就直接清掉异常返回 false，不要继续检查 __fwCheerioLoad
             //（上轮的隐患：万一 __fwCheerioLoad 残留着旧值，会把失败当成功）。
-            if context.exception != nil {
-                context.exception = nil
+            if let message = exceptionBox.message, !message.isEmpty {
                 exceptionBox.message = nil
                 return false
             }
@@ -1302,16 +1411,14 @@ final class WidgetHost: @unchecked Sendable {
                 // 注入失败的诊断：bundle 解析错与资源缺失走同一条 false 路，DEBUG 下把
                 // JS 侧的异常打出来区分（不影响返回值；异常读完就清掉，别让它留着污染后事）。
                 #if DEBUG
-                if let exception = context.exception {
-                    print("[WidgetHost] cheerio bundle 注入失败：\(exception.toString() ?? "")")
+                if let message = exceptionBox.message, !message.isEmpty {
+                    print("[WidgetHost] cheerio bundle 注入失败：\(message)")
                 }
                 #endif
-                context.exception = nil
                 exceptionBox.message = nil
                 return false
             }
             // 成功也清掉（防之前的 eval 留了 stale 异常，误算到后事头上）。
-            context.exception = nil
             exceptionBox.message = nil
             return true
         }
@@ -1324,14 +1431,13 @@ final class WidgetHost: @unchecked Sendable {
         if let glue = Self.widgetHTMLGlue {
             context.evaluateScript(glue, withSourceURL: URL(string: "host://WidgetHTML.js.txt"))
             #if DEBUG
-            if let exception = context.exception {
-                print("[WidgetHost] WidgetHTML 胶水注入失败：\(exception.toString() ?? "")")
+            if let message = exceptionBox.message, !message.isEmpty {
+                print("[WidgetHost] WidgetHTML 胶水注入失败：\(message)")
             }
             #endif
             // 内部 eval 的异常也要清掉盒子里的那份：exceptionHandler 会把胶水脚本的
             // 异常也写进 box.message，不清的话 build() 会把它误算到模块源码头上
             //（模块源码还没跑就被拒绝加载）。模块源码的异常由 build() 自己读盒子。
-            context.exception = nil
             exceptionBox.message = nil
         }
 
@@ -1341,11 +1447,10 @@ final class WidgetHost: @unchecked Sendable {
         // install 内部跳过，模块调 Widget.crypto 时再报"不可用"，不连累整个桥。
         WidgetCrypto.install(into: context)
         #if DEBUG
-        if let exception = context.exception {
-            print("[WidgetHost] WidgetCrypto 胶水注入失败：\(exception.toString() ?? "")")
+        if let message = exceptionBox.message, !message.isEmpty {
+            print("[WidgetHost] WidgetCrypto 胶水注入失败：\(message)")
         }
         #endif
-        context.exception = nil
         exceptionBox.message = nil
 
         // __fwArrayBufferFromBytes（内部助手，Widget.http 回值 .arrayBuffer 用）：
@@ -1441,18 +1546,55 @@ final class WidgetHost: @unchecked Sendable {
     /// 从 context 取 Promise 构造器，用 executor block 造一个 JS Promise。
     /// executor 被 Promise 构造器同步调用，交出 resolve/reject；
     /// Swift 拿着它们去后台发请求，完事回主线程结算。
-    private static func makeHttpGetPromise(in context: JSContext, urlString: String, options: JSValue?, interceptor: CategoryRequestInterceptor, httpRegistry: HTTPRequestRegistry) -> JSValue {
-        guard let promiseConstructor = context.objectForKeyedSubscript("Promise"),
-              !promiseConstructor.isUndefined else {
-            fatalError("WidgetHost: JS 环境里没有 Promise")
+    /// 用原生 Promise 构造器造一个已拒绝的 Promise（chunk-1 P1-3）：
+    /// 模块把全局 Promise 改坏、或 construct 失败时走这里，绝不 fatalError。
+    /// 构造器取不到时，用 async 函数取回内建 Promise（async 函数恒用内建
+    /// Promise，不受全局 Promise 改写影响）；再取不到就返回 undefined，
+    /// JS 侧调 .then 会报 TypeError，总比崩 App 强——已是最后防线，
+    /// 实践中走不到（构造器在建桥时就从全新 context 上取下强引用了）。
+    private static func rejectedPromise(in context: JSContext, constructor: JSValue?, exceptionBox: ExceptionBox, message: String) -> JSValue {
+        var ctor = constructor
+        if ctor == nil || ctor!.isUndefined || ctor!.isNull {
+            // 恢复求值自己的异常不留给后事（本次已自行处理）：
+            // 求值前盒子里是什么，求值后还恢复成什么。
+            let before = exceptionBox.message
+            if let recovered = context.evaluateScript("(async function(){}()).constructor"),
+               !recovered.isUndefined, !recovered.isNull {
+                ctor = recovered
+            }
+            if exceptionBox.message != before {
+                exceptionBox.message = before
+            }
         }
+        guard let ctor, !ctor.isUndefined, !ctor.isNull else {
+            #if DEBUG
+            print("[WidgetHost] Widget.http 拿不到可用的 Promise 构造器：\(message)")
+            #endif
+            return JSValue(undefinedIn: context)!
+        }
+        let errorValue: JSValue
+        if let jsError = context.objectForKeyedSubscript("Error")?.construct(withArguments: [message]) {
+            errorValue = jsError
+        } else {
+            errorValue = JSValue(object: message, in: context)!
+        }
+        if let rejected = ctor.invokeMethod("reject", withArguments: [errorValue]) {
+            return rejected
+        }
+        #if DEBUG
+        print("[WidgetHost] Promise.reject 失败：\(message)")
+        #endif
+        return JSValue(undefinedIn: context)!
+    }
+
+    private static func makeHttpGetPromise(in context: JSContext, urlString: String, options: JSValue?, interceptor: CategoryRequestInterceptor, httpRegistry: HTTPRequestRegistry, nativePromiseConstructor: JSValue?, exceptionBox: ExceptionBox) -> JSValue {
         let headers = headers(from: options)
         let timeout = timeoutInterval(from: options)
         let effectiveURL = interceptor.rewrittenURL(for: urlString) ?? urlString
         let executor: @convention(block) (JSValue, JSValue) -> Void = { resolve, reject in
             let box = JSCallbackBox(resolve: resolve, reject: reject)
             // executor Task 是 detached 的：记进登记表，完事自己注销；
-            // host 释放/模块调用失败时由 cancelAll 统一取消。
+            // host 释放时由 cancelAll 统一取消。
             // 注意：Task 体内第一个 await（fetchHTTP）才会挂起，register
             // 一定在 Task 跑完之前执行到，defer 里的 unregister 不会漏。
             var taskID: UUID?
@@ -1473,9 +1615,7 @@ final class WidgetHost: @unchecked Sendable {
                         result.setValue(data, forProperty: "data")
                         result.setValue(JSValue(object: responseHeaders, in: ctx) ?? JSValue(newObjectIn: ctx)!, forProperty: "headers")
                         result.setValue(finalURL, forProperty: "finalUrl")
-                        if let buffer = WidgetHost.jsArrayBuffer(from: rawData, in: ctx) {
-                            result.setValue(buffer, forProperty: "arrayBuffer")
-                        }
+                        WidgetHost.installArrayBuffer(from: rawData, in: ctx, on: result)
                         box.resolve.call(withArguments: [result])
                     }
                 } catch {
@@ -1501,24 +1641,25 @@ final class WidgetHost: @unchecked Sendable {
             }
             taskID = httpRegistry.register(task)
         }
-        guard let promise = promiseConstructor.construct(withArguments: [executor]) else {
-            fatalError("WidgetHost: 构造 Promise 失败")
+        // P1-3：构造器是建桥时从全新 context 上取下的原生构造器（不是现取的全局
+        // Promise，模块改写全局 Promise 也影响不到它）；construct 失败也不
+        // fatalError，返回一个已拒绝的 Promise。
+        guard let promiseConstructor = nativePromiseConstructor,
+              !promiseConstructor.isUndefined, !promiseConstructor.isNull,
+              let promise = promiseConstructor.construct(withArguments: [executor]) else {
+            return rejectedPromise(in: context, constructor: nativePromiseConstructor, exceptionBox: exceptionBox, message: "Widget.http.get 构造 Promise 失败")
         }
         return promise
     }
 
-    private static func makeHttpPostPromise(in context: JSContext, urlString: String, body: JSValue?, options: JSValue?, httpRegistry: HTTPRequestRegistry) -> JSValue {
-        guard let promiseConstructor = context.objectForKeyedSubscript("Promise"),
-              !promiseConstructor.isUndefined else {
-            fatalError("WidgetHost: JS 环境里没有 Promise")
-        }
+    private static func makeHttpPostPromise(in context: JSContext, urlString: String, body: JSValue?, options: JSValue?, httpRegistry: HTTPRequestRegistry, nativePromiseConstructor: JSValue?, exceptionBox: ExceptionBox) -> JSValue {
         let headers = headers(from: options)
         let timeout = timeoutInterval(from: options)
         let bodyData = httpBodyData(from: body)
         let executor: @convention(block) (JSValue, JSValue) -> Void = { resolve, reject in
             let box = JSCallbackBox(resolve: resolve, reject: reject)
             // executor Task 是 detached 的：记进登记表，完事自己注销；
-            // host 释放/模块调用失败时由 cancelAll 统一取消（与 GET 同理）。
+            // host 释放时由 cancelAll 统一取消（与 GET 同理）。
             var taskID: UUID?
             let task = Task {
                 defer {
@@ -1539,9 +1680,7 @@ final class WidgetHost: @unchecked Sendable {
                         result.setValue(data, forProperty: "data")
                         result.setValue(JSValue(object: responseHeaders, in: ctx) ?? JSValue(newObjectIn: ctx)!, forProperty: "headers")
                         result.setValue(finalURL, forProperty: "finalUrl")
-                        if let buffer = WidgetHost.jsArrayBuffer(from: rawData, in: ctx) {
-                            result.setValue(buffer, forProperty: "arrayBuffer")
-                        }
+                        WidgetHost.installArrayBuffer(from: rawData, in: ctx, on: result)
                         box.resolve.call(withArguments: [result])
                     }
                 } catch {
@@ -1567,8 +1706,11 @@ final class WidgetHost: @unchecked Sendable {
             }
             taskID = httpRegistry.register(task)
         }
-        guard let promise = promiseConstructor.construct(withArguments: [executor]) else {
-            fatalError("WidgetHost: 构造 Promise 失败")
+        // P1-3：与 GET 同款——原生构造器 + construct 失败返回已拒绝的 Promise，不 fatalError。
+        guard let promiseConstructor = nativePromiseConstructor,
+              !promiseConstructor.isUndefined, !promiseConstructor.isNull,
+              let promise = promiseConstructor.construct(withArguments: [executor]) else {
+            return rejectedPromise(in: context, constructor: nativePromiseConstructor, exceptionBox: exceptionBox, message: "Widget.http.post 构造 Promise 失败")
         }
         return promise
     }
@@ -1593,17 +1735,18 @@ final class WidgetHost: @unchecked Sendable {
         return body.toString().data(using: .utf8)
     }
 
-    /// 从 options 提取超时时间（兼容毫秒如 8000 和秒如 8）；未传时默认 12 秒，
-    /// 让模块在 30 秒 awaitPromise 窗口内至少有余量切到备用镜像域名。
+    /// 从 options 提取超时时间（兼容毫秒如 8000 和秒如 8）；未传时默认
+    /// WidgetTimeoutBudget.httpDefaultSeconds，让模块在 awaitPromise 窗口内
+    /// 至少有余量切到备用镜像域名。默认值/夹值/毫秒分界全在超时一本账里（P1-10）。
     private static func timeoutInterval(from options: JSValue?) -> TimeInterval {
         guard let raw = options?.objectForKeyedSubscript("timeout"),
               !raw.isUndefined, !raw.isNull else {
-            return 12
+            return WidgetTimeoutBudget.httpDefaultSeconds
         }
         let value = raw.toDouble()
-        guard value.isFinite, value > 0 else { return 12 }
-        let seconds = value > 120 ? (value / 1000.0) : value
-        return min(max(seconds, 3), 25)
+        guard value.isFinite, value > 0 else { return WidgetTimeoutBudget.httpDefaultSeconds }
+        let seconds = value > WidgetTimeoutBudget.timeoutMillisThreshold ? (value / 1000.0) : value
+        return min(max(seconds, WidgetTimeoutBudget.httpMinSeconds), WidgetTimeoutBudget.httpMaxSeconds)
     }
 
     private static func headers(from options: JSValue?) -> [String: String] {
@@ -1727,6 +1870,42 @@ final class WidgetHost: @unchecked Sendable {
         guard let buffer = helper.call(withArguments: [jsArray]),
               !buffer.isUndefined, !buffer.isNull else { return nil }
         return buffer
+    }
+
+    /// 在 Widget.http 回值对象上装 .arrayBuffer（chunk-1 性能问题）：
+    /// ≤1 MiB 直接急切构造（装箱量可接受，行为与原来一致）；
+    /// 1–16 MiB 装惰性 getter，JS 第一次读 .arrayBuffer 时才构造——
+    /// fetch().arrayBuffer() 与模块直接读 res.arrayBuffer 都是按需读，
+    /// 平时不付装箱钱；建好后把 getter 换成普通值属性，后续访问不再经过
+    /// getter，getter 连同它捕获的 raw 一起释放。
+    /// >16 MiB 不装（与原来一致，属性缺省）。16 MiB 上限阈值保持不变。
+    /// 只在主线程调（调用点都在 MainActor.run 里）。
+    /// JS 侧契约不变：res.arrayBuffer 仍是 ArrayBuffer（或缺省），只是什么时候构造变了。
+    private static func installArrayBuffer(from raw: Data, in context: JSContext, on result: JSValue) {
+        guard raw.count <= 16 * 1024 * 1024 else { return }
+        if raw.count <= 1 * 1024 * 1024 {
+            if let buffer = jsArrayBuffer(from: raw, in: context) {
+                result.setValue(buffer, forProperty: "arrayBuffer")
+            }
+            return
+        }
+        let getter: @convention(block) () -> JSValue = {
+            guard let buffer = WidgetHost.jsArrayBuffer(from: raw, in: context) else {
+                return JSValue(undefinedIn: context)!
+            }
+            // 建好就换成普通值属性：后续访问零开销，getter 连同它捕获的 raw 一起释放。
+            result.setValue(buffer, forProperty: "arrayBuffer")
+            return buffer
+        }
+        guard let getterValue = JSValue(object: getter, in: context) else { return }
+        result.defineProperty(
+            "arrayBuffer",
+            descriptor: [
+                JSPropertyDescriptorGetKey: getterValue,
+                JSPropertyDescriptorConfigurableKey: true,
+                JSPropertyDescriptorEnumerableKey: true,
+            ]
+        )
     }
 
     /// 响应体能解析成 JSON 就给对象/数组，否则给文本。
@@ -2264,7 +2443,7 @@ final class WidgetHost: @unchecked Sendable {
     private func fetchWordPressArray(url: URL) async throws -> (status: Int, items: [[String: Any]]?, rawData: Data) {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.timeoutInterval = 12
+        request.timeoutInterval = WidgetTimeoutBudget.httpDefaultSeconds
         let headers = NetConstants.mergeHeaders(
             base: NetConstants.defaultBrowserHeaders,
             overrides: ["Accept": "application/json"]
@@ -2272,7 +2451,7 @@ final class WidgetHost: @unchecked Sendable {
         for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
-        let (raw, response) = try await WordPressHTTP.shared.fetch(request, source: "wp-direct", timeout: 12)
+        let (raw, response) = try await WordPressHTTP.shared.fetch(request, source: "wp-direct", timeout: WidgetTimeoutBudget.httpDefaultSeconds)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         let items = try? JSONSerialization.jsonObject(with: raw) as? [[String: Any]]
         return (status, items, raw)
@@ -2389,15 +2568,19 @@ final class WidgetHost: @unchecked Sendable {
         return out
     }
 
-    private func callFunction(_ name: String, params: [String: Any]) async throws -> JSValue {
+    private func callFunction(_ name: String, params: [String: Any]) async throws -> Any {
         try await callFunction(name, args: [params])
     }
 
     /// 调 JS 函数（async 函数返回 Promise）。函数查找与调用在主线程做，
     /// 返回的 Promise 再经 awaitPromise 桥回 Swift async。
-    private func callFunction(_ name: String, args: [Any]) async throws -> JSValue {
+    /// 返回的是主线程转好的 Swift/Foundation 值（P1-7），不再是 JSValue。
+    private func callFunction(_ name: String, args: [Any]) async throws -> Any {
         let returned = try await MainActor.run { () throws -> JSValue in
-            guard let fn = context.objectForKeyedSubscript(name),
+            // P1-4b：调之前先清掉盒子里上一次的残留异常（定时器回调等），
+            // 免得本次成功也被 takeException() 误判成失败。
+            exceptionBox.message = nil
+            guard let fn = Self.globalSymbol(in: context, named: name),
                   !fn.isUndefined, !fn.isNull else {
                 throw WidgetHostError.functionMissing("模块里没有这个功能：\(name)")
             }
@@ -2419,16 +2602,19 @@ final class WidgetHost: @unchecked Sendable {
         return message.flatMap { $0.isEmpty ? nil : $0 }
     }
 
-    /// 等一个 JS Promise，30 秒超时。超时或 reject 都 throw。
+    /// 等一个 JS Promise，超时或 reject 都 throw。超时窗口见
+    /// WidgetTimeoutBudget.promiseWindowMs（超时一本账，P1-10）。
+    /// 返回前在主线程把 JSValue 转成 Swift/Foundation 值（P1-7），
+    /// 调用方只解析 Swift 值，不在后台线程碰 JSValue。
     /// 超时后任务组 cancel 会一路传进 awaitPromiseRaw 的取消处理，
     /// JS 侧的等待随即收尾，不再空转占着连接池（旧逻辑：超时只 throw，
     /// continuation 没人 resume，JS 的 fetch 还在后台跑）。
-    private func awaitPromise(_ value: JSValue) async throws -> JSValue {
+    private func awaitPromise(_ value: JSValue) async throws -> Any {
         let box = JSValueBox(value)
-        return try await withThrowingTaskGroup(of: JSValue.self) { group in
+        return try await withThrowingTaskGroup(of: Any.self) { group in
             group.addTask { try await self.awaitPromiseRaw(box.value) }
             group.addTask {
-                try await Task.sleep(nanoseconds: 30 * 1_000_000_000)
+                try await Task.sleep(nanoseconds: UInt64(WidgetTimeoutBudget.promiseWindowMs) * 1_000_000)
                 throw WidgetHostError.callFailed("模块 30 秒没返回，可能是站挂了或网络太慢")
             }
             guard let result = try await group.next() else {
@@ -2468,16 +2654,24 @@ final class WidgetHost: @unchecked Sendable {
     /// 盒子前就跑，所以存进去后要再查一次 Task.isCancelled；② 主队列的 then 调度
     /// 晚于取消——DispatchQueue.main.async 里先查取消再调 then，不给已取消的
     /// Promise 再挂回调。
-    private func awaitPromiseRaw(_ value: JSValue) async throws -> JSValue {
+    /// 返回的是主线程转好的 Swift/Foundation 值（P1-7），不再是 JSValue。
+    private func awaitPromiseRaw(_ value: JSValue) async throws -> Any {
         let box = JSValueBox(value)
-        let thenValue = await MainActor.run { box.value.objectForKeyedSubscript("then") }
+        // P1-4a：模块返回 undefined/null 时不对它取属性——JSC 内部 TypeError
+        // 会写进 exceptionBox，污染下一次调用。非对象直接按同步结果走。
+        let thenValue: JSValue? = await MainActor.run {
+            guard box.value.isObject else { return nil }
+            return box.value.objectForKeyedSubscript("then")
+        }
         guard let thenValue, !thenValue.isUndefined, !thenValue.isNull else {
-            return value
+            // 不是 Promise（没有 then）就直接当结果用——有的模块同步返回数组，不包 Promise。
+            // 在主线程转成 Swift 值再返回（P1-7）；undefined/null 转出来是 nil，记成 NSNull，
+            // 解析侧按“不是列表/详情”抛错，与原来 toArray()/toDictionary() 为 nil 的行为一致。
+            return await MainActor.run { box.value.toObject() ?? NSNull() }
         }
         let once = OnceBox()
         let contBox = ContinuationBox()
-        do {
-            return try await withTaskCancellationHandler {
+        let resolved = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<JSValue, Error>) in
                 contBox.set(continuation)
                 if Task.isCancelled {
@@ -2525,18 +2719,18 @@ final class WidgetHost: @unchecked Sendable {
                 contBox.take()?.resume(throwing: CancellationError())
             }
         }
-        } catch {
-            // 本次模块调用失败/超时（reject 或取消）：在途的 Widget.http
-            // 请求全部取消，不让它们继续跑、继续 resolve 这个 host 的 JS。
-            httpRegistry.cancelAll()
-            throw error
-        }
+        // P1-7：Promise 兑现的 JSValue 也在主线程转成 Swift 值再交出去；
+        // 调用方（解析）只碰 Swift/Foundation 值，不在后台线程碰 JSValue。
+        // P0-1：这里不再调 httpRegistry.cancelAll()——一次模块调用失败/超时
+        // 就取消同一 host 全部在途 Widget.http 请求，会杀掉竞速的另外几个样本
+        // 与用户刚点的解析；在途请求只在 host 释放（deinit）时统一取消。
+        return await MainActor.run { resolved.toObject() ?? NSNull() }
     }
 
     // MARK: - 内部：结果解析
 
-    private func parseVideoItems(_ value: JSValue) throws -> [VideoItem] {
-        guard let array = value.toArray() else {
+    private func parseVideoItems(_ value: Any) throws -> [VideoItem] {
+        guard let array = value as? [Any] else {
             throw WidgetHostError.unexpectedResult("模块返回的不是列表，看不懂")
         }
         var items: [VideoItem] = []
@@ -2573,8 +2767,8 @@ final class WidgetHost: @unchecked Sendable {
 
     /// 解析 loadDetail 返回的详情对象：复用 videoItem 的字段（id/标题/链接/封面/描述），
     /// 再取 videoUrl（首集预铸直链）与 childItems（分集）。
-    private func parseDetailItem(_ value: JSValue) throws -> DetailItem {
-        guard let dict = value.toDictionary() as? [String: Any] else {
+    private func parseDetailItem(_ value: Any) throws -> DetailItem {
+        guard let dict = value as? [String: Any] else {
             throw WidgetHostError.unexpectedResult("模块返回的不是详情，看不懂")
         }
         let base = videoItem(from: dict)
@@ -2642,18 +2836,12 @@ final class WidgetHost: @unchecked Sendable {
         (dict["cookie"] as? String).flatMap { $0.isEmpty ? nil : $0 }
     }
 
-    private func parsePlayLines(_ value: JSValue) -> [PlayLine] {
+    private func parsePlayLines(_ value: Any) -> [PlayLine] {
         var dicts: [[String: Any]] = []
-        if let array = value.toArray() {
+        if let array = value as? [Any] {
             dicts = array.compactMap { $0 as? [String: Any] }
-        } else if let single = value.toDictionary() {
-            var stringDict: [String: Any] = [:]
-            for (key, value) in single {
-                if let keyString = key as? String {
-                    stringDict[keyString] = value
-                }
-            }
-            dicts = [stringDict]
+        } else if let single = value as? [String: Any] {
+            dicts = [single]
         }
         var lines: [PlayLine] = []
         for dict in dicts {
@@ -2677,14 +2865,104 @@ final class WidgetHost: @unchecked Sendable {
 
 // MARK: - 小盒子（线程 / Sendable 用）
 
+/// 模块 id 的盒子（chunk-1 P1-11）：桥安装时 id 还不知道，build() 取到
+/// WidgetMetadata.id 后才填进去；桥里的 storage/localStorage block 每次调用
+/// 时现算带 id 的前缀，不在安装时定死。全在主线程读写（JS 只在主线程跑，
+/// 见文件头规矩），标 @unchecked Sendable 只是为了能进 @convention(block) 闭包。
+/// 盒子本身是纯 Swift 对象，不留 JS 引用。id 只写一次（build 里 metaId 到手后），
+/// 之后只读；host 释放不影响它（block 被 context 强引用，盒子随 context 走）。
+private final class ModuleIDBox: @unchecked Sendable {
+    var id: String = ""
+}
+
 /// 接 JS 异常信息的盒子（exceptionHandler 回调里写，takeException 里读）。
-private final class ExceptionBox {
+/// 全在主线程读写（JS 只在主线程跑，见文件头规矩），标 @unchecked Sendable
+/// 只是为了能进定时器 work item 这类闭包。
+private final class ExceptionBox: @unchecked Sendable {
     var message: String?
 }
 
+/// 原生 Promise 构造器的弱持有盒（chunk-1 P1-3）：
+/// 强引用由 WidgetHost 实例持有（host → 构造器 → context，不成环）；
+/// 桥里的 http.get/post block 只拿这个盒子，不直接强引用构造器——
+/// block 被 context 强引用，强引用构造器会在 context↔block 间成环、
+/// host 释放后也泄漏。盒子本身是纯 Swift 对象，不留 JS 引用。
+private final class NativePromiseStore: @unchecked Sendable {
+    weak var constructor: JSValue?
+}
+
+/// 在途定时器登记表（chunk-1 P1-6，与 HTTPRequestRegistry 同构）：
+/// setTimeout/setInterval 的 DispatchWorkItem 记在这里；host deinit 时
+/// cancelAll() 统一取消，不让定时器在 host 释放后还跑模块代码。
+/// 上限 64 个：超限的 setTimeout/setInterval 调用直接忽略并返回 0
+///（JS 侧拿到 0 这个无效 id，与原来“注册失败”的行为一致——原来超限
+/// 是无上限增长，现在宁可丢掉新的也不让旧的泄漏）。
+private final class TimerRegistry: @unchecked Sendable {
+    /// 同时存在的定时器上限。
+    static let maxTimers = 64
+
+    private let lock = NSLock()
+    private var timers: [Int: DispatchWorkItem] = [:]
+    private var counter = 0
+
+    /// 分配 id 并登记一份 work；满上限返回 nil（调用方不得再排这个定时器）。
+    /// makeWork 只负责建 DispatchWorkItem，不跑用户代码，持锁调它不会死锁。
+    func register(_ makeWork: (Int) -> DispatchWorkItem) -> (id: Int, work: DispatchWorkItem)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard timers.count < Self.maxTimers else { return nil }
+        counter += 1
+        let id = counter
+        let work = makeWork(id)
+        timers[id] = work
+        return (id, work)
+    }
+
+    /// 换掉某个 id 的 work（setInterval 每 tick 建新的 work 时用）。
+    /// id 已被 cancel 时不复活——清掉后不重排。
+    func store(_ work: DispatchWorkItem, for id: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard timers[id] != nil else { return }
+        timers[id] = work
+    }
+
+    /// 该 id 是否还在表里（setInterval 的 tick 触发时查，决定停不停）。
+    func contains(_ id: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return timers[id] != nil
+    }
+
+    /// 从表里拿掉（setTimeout 触发一次后、setInterval 回调发现 context 没了时用），
+    /// 不 cancel——work 正在跑，cancel 也没意义。
+    func remove(_ id: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        timers.removeValue(forKey: id)
+    }
+
+    /// 取消一个定时器（clearTimeout/clearInterval 用）：拿掉并 cancel。
+    func cancel(_ id: Int) {
+        lock.lock()
+        let work = timers.removeValue(forKey: id)
+        lock.unlock()
+        work?.cancel()
+    }
+
+    /// 取消全部在途定时器（host deinit 用）。
+    func cancelAll() {
+        lock.lock()
+        let current = timers
+        timers.removeAll()
+        lock.unlock()
+        for work in current.values { work.cancel() }
+    }
+}
+
 /// 在途 Widget.http 请求登记表：executor Task 是 detached 的（无父子关系，
-/// host 释放时没人取消），记在这里；host deinit 或一次模块调用失败/超时
-/// 时统一取消，不让已死的 host 的请求继续跑、继续 resolve 已释放的 JSContext。
+/// host 释放时没人取消），记在这里；host deinit 时统一取消，不让已死的
+/// host 的请求继续跑、继续 resolve 已释放的 JSContext。
 private final class HTTPRequestRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var tasks: [UUID: Task<Void, Never>] = [:]

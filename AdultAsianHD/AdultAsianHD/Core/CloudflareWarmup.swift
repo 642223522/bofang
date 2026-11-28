@@ -21,7 +21,7 @@ final class CloudflareWarmup {
     /// 需要预热的域名（+ 子域匹配）：dood/playmogo 嵌页家族与 onlybokep。
     static let warmupHosts: [String] = [
         "playmogo.com", "doodstream.com", "dood.to", "dood.watch",
-        "doodstream.co", "doodstream.io", "onlybokep.com",
+        "doodstream.co", "doodstream.io", "onlybokep.cam",
     ]
 
     private final class WarmupSession {

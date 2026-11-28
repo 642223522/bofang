@@ -170,13 +170,14 @@ final class Downloader: ObservableObject {
         let ext = url.pathExtension.isEmpty ? "mp4" : url.pathExtension
         let destURL = uniqueFileURL(for: title, ext: ext)
         do {
-            let tempURL = try await downloadFileWithResume(from: url, taskId: id)
-            try? fileManager.removeItem(at: destURL)
-            try fileManager.moveItem(at: tempURL, to: destURL)
+            // P0-4：落盘已在 downloadOnce 的 completion handler 返回前同步完成
+            //（见 finishDownload），这里拿到的就是最终地址，不再 await 返回后
+            // 才 moveItem——临时文件那时可能已被系统删掉。
+            let finalURL = try await downloadFileWithResume(from: url, taskId: id, destURL: destURL)
             updateTask(id: id) {
                 $0.progress = 1
                 $0.state = .completed
-                $0.fileURL = destURL
+                $0.fileURL = finalURL
             }
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
@@ -187,12 +188,12 @@ final class Downloader: ObservableObject {
         }
     }
 
-    private func downloadFileWithResume(from url: URL, taskId: UUID) async throws -> URL {
+    private func downloadFileWithResume(from url: URL, taskId: UUID, destURL: URL) async throws -> URL {
         var resumeData: Data?
         var lastError: Error?
         for _ in 0..<2 { // 最多下两次：第一次 + 一次 resume 重试
             do {
-                return try await downloadOnce(from: url, resumeData: resumeData, taskId: taskId)
+                return try await downloadOnce(from: url, resumeData: resumeData, taskId: taskId, destURL: destURL)
             } catch let failure as ResumeFailure {
                 if let data = failure.resumeData {
                     resumeData = data
@@ -205,54 +206,74 @@ final class Downloader: ObservableObject {
         throw lastError ?? DownloadError.network("下载失败")
     }
 
-    /// 一次 downloadTask。进度用 Timer 每 0.3 秒读 task.progress 轮询
-    /// （downloadTask 的 completionHandler 不带进度回调）。
-    private func downloadOnce(from url: URL, resumeData: Data?, taskId: UUID) async throws -> URL {
-        try await withCheckedThrowingContinuation { continuation in
-            var timer: Timer? = nil
-            let finish: (URL?, URLResponse?, Error?) -> Void = { location, response, error in
-                if let timer {
-                    DispatchQueue.main.async { timer.invalidate() }
+    /// 一次 downloadTask。进度用 task.progress 的 KVO（fractionCompleted），
+    /// 观察者由完成盒持有、完成/取消时释放；取消经 withTaskCancellationHandler
+    /// 同步取消底层任务（P0-5：旧实现用可变 var timer，被 @Sendable 的完成回调
+    /// 捕获并跨线程读写，是数据竞争 + Swift 6 硬编译错，且取消停不掉任务）。
+    private func downloadOnce(from url: URL, resumeData: Data?, taskId: UUID, destURL: URL) async throws -> URL {
+        let box = DownloadRaceBox()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
+                // 父任务在进 continuation 前已被取消时 onCancel 先跑、盒子已 finish，
+                // installContinuation 返回 false 并已把 pending 结果补恢复——
+                // 直接返回，什么都不创建（同 NetworkDiagnostics.URLSessionRaceBox 的 F25）。
+                guard box.installContinuation(continuation) else { return }
+                let finish: (URL?, URLResponse?, Error?) -> Void = { location, response, error in
+                    Self.finishDownload(location: location, response: response, error: error, destURL: destURL, box: box)
                 }
-                Self.finishDownload(location: location, response: response, error: error, continuation: continuation)
-            }
-            let task: URLSessionDownloadTask
-            if let resumeData {
-                task = URLSession.shared.downloadTask(withResumeData: resumeData, completionHandler: finish)
-            } else {
-                task = URLSession.shared.downloadTask(with: url, completionHandler: finish)
-            }
-            timer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
-                let fraction = task.progress.fractionCompleted
-                Task { @MainActor in
-                    self?.updateTask(id: taskId) { $0.progress = fraction }
+                let task: URLSessionDownloadTask
+                if let resumeData {
+                    task = URLSession.shared.downloadTask(withResumeData: resumeData, completionHandler: finish)
+                } else {
+                    task = URLSession.shared.downloadTask(with: url, completionHandler: finish)
                 }
+                box.installTask(task)
+                let observation = task.progress.observe(\.fractionCompleted, options: [.new]) { [weak self] progress, _ in
+                    let fraction = progress.fractionCompleted
+                    Task { @MainActor in
+                        self?.updateTask(id: taskId) { $0.progress = fraction }
+                    }
+                }
+                box.installObservation(observation)
+                task.resume()
             }
-            task.resume()
+        } onCancel: {
+            box.finish(.failure(CancellationError()), cancelTask: true)
         }
     }
 
-    private static func finishDownload(location: URL?, response: URLResponse?, error: Error?, continuation: CheckedContinuation<URL, Error>) {
+    /// completion handler 内同步落盘：临时 location 只在 handler 返回前有效，
+    /// moveItem 必须在这里做，不能等 continuation 恢复后再由调用方移
+    ///（P0-4：MP4 下载 100% 落盘时 No such file）。落盘失败直接报失败，
+    /// 绝不把已失效的临时 location 交回去。
+    private static func finishDownload(location: URL?, response: URLResponse?, error: Error?, destURL: URL, box: DownloadRaceBox) {
+        let result: Result<URL, Error>
         if let error {
             // 失败时 URLSession 会在 userInfo 里给 resumeData（能续传时）
             if let resumeData = (error as NSError).userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
-                continuation.resume(throwing: ResumeFailure(resumeData: resumeData, underlying: error))
+                result = .failure(ResumeFailure(resumeData: resumeData, underlying: error))
             } else {
-                continuation.resume(throwing: DownloadError.network(error.localizedDescription))
+                result = .failure(DownloadError.network(error.localizedDescription))
             }
-            return
+        } else if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            // downloadTask 的 HTTP 错误不走 error，得自己看 statusCode
+            //（404 也会“成功”返回一个装着错误页的临时文件）。
+            result = .failure(DownloadError.httpStatus(http.statusCode))
+        } else if let location {
+            do {
+                // 目标已存在（同名残留）先清掉：moveItem 不覆盖已存在文件。
+                if FileManager.default.fileExists(atPath: destURL.path) {
+                    try? FileManager.default.removeItem(at: destURL)
+                }
+                try FileManager.default.moveItem(at: location, to: destURL)
+                result = .success(destURL)
+            } catch {
+                result = .failure(DownloadError.network("下载完成但保存失败：\(error.localizedDescription)"))
+            }
+        } else {
+            result = .failure(DownloadError.network("下载完成但没拿到文件"))
         }
-        // downloadTask 的 HTTP 错误不走 error，得自己看 statusCode
-        //（404 也会“成功”返回一个装着错误页的临时文件）。
-        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-            continuation.resume(throwing: DownloadError.httpStatus(http.statusCode))
-            return
-        }
-        guard let location else {
-            continuation.resume(throwing: DownloadError.network("下载完成但没拿到文件"))
-            return
-        }
-        continuation.resume(returning: location)
+        box.finish(result, cancelTask: false)
     }
 
     // MARK: - 小工具
@@ -344,4 +365,93 @@ enum DownloadError: Error, LocalizedError {
 private struct ResumeFailure: Error {
     let resumeData: Data?
     let underlying: Error
+}
+
+/// downloadOnce 的一次性完成盒（与 NetworkDiagnostics.URLSessionRaceBox
+/// 同款 pending 设计）：完成回调 / 父取消两路抢一个 continuation，只恢复一次；
+/// 先到的结果在 continuation 还没装好时暂存 pending，装好立刻补恢复。
+/// 锁保护全部状态；进度 KVO 观察者也由盒子持有，完成/取消时释放。
+private final class DownloadRaceBox: @unchecked Sendable {
+    typealias Completion = CheckedContinuation<URL, Error>
+
+    private let lock = NSLock()
+    private var continuation: Completion?
+    private var pending: Result<URL, Error>?
+    private var task: URLSessionDownloadTask?
+    private var observation: NSKeyValueObservation?
+    private var finished = false
+
+    /// 装 continuation；已 finish 时返回 false（调用方什么都不创建直接返回）。
+    /// false 时 pending 里的结果已在这里补恢复，continuation 不会悬空。
+    @discardableResult
+    func installContinuation(_ value: Completion) -> Bool {
+        lock.lock()
+        if finished {
+            let result = pending
+            lock.unlock()
+            if let result {
+                value.resume(with: result)
+            } else {
+                // 防御：finished 但 pending 为空不应发生（finish 总是把结果
+                // 写进 pending）；真发生了也别让 continuation 永久挂住。
+                value.resume(throwing: CancellationError())
+            }
+            return false
+        }
+        continuation = value
+        lock.unlock()
+        return true
+    }
+
+    /// 存 downloadTask；已 finish 时立即取消它（调用方在 install 后 resume，
+    /// 已取消的任务 resume 后会立刻以 -999 完成，completion 里 finish 是 no-op）。
+    func installTask(_ value: URLSessionDownloadTask) {
+        lock.lock()
+        let cancel = finished
+        if !cancel {
+            task = value
+        }
+        lock.unlock()
+        if cancel {
+            value.cancel()
+        }
+    }
+
+    /// 存进度 KVO 观察者；已 finish 时立即释放它（不再收进度回调）。
+    func installObservation(_ value: NSKeyValueObservation) {
+        lock.lock()
+        let invalidate = finished
+        if !invalidate {
+            observation = value
+        }
+        lock.unlock()
+        if invalidate {
+            value.invalidate()
+        }
+    }
+
+    /// 完成：取消时 cancelTask == true，同步取消底层 downloadTask。
+    func finish(_ result: Result<URL, Error>, cancelTask: Bool) {
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        finished = true
+        let continuation = self.continuation
+        self.continuation = nil
+        let task = self.task
+        self.task = nil
+        let observation = self.observation
+        self.observation = nil
+        if continuation == nil {
+            pending = result
+        }
+        lock.unlock()
+        observation?.invalidate()
+        if cancelTask {
+            task?.cancel()
+        }
+        continuation?.resume(with: result)
+    }
 }

@@ -93,20 +93,45 @@ enum NodeRequiredModules {
 }
 
 extension VideoItem {
-    /// 分类识别打分（0–4）：id 含 cat- 标记、_cat 是"分类"、链接含 /category/、无封面。
+    /// id 是否含分类标记（前缀 "cat-" 或 "-cat-" 子串）。
+    /// 注意 "black-cat-123" 这类普通视频 id 也会命中这一条——它只是弱信号，
+    /// 能不能过线由 isCategory 里的强信号/辅助分规则定，这里不单独收紧。
+    private func hasIdMarker(under rule: CategoryDetectionRule) -> Bool {
+        id.hasPrefix(rule.idMarker) || id.contains("-" + rule.idMarker)
+    }
+
+    /// _cat / category 字段是否为分类标记（比较前去首尾空白）。
+    private func hasCategoryMarker(under rule: CategoryDetectionRule) -> Bool {
+        category.trimmingCharacters(in: .whitespacesAndNewlines) == rule.categoryMarker
+    }
+
+    /// 分类识别打分（0–4）：id 含 cat- 标记、_cat 是"分类"、链接含 /category/
+    /// （大小写不敏感）、无封面。只做信号计数，过线规则见 isCategory。
     func categoryScore(under rule: CategoryDetectionRule) -> Int {
         var score = 0
-        if id.hasPrefix(rule.idMarker) || id.contains("-" + rule.idMarker) { score += 1 }
-        if category == rule.categoryMarker { score += 1 }
-        if link.contains(rule.linkPathMarker) { score += 1 }
+        if hasIdMarker(under: rule) { score += 1 }
+        if hasCategoryMarker(under: rule) { score += 1 }
+        if link.lowercased().contains(rule.linkPathMarker.lowercased()) { score += 1 }
         let hasCover = !(coverURL ?? "").isEmpty
         if rule.countsMissingCover && !hasCover { score += 1 }
         return score
     }
 
-    /// 打分达到阈值即分类项（跳转桩），否则是视频。
+    /// 是否分类项（跳转桩），否则是视频。强弱信号分两档，不只看总分：
+    /// 1. 强信号：id 分类标记 + _cat"分类"双标记同时命中，直接判分类——
+    ///    不依赖 perModule 登记与阈值，新模块的分类瓦片不再漏判
+    ///    （perModule 表保留作兼容，阈值仍对弱信号组合生效）。
+    /// 2. 弱信号：缺封面只是辅助分。没有 _cat"分类"时，缺封面不得当过线的
+    ///    决定分——普通视频 id 偶然含 -cat- 又缺封面，在阈值 2 的站上
+    ///    也不能仅凭这两分被误判为分类。
     func isCategory(under rule: CategoryDetectionRule) -> Bool {
-        categoryScore(under: rule) >= rule.threshold
+        if hasIdMarker(under: rule) && hasCategoryMarker(under: rule) { return true }
+        let score = categoryScore(under: rule)
+        guard score >= rule.threshold else { return false }
+        if hasCategoryMarker(under: rule) { return true }
+        let hasCover = !(coverURL ?? "").isEmpty
+        let coverPoint = (rule.countsMissingCover && !hasCover) ? 1 : 0
+        return score - coverPoint >= rule.threshold
     }
 
     /// 从 id 里取分类数字编号，如 "pornjav-cat-33" → "33"；纯数字 id 直接返回。
@@ -114,9 +139,21 @@ extension VideoItem {
 
     /// 同上，作用于任意原始 id 字符串。
     static func numericId(from rawId: String) -> String? {
-        if !rawId.isEmpty && rawId.allSatisfy({ $0.isNumber }) { return rawId }
-        guard let range = rawId.range(of: "cat-") else { return nil }
-        let digits = rawId[range.upperBound...].prefix(while: { $0.isNumber })
+        // 纯数字 id 直接返回；只认 ASCII 数字，全角/Unicode 数字
+        // （如 "１２３"）会生成非法 WP REST 数字 ID，必须排除。
+        if !rawId.isEmpty && rawId.allSatisfy({ $0.isASCII && $0.isNumber }) { return rawId }
+        // 优先向后搜 "-cat-"：正向首匹配会在 "wildcat-cat-33" 里命中前段
+        // "wildcat-" 的 "cat-" 而截断；再兜底前缀 "cat-"（如 "cat-33"）。
+        let range: Range<String.Index>?
+        if let backward = rawId.range(of: "-cat-", options: .backwards) {
+            range = backward
+        } else if rawId.hasPrefix("cat-") {
+            range = rawId.startIndex..<rawId.index(rawId.startIndex, offsetBy: 4)
+        } else {
+            range = nil
+        }
+        guard let range else { return nil }
+        let digits = rawId[range.upperBound...].prefix(while: { $0.isASCII && $0.isNumber })
         return digits.isEmpty ? nil : String(digits)
     }
 
@@ -235,8 +272,11 @@ struct CheckTimeouts {
         self.firstFrameMs = firstFrameMs
     }
 
-    /// 分步默认值解析：模块声明值优先，钳制到 1000...60000ms，防止模块写错数字
-    /// （1ms 或 10 分钟）把竞速卡住或拖垮。竞速（WidgetHost）用。
+    /// 分步默认值解析：模块声明值优先，钳制到 1000...(awaitPromise 窗口减余量)，
+    /// 防止模块写错数字（1ms 或 10 分钟）把竞速卡住或拖垮，也防止声明值
+    /// 超过 awaitPromise 窗口后被 30 秒静默截断（chunk-1 P1-10：超时一本账，
+    /// 上限见 WidgetHost.WidgetTimeoutBudget）。竞速（WidgetHost）用。
+    /// 夹值时不记诊断：这里是纯函数，没有诊断接入点。
     static func effectiveMs(for kind: CheckStepKind, declared: Int?) -> Int {
         let fallback: Int
         switch kind {
@@ -247,7 +287,7 @@ struct CheckTimeouts {
         case .firstFrame: fallback = 12000
         }
         guard let ms = declared else { return fallback }
-        return max(1000, min(60000, ms))
+        return max(1000, min(WidgetHost.WidgetTimeoutBudget.promiseWindowMs - WidgetHost.WidgetTimeoutBudget.reserveMs, ms))
     }
 }
 

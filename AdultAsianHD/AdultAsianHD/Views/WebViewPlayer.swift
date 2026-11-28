@@ -2669,6 +2669,10 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
     private let adStrip: Bool
     private var webView: WKWebView?
     private var loadedURL: URL?
+    /// 上次见到的重试计数（run #36 P0-11）：retryNonce 变了=用户点了
+    /// “重试嵌入播放”，即使 URL 相同也要强制重载（以前 guard loadedURL != url
+    /// 直接早退，重试按钮是摆设）。
+    private var lastRetryNonce: Int?
     private var navigationStartAt: Date?
     /// CF 兜底已关过广告规则：为 true 后不再装规则（堵异步编译完成又把规则装回去的竞态）。
     private var adRulesDisabled = false
@@ -2751,7 +2755,8 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
         true
     }
 
-    /// URL 不变不重载，避免 SwiftUI 刷新时打断正在播的嵌入页。
+    /// URL 不变不重载，避免 SwiftUI 刷新时打断正在播的嵌入页；但 retryNonce
+    /// 变了（用户点了“重试嵌入播放”）必须强制重载，即使 URL 相同。
     /// 只做 URL 加载：探针 reset 不在这里做（SwiftUI 更新期调它会改
     /// @Published，撞上视图更新）；切 URL 时 WebViewPlayerView 的
     /// .onChange(of: url) 会调 probe.stop()/start()。
@@ -2759,12 +2764,23 @@ final class EmbedWebViewController: UIViewController, WKNavigationDelegate, WKUI
     /// 预热只在后台并行跑（给播放 WebView 预种 cf_clearance cookie，
     /// 完事不改已在加载的页面）。以前：没 clearance 就先暖 3×10 秒，
     /// 暖完才加载——白屏 10–30 秒就是这么来的。
-    func loadIfNeeded(url: URL) {
-        guard loadedURL != url else { return }
+    func loadIfNeeded(url: URL, retryNonce: Int = 0) {
+        let nonceChanged = lastRetryNonce != nil && lastRetryNonce != retryNonce
+        guard loadedURL != url || nonceChanged else { return }
+        lastRetryNonce = retryNonce
         loadedURL = url
         navigationStartAt = Date()
         // 上一页关掉广告规则后换了新 URL：规则重新开，新的一页重新评估。
         adRulesDisabled = false
+        // 强制重试时：上一页可能走 reloadWithoutRules() 清空了规则，
+        // 只把 adRulesDisabled 置回 false 不够（规则已从 userContentController
+        // 里摘掉），要把缓存的规则重新装回去，否则后续嵌页第一层广告拦截永久失效。
+        if nonceChanged, adStrip, let webView {
+            webView.configuration.userContentController.removeAllContentRuleLists()
+            AdBlockRuleStore.install(into: webView.configuration.userContentController, siteHost: url.host ?? "") { [weak self] in
+                !(self?.adRulesDisabled ?? true)
+            }
+        }
         probe.pageLoaded = false
         // 立即加载（不等预热）。
         load(request: url)
@@ -2891,13 +2907,15 @@ struct EmbedWebView: UIViewControllerRepresentable {
     let probe: EmbedProbeState
     /// 是否开广告剥离（默认 true；模块的 adStrip 标记透传到这里，false 就不开）。
     var adStrip: Bool = true
+    /// 嵌入重试计数（WebViewPlayerView 从 retryNonce 透传）：变了就强制重载同一 URL。
+    var retryNonce: Int = 0
 
     func makeUIViewController(context: Context) -> EmbedWebViewController {
         EmbedWebViewController(url: url, probe: probe, adStrip: adStrip)
     }
 
     func updateUIViewController(_ uiViewController: EmbedWebViewController, context: Context) {
-        uiViewController.loadIfNeeded(url: url)
+        uiViewController.loadIfNeeded(url: url, retryNonce: retryNonce)
     }
 
     static func dismantleUIViewController(_ uiViewController: EmbedWebViewController, coordinator: Coordinator) {
@@ -2939,7 +2957,7 @@ struct WebViewPlayerView: View {
 
     var body: some View {
         ZStack {
-            EmbedWebView(url: url, probe: probe, adStrip: adStrip)
+            EmbedWebView(url: url, probe: probe, adStrip: adStrip, retryNonce: retryNonce)
             // 质询进行中：顶部小胶囊提示，不盖全屏、不拦手势
             //（Cloudflare 复选框在下面，用户要能点到“我是人类”；
             // 点画面切底条显隐走 WKWebView 上的原生手势，不走 SwiftUI

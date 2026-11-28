@@ -78,21 +78,31 @@ final class StagedNetworkProbe: NSObject {
         ),
     ]
 
-    /// DoH 解析商（JSON API，IP 字面量端点，不走系统 DNS；每家 4 秒超时）：
-    /// Google 与 Ali 用 /resolve（JSON API）；Cloudflare/DNSPod/360/114DNS 用
+    /// DoH 解析商（JSON API，不走系统 DNS；每家 4 秒总预算）：
+    /// Google 与 Ali 用 /resolve（JSON API）；Cloudflare/DNSPod/360 用
     /// /dns-query + Accept: application/dns-json。
+    /// endpointHost 是 TLS SNI 与证书校验主机名（与 DoHFallbackClient
+    /// 的解析商表一致）；直连时按 ips 逐个试 fetchSingleHop（与业务侧
+    /// DoH 同一条 HTTP 栈：SNI + 真证书校验 + HTTP/1.1，禁 H3）。
+    /// 114DNS 已删：它没有公开的 DoH 主机名（只有 53 端口明文 DNS），
+    /// IP 字面量 URL 永远过不了证书校验，那行只会报假 TLS 失败——
+    /// 114DNS 公布 DoH 主机名后再加回来（补 endpointHost 即可）。
     /// 注意：规范里 Google 写的是 8.8.8.8/dns-query，那是 DNS 线路格式端点
     ///（RFC 8484，需自组 DNS 报文）；本探针的 resolveDoH 只讲 JSON，
     /// 所以 Google 走 /resolve（Google 的 JSON API），查的是同一家解析商。
-    /// 360（101.226.4.6）与 114DNS（114.114.114.114）只确认了 DoH 服务存在，
-    /// 沙箱里 TLS 建连超时、未证实可用——探针行会如实报出错误码。
-    private static let dohResolvers: [(name: String, endpoint: String)] = [
-        ("Google", "https://8.8.8.8/resolve"),
-        ("CFDoH", "https://1.1.1.1/dns-query"),
-        ("AliDoH", "https://223.5.5.5/resolve"),
-        ("DNSPod", "https://119.29.29.29/dns-query"),
-        ("360", "https://101.226.4.6/dns-query"),
-        ("114DNS", "https://114.114.114.114/dns-query"),
+    /// 360（101.226.4.6）沙箱里 TLS 建连超时、未证实可用——探针行会如实报出错误码。
+    private struct DohProbeEndpoint {
+        let name: String
+        let endpointHost: String
+        let path: String
+        let ips: [String]
+    }
+    private static let dohResolvers: [DohProbeEndpoint] = [
+        DohProbeEndpoint(name: "Google", endpointHost: "dns.google", path: "/resolve", ips: ["8.8.8.8", "8.8.4.4"]),
+        DohProbeEndpoint(name: "CFDoH", endpointHost: "cloudflare-dns.com", path: "/dns-query", ips: ["1.1.1.1", "1.0.0.1"]),
+        DohProbeEndpoint(name: "AliDoH", endpointHost: "dns.alidns.com", path: "/resolve", ips: ["223.5.5.5", "223.6.6.6"]),
+        DohProbeEndpoint(name: "DNSPod", endpointHost: "doh.pub", path: "/dns-query", ips: ["119.29.29.29"]),
+        DohProbeEndpoint(name: "360", endpointHost: "doh.360.cn", path: "/dns-query", ips: ["101.226.4.6"]),
     ]
 
     /// 每出一行探针结果就调一次（调用方在里面跳回 MainActor 写 UI）。
@@ -124,11 +134,11 @@ final class StagedNetworkProbe: NSObject {
                 ok: !sys.v4.isEmpty || !sys.v6.isEmpty
             ))
 
-            // 1b. 六家 DoH（IP 字面量，不走系统 DNS）× A / AAAA / HTTPS(65)。
-            for (name, base) in Self.dohResolvers {
+            // 1b. 五家 DoH（直连 IP 字面量 + SNI，不走系统 DNS）× A / AAAA / HTTPS(65)。
+            for resolver in Self.dohResolvers {
                 for qtype in ["A", "AAAA", "HTTPS"] {
                     if Task.isCancelled { return }
-                    let rec = await resolveDoH(resolver: name, endpoint: base, host: host, qtype: qtype)
+                    let rec = await resolveDoH(resolver: resolver, host: host, qtype: qtype)
                     let ok = rec.error == nil && !rec.records.isEmpty
                     emit(ProbeLine(
                         stage: .dns,
@@ -272,39 +282,68 @@ final class StagedNetworkProbe: NSObject {
         let error: String?
     }
 
-    private func resolveDoH(resolver: String, endpoint: String, host: String, qtype: String) async -> DNSAnswerRecord {
+    /// DoH JSON 查询：走 DoHFallbackClient.fetchSingleHop（与业务侧 DoH
+    /// 同一条栈：直连 IP 字面量 + SNI=endpointHost + 按端点域名校验证书 +
+    /// HTTP/1.1，不走 URLSession、不发 H3）。每家 4 秒总预算，多个 IP 共用。
+    /// 校验 HTTP 2xx 与 DNS Status==0：非 2xx / 非 0 状态都如实记错，
+    /// 不再把失败响应当成“解析商无答案”——旧逻辑用裸 URLSession 直连 IP
+    /// 字面量，不发 SNI、证书按 IP 校验必失败，结论与真实路径矛盾（P1-10）。
+    private func resolveDoH(resolver: DohProbeEndpoint, host: String, qtype: String) async -> DNSAnswerRecord {
         let start = CFAbsoluteTimeGetCurrent()
-        guard var comps = URLComponents(string: endpoint) else {
-            return DNSAnswerRecord(resolver: resolver, qtype: qtype, latencyMs: 0, cnames: [], records: [], error: "bad_url")
+        let latencyMs: () -> Int = { Int((CFAbsoluteTimeGetCurrent() - start) * 1000) }
+        let fail: (String) -> DNSAnswerRecord = { error in
+            DNSAnswerRecord(resolver: resolver.name, qtype: qtype, latencyMs: latencyMs(), cnames: [], records: [], error: error)
         }
-        comps.queryItems = [URLQueryItem(name: "name", value: host), URLQueryItem(name: "type", value: qtype)]
-        var req = URLRequest(url: comps.url!, timeoutInterval: 4)
-        req.setValue("application/dns-json", forHTTPHeaderField: "Accept")
-        let session = URLSession(configuration: .ephemeral)
-        defer { session.finishTasksAndInvalidate() }
-
-        do {
-            let (data, _) = try await session.data(for: req)
-            let ms = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                return DNSAnswerRecord(resolver: resolver, qtype: qtype, latencyMs: ms, cnames: [], records: [], error: "bad_json")
+        let deadline = Date().addingTimeInterval(4)
+        var lastError: String?
+        for ip in resolver.ips {
+            if Task.isCancelled { return fail("cancelled") }
+            // 同一家多个 IP 共用 4 秒预算：剩得少了就不再开新跳。
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0.5 else { break }
+            var comps = URLComponents()
+            comps.scheme = "https"
+            comps.host = resolver.endpointHost
+            comps.path = resolver.path
+            comps.queryItems = [URLQueryItem(name: "name", value: host), URLQueryItem(name: "type", value: qtype)]
+            guard let url = comps.url else { return fail("bad_url") }
+            var req = URLRequest(url: url, timeoutInterval: remaining)
+            req.setValue("application/dns-json", forHTTPHeaderField: "Accept")
+            do {
+                let (data, http) = try await DoHFallbackClient.shared.fetchSingleHop(
+                    url: url, host: resolver.endpointHost, ip: ip, request: req, timeout: remaining
+                )
+                guard (200...299).contains(http.statusCode) else {
+                    lastError = "http_\(http.statusCode)"
+                    continue
+                }
+                guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    lastError = "bad_json"
+                    continue
+                }
+                let status = json["Status"] as? Int ?? -1
+                guard status == 0 else {
+                    return fail("dns_status_\(status)")
+                }
+                let answers = (json["Answer"] as? [[String: Any]]) ?? []
+                let wantType: Int = (qtype == "A") ? 1 : (qtype == "AAAA" ? 28 : 65)
+                var cnames: [String] = []
+                var recs: [(String, Int)] = []
+                for a in answers {
+                    let t = a["type"] as? Int ?? -1
+                    let val = a["data"] as? String ?? ""
+                    let ttl = a["TTL"] as? Int ?? -1
+                    if t == 5 { cnames.append(val) }
+                    else if t == wantType { recs.append((val, ttl)) }
+                }
+                return DNSAnswerRecord(resolver: resolver.name, qtype: qtype, latencyMs: latencyMs(), cnames: cnames, records: recs, error: nil)
+            } catch {
+                if error is CancellationError { return fail("cancelled") }
+                lastError = "\((error as NSError).code)"
+                continue
             }
-            let answers = (json["Answer"] as? [[String: Any]]) ?? []
-            let wantType: Int = (qtype == "A") ? 1 : (qtype == "AAAA" ? 28 : 65)
-            var cnames: [String] = []
-            var recs: [(String, Int)] = []
-            for a in answers {
-                let t = a["type"] as? Int ?? -1
-                let val = a["data"] as? String ?? ""
-                let ttl = a["TTL"] as? Int ?? -1
-                if t == 5 { cnames.append(val) }
-                else if t == wantType { recs.append((val, ttl)) }
-            }
-            return DNSAnswerRecord(resolver: resolver, qtype: qtype, latencyMs: ms, cnames: cnames, records: recs, error: nil)
-        } catch {
-            let ms = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
-            return DNSAnswerRecord(resolver: resolver, qtype: qtype, latencyMs: ms, cnames: [], records: [], error: "\((error as NSError).code)")
         }
+        return fail(lastError ?? "timeout")
     }
 
     // MARK: - 2. Staged NWConnection + EstablishmentReport (TCP + TLS)
@@ -495,14 +534,51 @@ final class StagedNetworkProbe: NSObject {
         let wv = WKWebView(frame: .zero, configuration: cfg)
         wv.customUserAgent = nil
 
+        // Loader：continuation 盒子（与同文件 DNSBox.set / NWProbeBox 同款）：
+        // onCancel 的 finish 可能在 continuation 存进来之前跑——旧代码的
+        // finish 只 guard !done 后置 done，cont 仍是 nil，随后赋值的 cont
+        // 永远没人 resume，造成永久挂起 + 泄漏（P0-2）。这里 finish 先跑时
+        // 把结果存进 pendingResult，setContinuation 见到 done 立即恢复；
+        // 20 秒看门狗 Task 存下来，finish 里 cancel，不留 20 秒滞留。
         final class Loader: NSObject, WKNavigationDelegate, @unchecked Sendable {
-            var cont: CheckedContinuation<String, Never>?
-            var done = false
+            private let lock = NSLock()
+            private var cont: CheckedContinuation<String, Never>?
+            private var pendingResult: String?
+            private var done = false
+            private var _watchdog: Task<Void, Never>?
+            /// 看门狗 Task（锁保护的存取：finish 可能在任意线程跑）。
+            var watchdog: Task<Void, Never>? {
+                get { lock.lock(); defer { lock.unlock() }; return _watchdog }
+                set { lock.lock(); defer { lock.unlock() }; _watchdog = newValue }
+            }
+
+            /// 存 continuation：若 finish 已先跑（done），立即用存下的结果恢复。
+            func setContinuation(_ c: CheckedContinuation<String, Never>) {
+                lock.lock()
+                if done, let result = pendingResult {
+                    pendingResult = nil
+                    lock.unlock()
+                    c.resume(returning: result)
+                    return
+                }
+                cont = c
+                lock.unlock()
+            }
+
             func finish(_ text: String) {
-                guard !done else { return }
+                lock.lock()
+                guard !done else { lock.unlock(); return }
                 done = true
-                cont?.resume(returning: text)
+                let c = cont
                 cont = nil
+                // 只有 cont 还没存进来时才留结果给后到的 setContinuation；
+                // cont 已在时直接恢复，不留过期结果。
+                if c == nil { pendingResult = text }
+                let wd = _watchdog
+                _watchdog = nil
+                lock.unlock()
+                wd?.cancel()
+                c?.resume(returning: text)
             }
             func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
                 webView.evaluateJavaScript("document.body ? document.body.innerText.slice(0, 200) : ''") { val, _ in
@@ -533,12 +609,22 @@ final class StagedNetworkProbe: NSObject {
         wv.navigationDelegate = loader
         let result = await withTaskCancellationHandler {
             await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
-                loader.cont = cont
-                wv.load(URLRequest(url: url, timeoutInterval: 15))
+                loader.setContinuation(cont)
                 // 20 秒看门狗：挑战页/挂起的加载不会永远等下去（原版没有超时，会永久挂住）。
-                Task { @MainActor in
+                // 先存下来再加载：finish 里会 cancel 它。
+                loader.watchdog = Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 20_000_000_000)
                     loader.finish("TIMEOUT@20000ms（页面 20 秒未加载完）")
+                }
+                // 进 continuation 时已取消：onCancel 可能在 setContinuation
+                // 之前就跑完（finish 已占 done，setContinuation 已立即恢复），
+                // 也可能它的 Task 还没跑起来——这里再补一次 finish，guard
+                // done 拦着，不会重复恢复；已取消就不发 load。
+                if Task.isCancelled {
+                    wv.stopLoading()
+                    loader.finish("CANCELLED")
+                } else {
+                    wv.load(URLRequest(url: url, timeoutInterval: 15))
                 }
             }
         } onCancel: {

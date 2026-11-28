@@ -341,8 +341,8 @@ struct VideoCard: View {
                 Button {
                     favorites.toggle(item: item, sourceId: sourceId)
                 } label: {
-                    Image(systemName: favorites.isFavorite(item.id) ? "star.fill" : "star")
-                        .foregroundColor(favorites.isFavorite(item.id) ? .yellow : .white)
+                    Image(systemName: favorites.isFavorite(itemId: item.id, sourceId: sourceId) ? "star.fill" : "star")
+                        .foregroundColor(favorites.isFavorite(itemId: item.id, sourceId: sourceId) ? .yellow : .white)
                         .padding(6)
                         .background(Color.black.opacity(0.45), in: Circle())
                 }

@@ -86,8 +86,12 @@ enum PlaybackEngine {
         return lower.contains(".m3u8") || lower.contains(".mp4")
     }
 
-    /// 嵌入页（要先解流或 WebView 播）：http(s) 链接且不是直链；
-    /// 或 playerHint 明确标嵌入（"embed"/"webview"）。
+    /// 嵌入页（要先解流或 WebView 播）：playerHint 明确标嵌入
+    /// （"embed"/"webview"），或 URL 形态是嵌页（路径含 /e/、/embed/、/player/，
+    /// 或扩展名是 .html/.htm/.php/.aspx/.jsp）。
+    /// 不再对“非直链即嵌页”一刀切（P0-6）：无后缀直链、无 hint 的不透明
+    /// URL 不是嵌页，须留给 route(for:) 的 Step 5 兜底（.nativeIntercepted 试播），
+    /// 否则 javtiful 这类直链会被误路由进 WebView。
     /// playmogo/dood 这类嵌入页 URL 走这条；huangguo 的直链 HLS 虽然 hint 也是 hlsjs，
     /// 但 URL 本身是 .m3u8，先被上一关认成直链，不会误判。
     /// hlsjs 不再只由后缀决定去向：hlsjs+嵌页 URL 经由 route(for:) 判给 .webView。
@@ -98,7 +102,11 @@ enum PlaybackEngine {
         }
         guard let url = URL(string: urlString),
               url.scheme == "http" || url.scheme == "https" else { return false }
-        return !isDirectMediaURL(urlString)
+        let path = url.path.lowercased()
+        if path.contains("/e/") || path.contains("/embed/") || path.contains("/player/") {
+            return true
+        }
+        return ["html", "htm", "php", "aspx", "jsp"].contains(url.pathExtension.lowercased())
     }
 
     /// 一条可播线路的种类（竞速用；播放路由仍用 route(for:) 的完整判定）。
@@ -201,7 +209,9 @@ enum PlaybackEngine {
     /// - hint=native+明文 → .native；未知 hint 先按 URL 形态判，判不出走 .nativeIntercepted 试播。
     /// - 签名/token/加密/有自定义头/Cookie 的线直接走拦截器，不试裸连；
     ///   只有明文静态、无加密、无自定义头的线才先裸连、失败再升级拦截器（见 markFailed）。
-    /// - 非媒体形态（嵌页）→ .webView（不管 hint 写什么；hint=native+嵌页是 hint_vs_content）。
+    /// - 嵌页形态（/e/、/embed/、/player/、.html/.php 或 embed/webview hint）
+    ///   → .webView；无 hint 的不透明 URL → .nativeIntercepted 试播（Step 5，
+    ///   hint=native+嵌页是 hint_vs_content）。
     static func route(for line: PlayLine) -> PlayerEngine {
         let hint = (line.playerHint ?? "").lowercased()
         let lower = line.url.lowercased()
@@ -212,8 +222,8 @@ enum PlaybackEngine {
             return .nativeIntercepted
         }
         let ext = url.pathExtension.lowercased()
-        // 1. .mpd → DASH（在 isEmbedURL 之前判：.mpd 已不是 AVPlayer 直链，
-        //    isEmbedURL 会把它误判成嵌页）。
+        // 1. .mpd → DASH（在 isEmbedURL 之前判：.mpd 不是 AVPlayer 直链，
+        //    也不是嵌页路径形态，必须先按 DASH 分流）。
         //    能力判定：有 dash.js → .dash；无 dash.js 但有软解 → .softDecoder；
         //    两者都没有 → 仍返回 .dash（不静默丢线），由 routeLine 的 fast-fail
         //    直接报明确错误并切下一条线；能力探测中途变化时，B 路 DASHPlayerView
@@ -233,6 +243,23 @@ enum PlaybackEngine {
         // 2. 非原生容器 → 软解（无软解则拦截器试播，失败报明确错误）。
         if ["mkv", "flv", "avi", "webm"].contains(ext) {
             return PlaybackCapabilities.hasSoftwareDecoder ? .softDecoder : .nativeIntercepted
+        }
+        // 3a. 显式直链 hint（classifyPlayableLine 的既有映射：exact "mp4"/
+        //     "direct"/"avplayer" → 直链文件，"hls"/"m3u8" → HLS，"native" 同直链）。
+        //     无扩展名直链（如 /media/video/<id>/720p + hint "mp4"）在此认出，
+        //     不再掉进 Step 4 被 isEmbedURL 误判成嵌页（P0-6：javtiful 回归）。
+        //     hint 含 hlsjs 不走这里：classify 把它归为嵌页，hlsjs+媒体 URL
+        //     由下面 Step 3 的 hlsjs 分支处理，hlsjs+嵌页 URL 走 Step 4。
+        //     带签名/自定义头/Cookie 或无扩展名 → .nativeIntercepted；
+        //     明文带扩展名 → .native（与 Step 3 的同类分支一致）。
+        let directHint = hint.trimmingCharacters(in: .whitespacesAndNewlines)
+        if ["mp4", "direct", "avplayer", "hls", "m3u8", "native"].contains(directHint) {
+            let needsIntercept = isSignedURL(line.url)
+                || line.headers?.isEmpty == false
+                || line.cookie?.isEmpty == false
+                || ext.isEmpty
+            if needsIntercept { return .nativeIntercepted }
+            return .native
         }
         // 3. 媒体形态（m3u8/mp4/mov）：内容优先，hint 只调起手路线。
         //    hint=embed/webview + 媒体 URL 不再直接进 WebView（Q5：内容优先，是 HLS 先走 D/P；
@@ -255,7 +282,8 @@ enum PlaybackEngine {
             // 未知 hint 的媒体 URL：形态判得出，走拦截器试播。
             return .nativeIntercepted
         }
-        // 4. 非媒体形态（嵌页）→ WebView（不管 hint 写什么；hint=native+嵌页是 hint_vs_content）。
+        // 4. 嵌页形态 → WebView（isEmbedURL 已收紧：只认 embed/webview hint
+        //    或嵌页路径形态；无 hint 的不透明 URL 不再误判，在 Step 5 兜底）。
         if isEmbedURL(line.url, playerHint: line.playerHint) {
             return .webView
         }
@@ -572,7 +600,9 @@ final class PlayerViewModel: ObservableObject {
         } else {
             urlForm = ".\(ext)"
         }
-        let knownHints = ["native", "hlsjs", "embed", "webview", "dash"]
+        // 路由已认的 hint（含 Step 3a 的显式直链 hint）：不再记“未知 hint”。
+        let knownHints = ["native", "hlsjs", "embed", "webview", "dash",
+                          "mp4", "direct", "avplayer", "hls", "m3u8"]
         let mismatch: MismatchKind
         let evidence: String
         if hint.isEmpty {

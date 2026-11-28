@@ -29,6 +29,9 @@ struct VideoGridView: View {
     /// 不让下拉刷新/切页后旧请求覆盖新列表、也不让 isLoading 永远卡着
     ///（run #20：分类空结果/失败也不能让转圈转到天荒地老）。
     @State private var loadGeneration = 0
+    /// 在途加载任务：翻页任务也存进来；刷新/搜索/清除先取消它再发新请求，
+    /// 旧任务回来时 generation 校验会把它拦掉，不写脏数据。
+    @State private var loadTask: Task<Void, Never>?
     @State private var hasMore = true
     @State private var errorMessage: String?
     @State private var searchText = ""
@@ -71,6 +74,7 @@ struct VideoGridView: View {
                                 }
                             }
                         }
+                        .scrollTargetLayout()
 
                         if isLoading {
                             ProgressView()
@@ -146,14 +150,20 @@ struct VideoGridView: View {
     // MARK: - 加载
 
     private func reload() async {
+        // 非追加加载（刷新/搜索/清除）必须能打断在途请求：先取消上一次
+        // 保存的任务，再发新请求；旧任务回来时 generation 校验拦掉它。
+        loadTask?.cancel()
         currentPage = 1
         hasMore = true
-        await load(page: 1, append: false)
+        let task = Task { await load(page: 1, append: false) }
+        loadTask = task
+        await task.value
     }
 
     private func loadNextPage() {
         guard !isLoading, hasMore else { return }
-        Task { await load(page: currentPage + 1, append: true) }
+        // 翻页任务也存进 loadTask，刷新/搜索才能打断在途翻页。
+        loadTask = Task { await load(page: currentPage + 1, append: true) }
     }
 
     private func runSearch() {
@@ -164,7 +174,9 @@ struct VideoGridView: View {
     }
 
     private func load(page: Int, append: Bool) async {
-        guard !isLoading else { return }
+        // 只有追加翻页才拦截并发；在途翻页时刷新/搜索/清除必须能进来，
+        // 否则新请求被静默吞掉、旧翻页回来还会把旧列表下一页追加到新状态里。
+        if append && isLoading { return }
         isLoading = true
         loadGeneration += 1
         let generation = loadGeneration

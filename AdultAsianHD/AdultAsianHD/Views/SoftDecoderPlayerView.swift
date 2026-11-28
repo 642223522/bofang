@@ -98,6 +98,11 @@ final class SoftDecoderPlayerController: ObservableObject {
     @Published var controlsVisible = true
     /// 是否在全屏（按钮图标据此切全屏/退出全屏；画面 view 的挂载门控也认它）。
     @Published var isFullscreen = false
+    /// 画面层代际（run #36 P0-9）：KSPlayerLayer 重建（后端回退换出新
+    /// player.view）或就绪时递增，作为值传给 SoftDecoderKSView，迫使
+    /// SwiftUI 调用 updateUIView 把画面 view 重新挂回容器（只传 controller
+    /// 同对象引用时结构体值不变、updateUIView 会被跳过，导致有声黑屏）。
+    @Published var layerRevision = 0
     /// 画质选项（从 viewModel.lines 推导，与原生同款）与当前档位。
     @Published var qualityOptions: [QualityOption] = []
     @Published var currentQualityLabel: String = "自动"
@@ -162,7 +167,8 @@ final class SoftDecoderPlayerController: ObservableObject {
             bufferedEnd = 0
             return
         }
-        guard lastURL != url || lastHeaders != headers else { return }
+        guard lastURL != url || lastHeaders != headers
+            || viewModel.playGeneration != lastGeneration || didMarkFailedURL != nil else { return }
         // 新片/新一集（generation 变了）从 0:00 起；同片切线保当前进度。
         let generation = viewModel.playGeneration
         let isNewSession = generation != lastGeneration
@@ -194,6 +200,7 @@ final class SoftDecoderPlayerController: ObservableObject {
         let layer = KSPlayerLayer(url: url, options: options, delegate: delegate)
         layerDelegate = delegate
         playerLayer = layer
+        layerRevision += 1
         layer.prepareToPlay()
         scheduleLoadTimeout()
     }
@@ -230,6 +237,8 @@ final class SoftDecoderPlayerController: ObservableObject {
     func handleState(layer: KSPlayerLayer, state: KSPlayerState) {
         guard layer === playerLayer else { return }
         if state == .readyToPlay {
+            // 层就绪也可能换出新 player.view：递增代际，画面 view 重新挂载。
+            layerRevision += 1
             if shouldPlay { layer.play() }
             return
         }
@@ -495,6 +504,12 @@ struct SoftDecoderKSView: UIViewRepresentable {
     let controller: SoftDecoderPlayerController
     /// true=全屏容器，false=内嵌容器（门控见 attachVideoView）。
     let isFullscreenContainer: Bool
+    /// 画面层代际（controller.layerRevision）：值变了 SwiftUI 才会调
+    /// updateUIView；只传 controller 时是同对象引用，值比对恒相等。
+    let layerRevision: Int
+    /// 全屏状态值（controller.isFullscreen）：退出全屏时值变了才会调
+    /// updateUIView，把画面 view 从全屏容器搬回内嵌容器。
+    let isFullscreen: Bool
 
     func makeUIView(context: Context) -> UIView {
         let view = UIView()
@@ -503,7 +518,14 @@ struct SoftDecoderKSView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: UIView, context: Context) {
-        controller.attachVideoView(to: uiView, fullscreenContainer: isFullscreenContainer)
+        // 只在代际或全屏状态变化时重挂：每次调用都无条件重建 view
+        // 会打断正在播的画面。首调时 coordinator 里的旧值为 nil，必挂一次。
+        if context.coordinator.lastLayerRevision != layerRevision
+            || context.coordinator.lastIsFullscreen != isFullscreen {
+            context.coordinator.lastLayerRevision = layerRevision
+            context.coordinator.lastIsFullscreen = isFullscreen
+            controller.attachVideoView(to: uiView, fullscreenContainer: isFullscreenContainer)
+        }
     }
 
     static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) {
@@ -513,7 +535,10 @@ struct SoftDecoderKSView: UIViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    final class Coordinator {}
+    final class Coordinator {
+        var lastLayerRevision: Int?
+        var lastIsFullscreen: Bool?
+    }
 }
 
 // MARK: - 软解播放器（SwiftUI：KSPlayerLayer + 同一套底条，16:9 内嵌）
@@ -535,7 +560,7 @@ struct SoftDecoderPlayerView: View {
 
     var body: some View {
         ZStack {
-            SoftDecoderKSView(controller: controller, isFullscreenContainer: false)
+            SoftDecoderKSView(controller: controller, isFullscreenContainer: false, layerRevision: controller.layerRevision, isFullscreen: controller.isFullscreen)
                 .onTapGesture { controller.toggleControls() }
             if controller.isLoading {
                 ProgressView()
@@ -597,7 +622,7 @@ struct SoftDecoderFullscreenContent: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            SoftDecoderKSView(controller: controller, isFullscreenContainer: true)
+            SoftDecoderKSView(controller: controller, isFullscreenContainer: true, layerRevision: controller.layerRevision, isFullscreen: controller.isFullscreen)
                 .ignoresSafeArea()
                 .onTapGesture { controller.toggleControls() }
             if controller.isLoading {
@@ -685,6 +710,9 @@ final class SoftDecoderFullscreenViewController: UIViewController {
 }
 
 /// 全屏呈现器：从最顶层控制器 present 横屏全屏播放器（与原生同款写法）。
+/// 整体 @MainActor：topViewController() 直接访问 UIApplication.shared，
+/// activeVC 是 static weak var，非隔离会有 Swift 6 隔离违规。
+@MainActor
 enum SoftDecoderFullscreenPresenter {
     private static weak var activeVC: SoftDecoderFullscreenViewController?
 

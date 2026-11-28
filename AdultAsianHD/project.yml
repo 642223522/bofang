@@ -3,7 +3,9 @@
 # project.yml 放在 AdultAsianHD/ 目录下，生成出的 .xcodeproj 就在同目录，
 # 与 codemagic.yaml 引用的 AdultAsianHD/AdultAsianHD.xcodeproj 一致。
 # 注意：包里不带任何 .js（不内置源），Sources 目录不存在；
-# NSAppTransportSecurity 不在这里写死，由 codemagic 在已编好的 .app 上修。
+# NSAppTransportSecurity 写在下面 info.properties 里（2026-11-28 chunk-7 P0-17 迁移：
+# INFOPLIST_KEY_* 在 GENERATE_INFOPLIST_FILE=NO 时全被 Xcode 忽略，ATS 只留
+# NSAllowsArbitraryLoads=true；不要在 workflow 里再写 ATS 键，见 P0-15）。
 name: AdultAsianHD
 options:
   deploymentTarget:
@@ -38,27 +40,47 @@ targets:
       # xcodegen 每次 generate 都会按这里重写 Info.plist，手改的 key 会被悄悄删掉。
       properties:
         UILaunchScreen: {}
+        # 以下键 2026-11-28 chunk-7 P0-17 从 settings 的 INFOPLIST_KEY_* 迁入：
+        # project.yml 用 info: path:（GENERATE_INFOPLIST_FILE 默认 NO），
+        # INFOPLIST_KEY_* 全部被 Xcode 忽略，正是 #45/#47 构建丢方向键的根因。
+        # 必须写在这里（info.properties），xcodegen generate 时合并进 Info.plist。
+        # 方向键在这里是 YAML 数组（XcodeGen 直接写 plist 数组）；空格分隔字符串
+        # 只适用于 INFOPLIST_KEY_* 构建设置写法，不要混用。
+        CFBundleDisplayName: "我的私人影院"
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # iPad 方向（Duo 内屏按 iPad 形态走，缺它时回退读通用键；四个方向全给，
+        # 2026-11-26 Gemini+ChatGPT 共识的加固项。最终 .app 由 workflow Package IPA
+        # 门禁硬断言，不再靠 Fix 步骤事后补）。
+        "UISupportedInterfaceOrientations~ipad":
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+          - UIInterfaceOrientationPortraitUpsideDown
+        # 后台模式只留 fetch：audio 会让 AVPlayer 自动向系统注册 Now Playing，
+        # 播放一开始 iOS 就在灵动岛弹出媒体大卡片（还进控制中心），用户要的就是去掉它。
+        UIBackgroundModes:
+          - fetch
+        # ATS：只留 NSAllowsArbitraryLoads=true。绝不能再加
+        # NSAllowsArbitraryLoadsInWebContent / ForMedia / LocalNetworking，
+        # 任一出现都会让系统忽略 NSAllowsArbitraryLoads，回环代理
+        # http://127.0.0.1 与 http:// 流报 -1022（chunk-7 P0-15）。
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: com.liudehen.xiaoshipin
       PRODUCT_NAME: "$(TARGET_NAME)"
       MARKETING_VERSION: "1.0.3"
       CURRENT_PROJECT_VERSION: "4"
       ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-      INFOPLIST_KEY_CFBundleDisplayName: "我的私人影院"
-      INFOPLIST_KEY_CFBundleShortVersionString: "1.0.3"
-      INFOPLIST_KEY_CFBundleVersion: "4"
-      INFOPLIST_KEY_UISupportedInterfaceOrientations:
-        - UIInterfaceOrientationPortrait
-        - UIInterfaceOrientationLandscapeLeft
-        - UIInterfaceOrientationLandscapeRight
-      # iPad 方向（Duo 内屏按 iPad 形态走，缺它时回退读通用键；四个方向全给，
-      # 2026-11-26 Gemini+ChatGPT 共识的加固项。工作流 Fix 步骤里也会在已编好的
-      # .app 上再补一次，和 iPhone 方向键一样，防管线弄丢）。
-      "INFOPLIST_KEY_UISupportedInterfaceOrientations~ipad":
-        - UIInterfaceOrientationPortrait
-        - UIInterfaceOrientationLandscapeLeft
-        - UIInterfaceOrientationLandscapeRight
-        - UIInterfaceOrientationPortraitUpsideDown
+      # 注意：显示名/方向键/后台模式/ATS 不再用 INFOPLIST_KEY_* 写在这里——
+      # GENERATE_INFOPLIST_FILE 默认 NO 时它们全被 Xcode 忽略（#45/#47 根因），
+      # 已全部迁入上面 info.properties（chunk-7 P0-17）。
+      # 版本号仍由 MARKETING_VERSION / CURRENT_PROJECT_VERSION 出，
+      # Xcode 构建时自动写入 CFBundleShortVersionString / CFBundleVersion，
+      # workflow Fix 步骤再强制写一次、Package IPA 门禁硬断言。
       SWIFT_VERSION: "5.0"
       TARGETED_DEVICE_FAMILY: "1,2"
       CODE_SIGN_STYLE: Automatic

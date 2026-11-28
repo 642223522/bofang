@@ -116,7 +116,11 @@ final class HLSJSPlayerController: ObservableObject {
             webViewController?.load(url: nil, headers: nil, resumeAt: 0)
             return
         }
-        guard lastURL != url || lastHeaders != headers else { return }
+        // run #36 P0-12：去重条件须纳入代际与失败态，否则同 URL/头的
+        // 手动重试或同分集重播（playGeneration 已换）会直接早退，status
+        // 永久卡在“正在解析播放线路…”。
+        guard lastURL != url || lastHeaders != headers
+            || viewModel.playGeneration != lastGeneration || didMarkFailedURL != nil else { return }
         // 新片/新一集（generation 变了）从 0:00 起；同片切线保当前进度。
         let generation = viewModel.playGeneration
         let isNewSession = generation != lastGeneration

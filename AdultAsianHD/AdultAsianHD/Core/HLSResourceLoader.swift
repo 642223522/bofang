@@ -124,7 +124,37 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     /// 播单里见过的 #EXT-X-TARGETDURATION（秒）：seek 容差/看门狗预算的
     /// 分片时长来源 1（最准）。rewritePlaylist 逐行改写时顺带记录；
     /// 变体播单与媒体播单都可能带它，取最后一次见到的值。
+    /// 写统一走 setTargetDurationSeconds（stateLock）；读在主线程直接读
+    ///（与 encounteredFairPlay / preflight 同款写法，调用方在别的文件）。
     private(set) var targetDurationSeconds: Double?
+
+    /// 首个入口 URL（第一次 fetch 的 URL，一般是播单）：跨源判定锚点。
+    /// 跨源子请求（第三方 CDN 分片/密钥/变体）不带 Cookie/Authorization
+    /// 等凭据头（P1-9）。
+    private var originURL: URL?
+
+    /// 记首个入口 URL（只记第一次；之后 fetch 不改锚点）。
+    private func setOriginURLIfNeeded(_ url: URL) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if originURL == nil { originURL = url }
+    }
+
+    /// 与首个入口 URL 同源吗（scheme+host+端口全同）？
+    private func isSameOriginAsEntry(_ url: URL) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return NetConstants.isSameOrigin(originURL, url)
+    }
+
+    /// TARGETDURATION 写入（rewritePlaylist 在后台 Task 跑，CustomPlayerView
+    /// 在主线程读）：统一走 stateLock（P1-8；与 recordFailure /
+    /// setFairPlayFlag 同款）。
+    private func setTargetDurationSeconds(_ seconds: Double) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        targetDurationSeconds = seconds
+    }
 
     /// headers：已合并好的子请求头（iPhone UA + Referer + 模块自定义头 + Cookie）。
     init(headers: [String: String], cookie: String?) {
@@ -286,12 +316,28 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
         request.httpMethod = "GET"
         request.assumesHTTP3Capable = false
         request.timeoutInterval = 12
-        for (key, value) in allHeaders {
+        // P1-9：记首个入口 URL 为 origin；跨源子请求（含第三方 CDN 分片/
+        // 密钥/变体）跳过凭据头。过滤后的表同时传给 preservedHeaders——
+        // 重定向时委托会按它补头，传全量表会在重定向跳步里把刚滤掉的
+        // 凭据头又补回去（DoHFallbackClient.redirectRequest / PerRequestDelegate
+        // 只在同源跳步才补敏感头，但锚点是本次请求 URL，不是入口 URL）。
+        setOriginURLIfNeeded(url)
+        let sameOrigin = isSameOriginAsEntry(url)
+        let sentHeaders: [String: String] = sameOrigin
+            ? allHeaders
+            : allHeaders.filter { !NetConstants.isSensitiveHeader($0.key) }
+        for (key, value) in sentHeaders {
             request.setValue(value, forHTTPHeaderField: key)
         }
         if let range {
             if let length = range.length {
-                request.setValue("bytes=\(range.offset)-\(range.offset + length - 1)", forHTTPHeaderField: "Range")
+                // P1-8：offset + length - 1 无溢出保护会 trap 闪退——
+                // 溢出按失败处理，不 trap（length > 0 由 requestedRange 保证）。
+                let (end, overflow) = range.offset.addingReportingOverflow(length - 1)
+                guard !overflow else {
+                    throw NSError(domain: "HLSResourceLoader", code: -1, userInfo: [NSLocalizedDescriptionKey: "Range 溢出"])
+                }
+                request.setValue("bytes=\(range.offset)-\(end)", forHTTPHeaderField: "Range")
             } else {
                 request.setValue("bytes=\(range.offset)-", forHTTPHeaderField: "Range")
             }
@@ -299,7 +345,7 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
         let result = try await DiagnosticHTTPClient.shared.data(
             for: request,
             source: "hlsloader",
-            preservedHeaders: allHeaders,
+            preservedHeaders: sentHeaders,
             timeout: 12
         )
         // 记实际账本：每一次代发请求都记（成功/非 2xx 都记；抛错的由 handle 的 catch 记 nil）。
@@ -331,13 +377,17 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     /// 播单判定（后缀 + 正文双重判定）：后缀 .m3u8 或 MIME 含 mpegurl 只是候选，
     /// 正文首行必须是 #EXTM3U（去 UTF-8 BOM 与前导空白）才算播单——
     /// CF 挑战页挂在 .m3u8 地址上时，按旧逻辑会被当成播单喂给 AVPlayer。
+    /// P1-7：正文是 #EXTM3U 即算播单，不再要求扩展名/MIME——无扩展名且
+    /// Content-Type: text/plain 的播单以前会被误杀。
     private func isPlaylist(data: Data, url: URL, response: HTTPURLResponse) -> Bool {
-        let hasPlaylistMarker = url.pathExtension.lowercased() == "m3u8"
-            || (response.mimeType?.lowercased().contains("mpegurl") ?? false)
-        guard hasPlaylistMarker else { return false }
         var text = String(decoding: data.prefix(64), as: UTF8.self)
         if text.hasPrefix("\u{FEFF}") { text.removeFirst() }
-        return text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("#EXTM3U")
+        let bodyIsM3U8 = text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("#EXTM3U")
+        let hasPlaylistMarker = url.pathExtension.lowercased() == "m3u8"
+            || (response.mimeType?.lowercased().contains("mpegurl") ?? false)
+            || bodyIsM3U8
+        guard hasPlaylistMarker else { return false }
+        return bodyIsM3U8
     }
 
     /// 播单逐行改写：key URI 解析成绝对路径并改 scheme（走拦截器）；
@@ -345,37 +395,67 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     /// MAP/init 与分片行只解析成绝对 https（AVPlayer 直接拉，不经过 delegate，
     /// 改了 scheme 只会 404 或报 -12881）。
     /// 相对路径必须重写为绝对路径，否则改 scheme 后 404 或 -12881（key 和分片都一样）。
+    /// P1-7：变体不只认 .m3u8 扩展名——#EXT-X-STREAM-INF: 的下一行裸 URI
+    /// 就是变体播单；#EXT-X-MEDIA 与 #EXT-X-I-FRAME-STREAM-INF: 的 URI
+    /// 也改写（仍是播单，走拦截器）。分片行仍只改绝对 https（文件头注释：
+    /// .ts 请求不经过 delegate，改 scheme 只会 404 / -12881）。
     /// TODO(备选)：key 可内联成 data: URI（多 key 轮换时需内联多个），本轮不实现。
     private func rewritePlaylist(_ text: String, baseURL: URL) -> String {
         let lines = text.components(separatedBy: .newlines)
         var out: [String] = []
         out.reserveCapacity(lines.count)
+        var nextLineIsVariant = false
         for line in lines {
             // 分片时长：seek 容差/看门狗预算用（见 CustomPlayerView.seekSegmentDurationSeconds）。
             if line.hasPrefix("#EXT-X-TARGETDURATION:") {
                 let value = line.dropFirst("#EXT-X-TARGETDURATION:".count)
                     .trimmingCharacters(in: .whitespaces)
                 if let seconds = Double(value), seconds > 0 {
-                    targetDurationSeconds = seconds
+                    setTargetDurationSeconds(seconds)
                 }
+                nextLineIsVariant = false
+                out.append(line)
+                continue
             }
-            if line.hasPrefix("#EXT-X-KEY"), let uri = extractURIValue(from: line) {
+            if line.hasPrefix("#EXT-X-STREAM-INF:") {
+                // 变体标记行本身不动，下一行裸 URI 是变体播单。
+                nextLineIsVariant = true
+                out.append(line)
+                continue
+            }
+            if line.hasPrefix("#EXT-X-I-FRAME-STREAM-INF:"), let (uri, uriRange) = extractURIValue(from: line) {
+                // I 帧变体播单：仍是播单，走拦截器（改 scheme）。
+                let absolute = absoluteURL(uri, base: baseURL)
+                out.append(line.replacingCharacters(in: uriRange, with: Self.loaderURL(for: absolute).absoluteString))
+                nextLineIsVariant = false
+                continue
+            }
+            if line.hasPrefix("#EXT-X-MEDIA:"), let (uri, uriRange) = extractURIValue(from: line) {
+                // 音频/字幕媒体播单：仍是播单，走拦截器（改 scheme）。
+                let absolute = absoluteURL(uri, base: baseURL)
+                out.append(line.replacingCharacters(in: uriRange, with: Self.loaderURL(for: absolute).absoluteString))
+                nextLineIsVariant = false
+                continue
+            }
+            if line.hasPrefix("#EXT-X-KEY"), let (uri, uriRange) = extractURIValue(from: line) {
                 let absolute = absoluteURL(uri, base: baseURL)
                 if absolute.scheme == "skd" || absolute.scheme == "skds" {
                     setFairPlayFlag()
                     out.append(line)
                 } else {
                     markKeyURL(absolute)
-                    out.append(line.replacingOccurrences(of: uri, with: Self.loaderURL(for: absolute).absoluteString))
+                    out.append(line.replacingCharacters(in: uriRange, with: Self.loaderURL(for: absolute).absoluteString))
                 }
-            } else if line.hasPrefix("#EXT-X-MAP:"), let uri = extractURIValue(from: line) {
+                nextLineIsVariant = false
+            } else if line.hasPrefix("#EXT-X-MAP:"), let (uri, uriRange) = extractURIValue(from: line) {
                 // init 分片：AVPlayer 直接拉，只改绝对 https，不改 scheme。
                 let absolute = absoluteURL(uri, base: baseURL)
-                out.append(line.replacingOccurrences(of: uri, with: absolute.absoluteString))
+                out.append(line.replacingCharacters(in: uriRange, with: absolute.absoluteString))
+                nextLineIsVariant = false
             } else if !line.hasPrefix("#"), !line.trimmingCharacters(in: .whitespaces).isEmpty {
                 let trimmed = line.trimmingCharacters(in: .whitespaces)
                 let absolute = absoluteURL(trimmed, base: baseURL)
-                if absolute.pathExtension.lowercased() == "m3u8" || trimmed.lowercased().contains(".m3u8") {
+                if nextLineIsVariant || absolute.pathExtension.lowercased() == "m3u8" || trimmed.lowercased().contains(".m3u8") {
                     // 变体播单行：仍是播单，走拦截器（改 scheme）。
                     out.append(Self.loaderURL(for: absolute).absoluteString)
                 } else {
@@ -383,31 +463,36 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
                     // 分片需头时拦截器覆盖不了（-12881），由上层回退 hls.js。
                     out.append(absolute.absoluteString)
                 }
+                nextLineIsVariant = false
             } else {
                 out.append(line)
+                nextLineIsVariant = false
             }
         }
         return out.joined(separator: "\n")
     }
 
-    /// URI="..."（有引号优先，无引号兜底）。
-    private func extractURIValue(from line: String) -> String? {
+    /// URI="..."（有引号优先，无引号兜底）。返回（值，值在行内的精确 Range）——
+    /// 调用方用 replacingCharacters(in:with:) 只换值本身；短 URI（"key"/"1"）
+    /// 用全行 replacingOccurrences 会误伤同行 IV=/BYTERANGE=（P1-7）。
+    private func extractURIValue(from line: String) -> (value: String, range: Range<String.Index>)? {
         if let start = line.range(of: "URI=\"") {
             let rest = line[start.upperBound...]
             guard let end = rest.firstIndex(of: "\"") else { return nil }
-            return String(rest[..<end])
+            return (String(rest[..<end]), rest.startIndex..<end)
         }
         guard let range = line.range(of: "URI=") else { return nil }
         let rest = line[range.upperBound...]
         let end = rest.firstIndex(where: { $0 == "," || $0 == " " }) ?? rest.endIndex
         let value = String(rest[..<end])
-        return value.isEmpty ? nil : value
+        guard !value.isEmpty else { return nil }
+        return (value, rest.startIndex..<end)
     }
 
     /// 播单里第一条 #EXT-X-KEY 的 URI（绝对路径字符串；重拉播单后找新签名用）。
     private func extractKeyURI(from text: String, baseURL: URL) -> String? {
         for line in text.components(separatedBy: .newlines) where line.hasPrefix("#EXT-X-KEY") {
-            guard let uri = extractURIValue(from: line) else { continue }
+            guard let (uri, _) = extractURIValue(from: line) else { continue }
             return absoluteURL(uri, base: baseURL).absoluteString
         }
         return nil
@@ -439,16 +524,20 @@ final class HLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
 
     /// 206：服务端已按 Range 切好，total 从 Content-Range 取；
     /// 200：服务端没理 Range，自己按请求的 Range 切一片出来。
+    /// P1-8：offset/length 加法用 addingReportingOverflow 钳制——
+    /// 极大 requestedLength 会 trap 闪退；溢出时 total 记 nil、end 钳到文件尾。
     private func sliceForRange(data: Data, response: HTTPURLResponse, range: RequestedRange?) -> (Data, Int?) {
         guard let range else { return (data, data.count) }
         if response.statusCode == 206 {
-            let total = totalLength(from: response) ?? (range.offset + data.count)
+            let (sum, overflow) = range.offset.addingReportingOverflow(data.count)
+            let total = totalLength(from: response) ?? (overflow ? nil : sum)
             return (data, total)
         }
         let start = min(range.offset, data.count)
         let end: Int
         if let length = range.length {
-            end = min(start + length, data.count)
+            let (sum, overflow) = start.addingReportingOverflow(length)
+            end = overflow ? data.count : min(sum, data.count)
         } else {
             end = data.count
         }

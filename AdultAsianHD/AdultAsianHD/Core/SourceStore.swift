@@ -34,6 +34,26 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
     private let giteeRepo = "individual-freedom/ziyong-ziliao-beifang"
     private let reportsBranch = "reports"
 
+    /// Gitee 同步专用会话：.ephemeral（无持久化磁盘缓存）且 urlCache = nil——
+    /// 带 access_token 查询参数的 URL 绝不进 URLCache/日志（P0-2）。
+    /// 只供 syncFromGitee 链路（列表 / contents 单文件 / raw 下载）用；
+    /// 上传账本等其他 Gitee 请求不在本次修法范围，不动。
+    private static let giteeSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 30
+        return URLSession(configuration: config)
+    }()
+
+    /// 导入/同步串行守卫：SourceStore 标了 @unchecked Sendable 且非 @MainActor，
+    /// 标志位只在 importLock 里读写，绝不裸 var 跨线程读写。
+    /// importData 与 syncFromGitee 共用这一位：双击同步 / 并发导入同一模块时，
+    /// 后到的直接失败，不排队——否则两路会分别拿到 xxx.js 与 xxx-2.js、
+    /// 写出重复 id 记录（P0-1）。
+    private let importLock = NSLock()
+    private var isImportingOrSyncing = false
+
     init() {
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         self.sourcesDirectory = documents.appendingPathComponent("Sources", isDirectory: true)
@@ -65,10 +85,39 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
 
     // MARK: - 导入（验收第一项）
 
-    /// 核心入口：文件 / 链接 / 同步下载到的 data 都走这里。
+    /// 核心入口：文件 / 链接 / 同步下载到的 data 都走这里（串行守卫：
+    /// 已有人在导入/同步时直接失败，不排队——双击同步/并发导入不再产生
+    /// xxx-2.js 与重复 id 记录；内核见 importDataCore）。
+    func importData(_ data: Data, fileName: String, origin: String) async -> Result<SourceRecord, ImportError> {
+        guard tryBeginImport() else {
+            return .failure(.network("正在导入或同步，请稍后再试"))
+        }
+        defer { endImport() }
+        return await importDataCore(data, fileName: fileName, origin: origin)
+    }
+
+    /// 抢导入/同步名额：空闲时置位并返回 true；已有人在导入/同步时返回 false，
+    /// 调用方直接失败（人话提示），不排队等。
+    private func tryBeginImport() -> Bool {
+        importLock.lock()
+        defer { importLock.unlock() }
+        guard !isImportingOrSyncing else { return false }
+        isImportingOrSyncing = true
+        return true
+    }
+
+    /// 释放导入/同步名额（与 tryBeginImport 配对，调用方用 defer 保证释放）。
+    private func endImport() {
+        importLock.lock()
+        defer { importLock.unlock() }
+        isImportingOrSyncing = false
+    }
+
+    /// importData 的无守卫内核：syncFromGitee 复用它（同步整轮已持导入名额，
+    /// 不能再走带守卫的 importData，否则自锁失败）。
     /// 顺序：转 UTF-8 文本 → WidgetHost.validate 校验格式（不合格直接失败，人话原因）
     /// → 文件名冲突自动改名（xxx-2.js）→ 写文件 → 更新清单 → 主线程刷新 sources。
-    func importData(_ data: Data, fileName: String, origin: String) async -> Result<SourceRecord, ImportError> {
+    private func importDataCore(_ data: Data, fileName: String, origin: String) async -> Result<SourceRecord, ImportError> {
         guard let text = String(data: data, encoding: .utf8),
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return .failure(.unreadable)
@@ -98,12 +147,18 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
             importedAt: Date()
         )
         await MainActor.run {
-            if let idx = self.sources.firstIndex(where: { $0.fileName == finalName }) {
+            // 源唯一身份只认 id：按 id 匹配替换，同一 meta.id 绝不追加第二条记录。
+            if let idx = self.sources.firstIndex(where: { $0.id == record.id }) {
                 self.sources[idx] = record
             } else {
                 self.sources.append(record)
             }
             self.saveManifest()
+        }
+        // 旧记录换了文件名时清掉旧文件（现逻辑里既有记录沿用旧文件名，
+        // 正常走不到这里；留作防卫，避免孤儿 .js 攒在 Sources 里）。
+        if let oldFileName = existing?.fileName, oldFileName != finalName {
+            try? fileManager.removeItem(at: sourcesDirectory.appendingPathComponent(oldFileName))
         }
         return .success(record)
     }
@@ -206,13 +261,18 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
 
     /// 从 Gitee“自用资料备份”js 分支拉 .js 源。
     /// 传空 token 时用 Keychain 里存过的；两个都没有就失败，提示先填 Token。
-    /// 同步是覆盖式：同名旧源先清掉再导入，避免反复同步产生 xxx-2.js。
+    /// 同步是覆盖式：同 meta.id 的旧源原地更新（写盘+清单都走 importDataCore），
+    /// 不再按文件名找旧源，避免反复同步产生 xxx-2.js 与重复 id 记录。
     /// 返回成功导入的个数；失败给人话原因。
     func syncFromGitee(token: String) async -> Result<Int, ImportError> {
         let effectiveToken = resolveGiteeToken(token)
         guard !effectiveToken.isEmpty else {
             return .failure(.network("请先在源页面填写 Gitee Token，才能同步"))
         }
+        guard tryBeginImport() else {
+            return .failure(.network("正在同步或导入，请稍后再试"))
+        }
+        defer { endImport() }
 
         guard let listURL = URL(string: "https://gitee.com/api/v5/repos/individual-freedom/ziyong-ziliao-beifang/contents/?ref=js") else {
             return .failure(.network("同步地址不对"))
@@ -223,7 +283,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         listRequest.timeoutInterval = 30
         let listData: Data
         do {
-            let (data, response) = try await URLSession.shared.data(for: listRequest)
+            let (data, response) = try await Self.giteeSession.data(for: listRequest)
             if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
                 if http.statusCode == 401 || http.statusCode == 403 {
                     return .failure(.network("Token 不对或没权限（HTTP \(http.statusCode)），检查一下 Token"))
@@ -234,6 +294,9 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         } catch {
             return .failure(.network("连不上码云：\(friendlyNetworkError(error))"))
         }
+        // 列表请求返回 2xx = Token 已鉴权通过，在这里才写 Keychain：
+        // 输错 Token 时上面已在 401/403 处返回，原来可用的 Token 不会被覆盖（P0-2）。
+        KeychainHelper.save(effectiveToken, forKey: giteeTokenKey)
         guard let entries = try? JSONSerialization.jsonObject(with: listData) as? [[String: Any]] else {
             return .failure(.network("码云返回的数据看不懂，稍后再试"))
         }
@@ -248,18 +311,6 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         var firstError: String?
         for entry in jsFiles {
             guard let name = entry["name"] as? String else { continue }
-            let rawURLString = entry["download_url"] as? String
-                ?? "https://gitee.com/individual-freedom/ziyong-ziliao-beifang/raw/js/\(name)"
-            // 下载也要带 Token：仓库是私有的，裸 GET 拉 raw 文件会被码云 403 拦
-            // （列表请求带了 Token 所以能列出文件，下载没带所以 403）。
-            // 两处都带：Authorization 头（直连时用）+ access_token 查询参数
-            // （URLSession 跨域重定向会丢 Authorization 头，查询参数能活下来）。
-            var rawComponents = URLComponents(string: rawURLString)
-            var rawQueryItems = rawComponents?.queryItems ?? []
-            rawQueryItems.removeAll { $0.name == "access_token" }
-            rawQueryItems.append(URLQueryItem(name: "access_token", value: effectiveToken))
-            rawComponents?.queryItems = rawQueryItems
-            guard let rawURL = rawComponents?.url else { continue }
 
             do {
                 // 1. 先下载到内存，绝不提前删本地旧源
@@ -267,12 +318,26 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
                 if let contentsData = await fetchGiteeContentsFile(name: name, token: effectiveToken) {
                     data = contentsData
                 } else {
+                    // contents API 失败才构造 raw URL（P0-2）：access_token 只在
+                    // 必要时才进 URL；download_url 必须是通过校验的 gitee 地址，
+                    // 否则用自行拼出的 gitee raw 地址兜底。
+                    // 下载也要带 Token：仓库是私有的，裸 GET 拉 raw 文件会被码云 403 拦。
+                    // 两处都带：Authorization 头（直连时用）+ access_token 查询参数
+                    // （URLSession 跨域重定向会丢 Authorization 头，查询参数能活下来）。
+                    let rawURLString = Self.validatedGiteeDownloadURL(from: entry)
+                        ?? "https://gitee.com/individual-freedom/ziyong-ziliao-beifang/raw/js/\(name)"
+                    var rawComponents = URLComponents(string: rawURLString)
+                    var rawQueryItems = rawComponents?.queryItems ?? []
+                    rawQueryItems.removeAll { $0.name == "access_token" }
+                    rawQueryItems.append(URLQueryItem(name: "access_token", value: effectiveToken))
+                    rawComponents?.queryItems = rawQueryItems
+                    guard let rawURL = rawComponents?.url else { continue }
                     var downloadRequest = URLRequest(url: rawURL)
                     downloadRequest.cachePolicy = .reloadIgnoringLocalCacheData
                     downloadRequest.setValue("token \(effectiveToken)", forHTTPHeaderField: "Authorization")
                     downloadRequest.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
                     downloadRequest.timeoutInterval = 30
-                    let (rawData, response) = try await URLSession.shared.data(for: downloadRequest)
+                    let (rawData, response) = try await Self.giteeSession.data(for: downloadRequest)
                     if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
                         if firstError == nil { firstError = "下载 \(name) 失败（HTTP \(http.statusCode)）" }
                         continue
@@ -287,42 +352,24 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
                     continue
                 }
                 let validation = WidgetHost.validate(jsSource: text, fallbackTitle: name)
-                guard validation.ok, let meta = validation.meta else {
+                // meta 由 importDataCore 在写盘时再取，这里只验合法性
+                // （不绑定 meta，避免未使用警告）。
+                guard validation.ok, validation.meta != nil else {
                     if firstError == nil { firstError = validation.error ?? "\(name) 不是有效模块" }
                     continue
                 }
 
-                // 3. 确认下载+校验全部通过，再原子替换同名/同 id 旧源（不去重：同站不同模块也是独立的源）
-                let sanitized = sanitizedFileName(name, fallback: meta.id)
-                let existing = await MainActor.run {
-                    self.sources.first(where: { $0.fileName == sanitized || $0.id == meta.id })
-                }
-                let finalName = existing?.fileName ?? uniqueFileName(sanitized)
-                let targetURL = sourcesDirectory.appendingPathComponent(finalName)
-                do {
-                    try data.write(to: targetURL, options: .atomic)
-                } catch {
-                    if firstError == nil { firstError = "写入 \(finalName) 失败" }
+                // 3. 确认下载+校验全部通过，走 importDataCore 写盘+更新清单
+                // （源唯一身份只认 meta.id；不去重：同站不同模块也是独立的源）。
+                // 注意 validation 在上面第 2 步已做过，importDataCore 里还会再验一次
+                // （同一段文本，结果一致），只为复用同一套写清单逻辑、不留两套。
+                switch await importDataCore(data, fileName: name, origin: "gitee") {
+                case .success:
+                    imported += 1
+                case .failure(let error):
+                    if firstError == nil { firstError = error.localizedDescription }
                     continue
                 }
-                let record = SourceRecord(
-                    id: meta.id,
-                    title: NodeRequiredModules.displayTitle(for: meta),
-                    fileName: finalName,
-                    origin: "gitee",
-                    country: existing?.country ?? countryGuess(for: meta),
-                    version: meta.version,
-                    importedAt: Date()
-                )
-                await MainActor.run {
-                    if let idx = self.sources.firstIndex(where: { $0.fileName == finalName }) {
-                        self.sources[idx] = record
-                    } else {
-                        self.sources.append(record)
-                    }
-                    self.saveManifest()
-                }
-                imported += 1
             } catch {
                 if firstError == nil { firstError = friendlyNetworkError(error) }
                 continue
@@ -342,6 +389,19 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         return .success(imported)
     }
 
+    /// download_url 强校验：只接受 https + gitee.com（或其子域，如 raw 子域）的地址；
+    /// 校验失败返回 nil，调用方改用自行拼出的 gitee raw 地址。
+    /// 代码里实际用到的 gitee host 只有 gitee.com（API / 下载 / raw 全是它），
+    /// raw.githubusercontent 不在此列——绝不把带 access_token 的 URL 发往第三方。
+    private static func validatedGiteeDownloadURL(from entry: [String: Any]) -> String? {
+        guard let rawString = entry["download_url"] as? String,
+              let url = URL(string: rawString),
+              url.scheme?.lowercased() == "https",
+              let host = url.host?.lowercased(),
+              host == "gitee.com" || host.hasSuffix(".gitee.com") else { return nil }
+        return rawString
+    }
+
     /// 用 Gitee contents API 单文件接口拿一个 .js 文件的内容。
     /// GET /api/v5/repos/<repo>/contents/<文件名>?ref=js，带 Authorization 头；
     /// 返回 JSON 里 `content` 是 base64（可能含换行，先去掉空白字符再解），
@@ -359,7 +419,7 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         request.setValue("token \(token)", forHTTPHeaderField: "Authorization")
         request.setValue(NetConstants.iPhoneUserAgent, forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 30
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
+        guard let (data, response) = try? await Self.giteeSession.data(for: request),
               let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let content = json["content"] as? String else {
@@ -448,11 +508,13 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
 
     // MARK: - 上传播放账本（reports 分支）
 
-    /// 归一化 Token：去首尾空白与换行；传入非空则顺手存入 Keychain，传入为空则读 Keychain。
+    /// 归一化 Token：去首尾空白与换行；传入非空返回传入值，传入为空则读 Keychain。
+    /// 只读不写——写 Keychain 只在 Gitee API 返回 2xx 的调用点做
+    /// （syncFromGitee 列表请求成功后、uploadLedger 上传成功后）：
+    /// 输错一个字符拿到 401 时，原来可用的 Token 不会被覆盖（P0-2）。
     private func resolveGiteeToken(_ rawToken: String) -> String {
         let trimmed = rawToken.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
-            KeychainHelper.save(trimmed, forKey: giteeTokenKey)
             return trimmed
         }
         return (KeychainHelper.load(forKey: giteeTokenKey) ?? "")
@@ -498,6 +560,8 @@ final class SourceStore: ObservableObject, @unchecked Sendable {
         )
         switch result {
         case .success:
+            // 上传返回 2xx = Token 已鉴权通过，在这里才写 Keychain（P0-2）。
+            KeychainHelper.save(effectiveToken, forKey: giteeTokenKey)
             return .success(fileName)
         case .failure(let error):
             return .failure(error)

@@ -276,7 +276,16 @@ final class CustomPlayerController: ObservableObject {
         // 回环地址不需要头，挂了反而把身份暴露给 AVPlayer 的日志。
         let effectiveHeaders = engine == .proxy ? nil : headers
         let engineChanged = lastEngine != engine
-        guard lastURL != url || lastHeaders != effectiveHeaders || engineChanged else { return }
+        // run #36 P0-12：去重条件须纳入代际与失败态，否则同 URL/头/引擎的
+        // 手动重试（switchLine）或同分集重播（playGeneration 已换）会直接早退，
+        // status 永久卡在“正在解析播放线路…”。拦截器路还要比 resourceLoader 身份：
+        // ViewModel 换了新拦截器实例时，当前 item 绑的还是旧的，必须重建。
+        // HLSResourceLoader 是 class（final class，NSObject 子类），!== 合法。
+        let loaderChanged = engine == .nativeIntercepted
+            && viewModel.resourceLoader !== activeResourceLoader
+        guard lastURL != url || lastHeaders != effectiveHeaders || engineChanged
+            || viewModel.playGeneration != lastGeneration || didMarkFailedURL != nil
+            || loaderChanged else { return }
         if engineChanged {
             // 同一 URL 换引擎：失败只认一次的标记要清掉，
             // 否则同一 URL 换路径后的第二次失败报不上去（markFailed 会认成重复）。
@@ -1543,6 +1552,10 @@ final class FullscreenPlayerViewController: UIViewController {
 }
 
 /// 全屏呈现器：从最顶层控制器 present 横屏全屏播放器。
+/// 整体 @MainActor：topViewController() 直接访问 UIApplication.shared，
+/// 非隔离会有 Swift 6 隔离违规。调用方只有 CustomPlayerView 的
+/// .onChange（SwiftUI 主线程上下文）与本文件内，无非隔离调用方受影响。
+@MainActor
 enum FullscreenPlayerPresenter {
     @MainActor
     static func present(player: AVPlayer, controller: CustomPlayerController, viewModel: PlayerViewModel, onExit: @escaping () -> Void) {

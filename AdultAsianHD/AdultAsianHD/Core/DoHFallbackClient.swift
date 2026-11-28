@@ -1452,8 +1452,15 @@ final class DoHFallbackClient: @unchecked Sendable {
 
     private func buildHTTP11Request(url: URL, host: String, request: URLRequest) -> Data {
         let method = request.httpMethod ?? "GET"
-        var pathAndQuery = url.path.isEmpty ? "/" : url.path
-        if let q = url.query, !q.isEmpty { pathAndQuery += "?\(q)" }
+        // P0-1：URL.path / URL.query 是百分号解码过的（%20 变裸空格、
+        // 非 ASCII 变原始 UTF-8 字节），严格源站/CDN 拒 400——请求行必须
+        // 用编码后形式。URLComponents 失败时才回落到解码过的 path/query。
+        // （URL.path 保留目录尾斜杠，尾斜杠不动。）
+        let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let encodedPath = comps?.percentEncodedPath ?? url.path
+        var pathAndQuery = encodedPath.isEmpty ? "/" : encodedPath
+        let encodedQuery = comps?.percentEncodedQuery ?? url.query
+        if let q = encodedQuery, !q.isEmpty { pathAndQuery += "?\(q)" }
         let hostHeader = url.port.map { "\($0 == 443 ? host : "\(host):\($0)")" } ?? host
 
         var lines: [String] = [

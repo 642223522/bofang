@@ -169,11 +169,12 @@ struct SourcesView: View {
     }
 
     private func uploadLedger() {
+        guard !isReading else { return }
         isReading = true
         readingLabel = "正在上传账本…"
         Task {
             // 传空串：store 里先用 Keychain 存过的 Token，没有才报错。
-            let result = await store.uploadLedger(token: giteeToken)
+            let result = await store.uploadLedger(token: "")
             isReading = false
             switch result {
             case .success(let file):
@@ -375,6 +376,7 @@ struct SourcesView: View {
     }
 
     private func importFromURL() {
+        guard !isReading else { return }
         let text = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
             showResultAlert("请先输入 .js 直链。")
@@ -427,6 +429,7 @@ struct SourcesView: View {
     }
 
     private func syncFromGitee() {
+        guard !isReading else { return }
         // Token 为空也照常调：store 里先用 Keychain 存过的，两个都没有才报错。
         let token = giteeToken.trimmingCharacters(in: .whitespacesAndNewlines)
         showSyncSheet = false

@@ -48,6 +48,9 @@ struct DetailView: View {
     @State private var currentEpisodeId: String?
     /// 分集现铸失败时显示的红字。
     @State private var episodeError: String?
+    /// 分集现铸的异步任务（run #36 P0-10）：保存下来才能在离页/点别的集时
+    /// 取消；不保存的话，点第 2 集后离页，loadResource 返回后会在后台重新起播。
+    @State private var episodeTask: Task<Void, Never>?
 
     var body: some View {
         ScrollView {
@@ -263,6 +266,8 @@ struct DetailView: View {
             // 全屏时不拆播放器：全屏模态盖上来也会触发 onDisappear，
             // 只是去全屏、没离开详情页，回来要接着播；真离开（isFullscreen=false）才停播。
             guard !isFullscreen else { return }
+            episodeTask?.cancel()
+            episodeTask = nil
             player.pause()
             player.replaceCurrentItem(with: nil)
             playerVM.stop()
@@ -284,8 +289,8 @@ struct DetailView: View {
                 favorites.toggle(item: item, sourceId: sourceId)
             } label: {
                 Label(
-                    favorites.isFavorite(item.id) ? "已收藏" : "收藏",
-                    systemImage: favorites.isFavorite(item.id) ? "star.fill" : "star"
+                    favorites.isFavorite(itemId: item.id, sourceId: sourceId) ? "已收藏" : "收藏",
+                    systemImage: favorites.isFavorite(itemId: item.id, sourceId: sourceId) ? "star.fill" : "star"
                 )
             }
             .buttonStyle(.bordered)
@@ -304,6 +309,9 @@ struct DetailView: View {
 
     /// 点某集：有预铸直链直接播；没有就用该集 epLink 调 loadResource 现铸再播。
     private func playEpisode(_ ep: DetailEpisode) {
+        // 旧的现铸任务先取消：连点第 2 集再点第 3 集时，慢返回的第 2 集
+        // 不能反过来劫持正在播的第 3 集；点第 2 集后离页，onDisappear 也会取消。
+        episodeTask?.cancel()
         currentEpisodeId = ep.id
         episodeError = nil
         if let urlString = ep.videoURL, !urlString.isEmpty {
@@ -327,15 +335,21 @@ struct DetailView: View {
             ), recastLink: ep.link)
             return
         }
-        Task {
+        episodeTask = Task {
             do {
                 let lines = try await host.loadResource(link: ep.link, title: ep.title)
+                // 迟到返回的校验：任务被取消（离页/点了别的集），或当前分集
+                // 已不是这集，一律丢弃，不起播、不报错。
+                guard !Task.isCancelled, currentEpisodeId == ep.id else { return }
                 if let first = lines.first {
-                    playerVM.playLine(first)
+                    // 非预铸分支也要传 recastLink: ep.link（与预铸分支一致）：
+                    // 否则第 2 集起遇密钥 403 重铸时无 epLink，会跳回第 1 集。
+                    playerVM.playLine(first, recastLink: ep.link)
                 } else {
                     episodeError = "这集没有可用的播放线路"
                 }
             } catch {
+                guard !Task.isCancelled, currentEpisodeId == ep.id else { return }
                 episodeError = "这集解析失败：\(error.localizedDescription)"
             }
         }

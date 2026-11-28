@@ -76,6 +76,13 @@ private final class ProxyFetchContext {
     /// 流式模式（分片/MAP）：头一到就发、body 边收边发；缓冲模式（播单/变体/密钥）：
     /// 收齐再改写/再发。
     let streamMode: Bool
+    /// 流式响应的确定长度（上游 Content-Length 有效，或 206 从 Content-Range
+    /// 算出）：非 nil 时响应头发 Content-Length、不写 chunked，body 裸发、
+    /// 收尾直接断连（P1-1；CoreMedia 对 206 要求 Content-Length，chunked
+    /// 会让 seek 后卡死）；nil 时沿用 chunked 流式。
+    /// 只在 URLSession 串行回调里读写（didReceive response 里定、data/
+    /// didComplete 里读），不用锁（同本类其余字段）。
+    var streamContentLength: Int?
     /// 同一 token 已在取、后来又到的连接：取完后从缓存统一服务。
     /// range 各自记着：等候者只配拿自己 Range 对应的响应。
     var waiters: [(connection: NWConnection, queue: DispatchQueue, range: String?)] = []
@@ -127,6 +134,10 @@ final class LoopbackProxyServer: NSObject {
     private var sessionToken: String = UUID().uuidString.replacingOccurrences(of: "-", with: "")
     /// token → 上游映射。
     private var mappings: [String: ProxyMapping] = [:]
+    /// 首个注册的上游 URL（入口播单）：跨源判定锚点。startUpstreamFetch
+    /// 里跨源上游不带凭据头（P1-9）；第一个映射就是入口，由 ViewModel
+    /// 经 entryURL(for:) 注册。stop 不清映射，这里也不清（同 mappings）。
+    private var originURL: URL?
     /// 上游 URL → token（同一上游只注册一次；监听重启换端口时复用 token，
     /// 缓存才不会丢——一次性 token 经不起第二次上游拉取）。
     private var mappingsByUpstream: [String: String] = [:]
@@ -340,6 +351,7 @@ final class LoopbackProxyServer: NSObject {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard boundPort > 0 else { return nil }
+        if originURL == nil { originURL = upstream }
         let key = upstream.absoluteString
         if let token = mappingsByUpstream[key] {
             return URL(string: "http://127.0.0.1:\(boundPort)/\(sessionToken)/\(token)")
@@ -363,6 +375,13 @@ final class LoopbackProxyServer: NSObject {
         stateLock.lock()
         defer { stateLock.unlock() }
         return mappings[token]
+    }
+
+    /// 入口 URL 快照（跨源判定锚点，锁保护的读）。
+    private func snapshotOriginURL() -> URL? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return originURL
     }
 
     private func isPlaylistURL(_ url: URL) -> Bool {
@@ -593,7 +612,11 @@ final class LoopbackProxyServer: NSObject {
         request.timeoutInterval = 15
         // 身份头由代理统一带（UA/Referer/模块头/Cookie）；AVPlayer 发来的头只转发 Range
         //（MP4 用它；其余一律以代理的为准，不把 AppleCoreMedia 之类带去上游）。
+        // P1-9：跨源上游（第三方 CDN 分片/密钥/变体）跳过凭据头——锚点是入口
+        // URL（首个注册的上游），不是本次上游自身（自身恒同源，判了等于没判）。
+        let sameOrigin = NetConstants.isSameOrigin(snapshotOriginURL(), context.mapping.upstream)
         for (key, value) in headers {
+            if !sameOrigin && NetConstants.isSensitiveHeader(key) { continue }
             request.setValue(value, forHTTPHeaderField: key)
         }
         if let range = context.requestRange {
@@ -843,7 +866,10 @@ final class LoopbackProxyServer: NSObject {
     }
 
     /// 响应头（chunked；Content-Length 不转发——分块编码替它；只转发白名单里的上游头）。
-    private func responseHead(status: Int, contentType: String, response: HTTPURLResponse?) -> Data {
+    /// P1-1：contentLength != nil 时带 Content-Length、不写 chunked——
+    /// CoreMedia 对 206 要求 Content-Length，chunked 会让 seek 后卡死
+    ///（见 sendFullResponse 注释）；nil 时沿用 chunked 流式。
+    private func responseHead(status: Int, contentType: String, response: HTTPURLResponse?, contentLength: Int? = nil) -> Data {
         var head = "HTTP/1.1 \(status) \(reasonPhrase(for: status))\r\n"
         head += "Content-Type: \(contentType)\r\n"
         if let response {
@@ -853,10 +879,35 @@ final class LoopbackProxyServer: NSObject {
                 }
             }
         }
-        head += "Transfer-Encoding: chunked\r\n"
+        if let contentLength {
+            head += "Content-Length: \(contentLength)\r\n"
+        } else {
+            head += "Transfer-Encoding: chunked\r\n"
+        }
         head += "Connection: close\r\n"
         head += "\r\n"
         return Data(head.utf8)
+    }
+
+    /// 流式响应可用的确定长度：上游 Content-Length 有效即用（206 一定有、
+    /// 200 常有）；206 无 Content-Length 时从 Content-Range
+    /// "bytes a-b/total" 取 b-a+1。拿不到则 nil（走 chunked）。
+    private func streamContentLength(for response: HTTPURLResponse) -> Int? {
+        if let raw = response.value(forHTTPHeaderField: "Content-Length")?.trimmingCharacters(in: .whitespaces),
+           let n = Int(raw), n >= 0 {
+            return n
+        }
+        guard response.statusCode == 206,
+              let cr = response.value(forHTTPHeaderField: "Content-Range") else { return nil }
+        // "bytes 0-99/1000" → 100；"bytes */1000" 这种无范围的返回 nil。
+        let rangePart = cr.split(separator: " ").last?.split(separator: "/").first ?? ""
+        let bounds = rangePart.split(separator: "-")
+        guard bounds.count == 2,
+              let lo = Int(bounds[0]), let hi = Int(bounds[1]), hi >= lo else { return nil }
+        let (diff, o1) = hi.subtractingReportingOverflow(lo)
+        let (len, o2) = diff.addingReportingOverflow(1)
+        guard !o1, !o2 else { return nil }
+        return len
     }
 
     private func reasonPhrase(for status: Int) -> String {
@@ -883,11 +934,30 @@ final class LoopbackProxyServer: NSObject {
         send(connection: connection, queue: queue, data: packet, isComplete: false)
     }
 
+    /// 流式 body 一块：定长模式（头里是 Content-Length）裸发，chunked 模式包 chunk 帧。
+    private func sendStreamData(connection: NWConnection, queue: DispatchQueue, data: Data, chunked: Bool) {
+        guard !data.isEmpty else { return }
+        if chunked {
+            sendChunk(connection: connection, queue: queue, data: data)
+        } else {
+            send(connection: connection, queue: queue, data: data, isComplete: false)
+        }
+    }
+
     /// 终结块：0 长度块，完结本次响应。发完后才断连（.finalMessage + 完成回调里
     /// cancel）：旧逻辑 send 完就地 untrackConnection，末尾分块可能还没发出去
     /// 连接就从表里掉了，AVPlayer 收不到收尾就报错。
     private func sendTerminalChunk(connection: NWConnection, queue: DispatchQueue) {
         send(connection: connection, queue: queue, data: Data("0\r\n\r\n".utf8), isComplete: true, contentContext: .finalMessage) {
+            self.untrackConnection(connection)
+            connection.cancel()
+        }
+    }
+
+    /// 定长流式收尾：不发 chunk 终结块（头里是 Content-Length，终结块会
+    /// 变成多余字节），直接完结连接。发完才断连，同 sendTerminalChunk。
+    private func sendClose(connection: NWConnection, queue: DispatchQueue) {
+        send(connection: connection, queue: queue, data: Data(), isComplete: true, contentContext: .finalMessage) {
             self.untrackConnection(connection)
             connection.cancel()
         }
@@ -980,14 +1050,37 @@ extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
     /// 重定向：代理自己跟随，绝不把 Location 交给 AVPlayer；
     /// 跨域 302 会丢自定义头，重定向请求上把身份头补回去——但凭据头
     /// （Authorization / Cookie / API key）只在同源（scheme+host+端口）时保留，
-    /// 跨域或 HTTPS→HTTP 降级一律不带。
+    /// 跨域或 HTTPS→HTTP 降级一律不带（与 DiagnosticHTTPClient 的
+    /// PerRequestDelegate 同款做法）。
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        // 拒非 http(s) 重定向目标：直接交回 3xx 响应，别让 CFNetwork 对
+        // javascript:/file:///intent: 之类报 -1002（与 PerRequestDelegate 同款）。
+        guard let targetURL = request.url,
+              let scheme = targetURL.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else {
+            completionHandler(nil)
+            return
+        }
         var redirected = request
         redirected.assumesHTTP3Capable = false
-        let sameOrigin = NetConstants.isSameOrigin(response.url ?? task.currentRequest?.url, request.url)
+        // 同源锚点是原始请求 URL（task.originalRequest），不是上一跳
+        // response.url：A→B→B2（B 与 B2 同源）时按上一跳判会把源站 A 的
+        // 凭据泄漏给第三方域 B2（P1-3）。
+        let sameOrigin = NetConstants.isSameOrigin(task.originalRequest?.url, redirected.url)
         for (key, value) in headers {
+            let lower = key.lowercased()
             if !sameOrigin && NetConstants.isSensitiveHeader(key) { continue }
-            redirected.setValue(value, forHTTPHeaderField: key)
+            // Host/Content-Length 由 CFNetwork 自己管；跳步头（Connection/
+            // Transfer-Encoding/Keep-Alive/Proxy-Connection/Upgrade）上 H2/H3
+            // 会违反 RFC 9113/9114，直接 RST_STREAM（与 PerRequestDelegate 同款）。
+            if lower == "host" || lower == "content-length" || lower == "connection"
+                || lower == "transfer-encoding" || lower == "keep-alive"
+                || lower == "proxy-connection" || lower == "upgrade" { continue }
+            // 不覆盖重定向途中的新值：只补缺失的头（无条件 setValue 会盖掉
+            // 服务端在重定向里新给的 Cookie/头）。
+            if redirected.value(forHTTPHeaderField: key) == nil {
+                redirected.setValue(value, forHTTPHeaderField: key)
+            }
         }
         completionHandler(redirected)
     }
@@ -1012,7 +1105,10 @@ extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
         }
         context.response = http
         if context.streamMode {
-            let head = responseHead(status: http.statusCode, contentType: contentType(for: context.mapping, response: http), response: http)
+            // 定长（206 / 有 Content-Length）走 Content-Length、不写 chunked（P1-1）。
+            let contentLength = streamContentLength(for: http)
+            context.streamContentLength = contentLength
+            let head = responseHead(status: http.statusCode, contentType: contentType(for: context.mapping, response: http), response: http, contentLength: contentLength)
             // 一次锁里同时做：置 headersSent + 取等候者 + 记下哪些等候者收到了头。
             // 旧逻辑先快照再置旗，中间到的 waiter 永远收不到头（只收到无头的分块 body）。
             let waiters = markHeadersSent(context, headedWaiters: true)
@@ -1035,9 +1131,10 @@ extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
             context.sniffPrefix.append(data.prefix(16384 - context.sniffPrefix.count))
         }
         if context.streamMode {
-            sendChunk(connection: context.connection, queue: context.queue, data: data)
+            let chunked = context.streamContentLength == nil
+            sendStreamData(connection: context.connection, queue: context.queue, data: data, chunked: chunked)
             for waiter in snapshotWaiters(context) {
-                sendChunk(connection: waiter.connection, queue: waiter.queue, data: data)
+                sendStreamData(connection: waiter.connection, queue: waiter.queue, data: data, chunked: chunked)
             }
         }
         if context.cacheable {
@@ -1085,7 +1182,9 @@ extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
         let status = context.response?.statusCode ?? 0
         if context.streamMode {
             // 流式：小响应进缓存（供重试原样服务，不再碰上游）；大分片只转发、不缓存。
-            if context.cacheable, let http = context.response {
+            // P1-2：只缓存 2xx——403/429/502/503 的小体积错误页进缓存后，
+            // AVPlayer 后续重试永远命中错误页。
+            if context.cacheable, let http = context.response, (200...299).contains(http.statusCode) {
                 cacheResponse(token: context.mapping.token, range: context.requestRange, response: CachedResponse(
                     status: http.statusCode,
                     contentType: contentType(for: context.mapping, response: http),
@@ -1095,10 +1194,20 @@ extension LoopbackProxyServer: URLSessionDataDelegate, URLSessionTaskDelegate {
             }
             recordActual(mapping: context.mapping, status: status, bytes: context.receivedBytes, servedFromCache: false)
             let waiters = snapshotWaiters(context)
-            sendTerminalChunk(connection: context.connection, queue: context.queue)
+            // 定长模式收尾直接断连（不发 chunk 终结块）；chunked 模式发终结块。
+            let chunked = context.streamContentLength == nil
+            if chunked {
+                sendTerminalChunk(connection: context.connection, queue: context.queue)
+            } else {
+                sendClose(connection: context.connection, queue: context.queue)
+            }
             for waiter in waiters {
                 recordActual(mapping: context.mapping, status: status, bytes: context.receivedBytes, servedFromCache: false)
-                sendTerminalChunk(connection: waiter.connection, queue: waiter.queue)
+                if chunked {
+                    sendTerminalChunk(connection: waiter.connection, queue: waiter.queue)
+                } else {
+                    sendClose(connection: waiter.connection, queue: waiter.queue)
+                }
             }
             return
         }

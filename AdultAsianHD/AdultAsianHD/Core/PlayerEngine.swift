@@ -22,13 +22,35 @@ enum PlayerEngine: Equatable {
     }
 }
 /// 能力注册表。各引擎模块把自己的旗置 true；路由表只读它。
+/// 可变 static var 一律走同一把 NSLock（P1-1）：hasLoopbackProxy 在
+/// LoopbackProxyServer.onListenerReady（listenerQueue 后台队列）写，
+/// 其余在 @MainActor 读写，无锁就是真实跨线程数据竞争 + Swift 6 并发报错。
+/// 调用方签名不变（仍是 PlaybackCapabilities.hasHLSJS 这类 Bool 读写）。
 enum PlaybackCapabilities {
-    static var hasHLSJS = false
-    static var hasDASH = false
+    private static let lock = NSLock()
+    private static var _hasHLSJS = false
+    private static var _hasDASH = false
+    private static var _hasLoopbackProxy = false
+    private static var _loopbackProxyBindFailed = false
+
+    static var hasHLSJS: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _hasHLSJS }
+        set { lock.lock(); defer { lock.unlock() }; _hasHLSJS = newValue }
+    }
+    static var hasDASH: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _hasDASH }
+        set { lock.lock(); defer { lock.unlock() }; _hasDASH = newValue }
+    }
     /// 回环代理：第一次成功起监听后置 true（能力已证实，见 LoopbackProxyServer）。
-    static var hasLoopbackProxy = false
+    static var hasLoopbackProxy: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _hasLoopbackProxy }
+        set { lock.lock(); defer { lock.unlock() }; _hasLoopbackProxy = newValue }
+    }
     /// 回环代理起监听失败过（sticky）：起不来就不再试 P，直接走 J/下一条线。
-    static var loopbackProxyBindFailed = false
+    static var loopbackProxyBindFailed: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _loopbackProxyBindFailed }
+        set { lock.lock(); defer { lock.unlock() }; _loopbackProxyBindFailed = newValue }
+    }
     #if canImport(KSPlayer)
     static let hasSoftwareDecoder = true
     #else

@@ -29,6 +29,16 @@ struct FavoriteEntry: Codable, Hashable, Identifiable {
         self.sourceId = sourceId
     }
 
+    /// 跨源唯一键（不参与 Codable 持久化，只作列表身份与判重用）：
+    /// "\(sourceId)::\(id)"——WordPress 系多源共用递增数字 id，裸 id 会跨源碰撞。
+    static func key(itemId: String, sourceId: String) -> String {
+        "\(sourceId)::\(itemId)"
+    }
+
+    var compositeKey: String {
+        Self.key(itemId: id, sourceId: sourceId)
+    }
+
     var videoItem: VideoItem {
         VideoItem(
             id: id, title: title, link: link,
@@ -39,7 +49,11 @@ struct FavoriteEntry: Codable, Hashable, Identifiable {
 
 // MARK: - 收藏仓库
 
+@MainActor
 final class FavoritesStore: ObservableObject {
+    // 与 NetworkDiagnostics / PlaybackLedger / CloudflareWarmup 同款写法：
+    // @MainActor 类 + 普通 static let shared，本工程已构建验证过
+    // （App 里 @StateObject = FavoritesStore.shared 不用改）。
     static let shared = FavoritesStore()
 
     private let idsKey = "favoriteIDs"
@@ -47,25 +61,33 @@ final class FavoritesStore: ObservableObject {
 
     @Published private(set) var entries: [FavoriteEntry] = []
 
+    /// 复合键集合：isFavorite 从 O(N) 降为 O(1)，与 entries 数组保持同步
+    ///（load / toggle / remove 处同步更新）。
+    private var favoriteKeys: Set<String> = []
+
     private init() {
         load()
     }
 
-    func isFavorite(_ id: String) -> Bool {
-        entries.contains { $0.id == id }
+    func isFavorite(itemId: String, sourceId: String) -> Bool {
+        favoriteKeys.contains(FavoriteEntry.key(itemId: itemId, sourceId: sourceId))
     }
 
     func toggle(item: VideoItem, sourceId: String) {
-        if let index = entries.firstIndex(where: { $0.id == item.id }) {
+        let key = FavoriteEntry.key(itemId: item.id, sourceId: sourceId)
+        if let index = entries.firstIndex(where: { $0.sourceId == sourceId && $0.id == item.id }) {
             entries.remove(at: index)
+            favoriteKeys.remove(key)
         } else {
             entries.append(FavoriteEntry(item: item, sourceId: sourceId))
+            favoriteKeys.insert(key)
         }
         save()
     }
 
     func remove(_ entry: FavoriteEntry) {
-        entries.removeAll { $0.id == entry.id }
+        entries.removeAll { $0.sourceId == entry.sourceId && $0.id == entry.id }
+        favoriteKeys.remove(entry.compositeKey)
         save()
     }
 
@@ -73,9 +95,11 @@ final class FavoritesStore: ObservableObject {
         guard let data = UserDefaults.standard.data(forKey: entriesKey),
               let decoded = try? JSONDecoder().decode([FavoriteEntry].self, from: data) else {
             entries = []
+            favoriteKeys = []
             return
         }
         entries = decoded
+        favoriteKeys = Set(decoded.map(\.compositeKey))
     }
 
     private func save() {
@@ -98,7 +122,9 @@ struct FavoritesView: View {
                     EmptyState(title: "还没有收藏", message: "在视频封面或详情页点星标，就会出现在这里。")
                 } else {
                     List {
-                        ForEach(favorites.entries) { entry in
+                        // 不用默认 Identifiable（entry.id 是裸 item.id，会跨源重复）：
+                        // 用 "\(sourceId)::\(id)" 作列表身份。
+                        ForEach(favorites.entries, id: \.compositeKey) { entry in
                             NavigationLink(value: entry) {
                                 HStack(spacing: 12) {
                                     // 和网格同一套封面加载（带重试 + 黄果密文解密），
