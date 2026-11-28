@@ -131,7 +131,7 @@ enum WidgetCrypto {
             iv16 = nil
         } else {
             guard let v = iv, v.count == 16 else {
-                throw CryptoError.invalidParameter("CBC iv must be 16 bytes")
+                throw CryptoError.invalidParameter("CBC/CTR iv must be 16 bytes")
             }
             iv16 = v
         }
@@ -175,7 +175,7 @@ enum WidgetCrypto {
         } else if let v = iv16 {
             ivBytes = [UInt8](v)
         } else {
-            throw CryptoError.invalidParameter("CBC iv must be 16 bytes")
+            throw CryptoError.invalidParameter("CBC/CTR iv must be 16 bytes")
         }
         let status: CCStatus = out.withUnsafeMutableBytes { outPtr in
             CCCrypt(
