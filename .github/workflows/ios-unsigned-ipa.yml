@@ -32,11 +32,18 @@ on:
       - '.github/workflows/ios-unsigned-ipa.yml'
   workflow_dispatch:
 
+# 最小权限：构建只需要读仓库；并发单组、后推取消前推，省 macOS 额度。
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   BUNDLE_ID: com.liudehen.xiaoshipin
   XCODE_PROJECT: AdultAsianHD/AdultAsianHD.xcodeproj
   XCODE_SCHEME: AdultAsianHD
-  INFO_PLIST: AdultAsianHD/AdultAsianHD/Info.plist
   APP_NAME: AdultAsianHD
   IPA_NAME: AdultAsianHD-unsigned.ipa
   BUILD_DIR: build
@@ -180,8 +187,8 @@ jobs:
           # ATS 特别注意：只留 NSAllowsArbitraryLoads=true（在 info.properties 里），
           # 绝不能在这里补 NSAllowsArbitraryLoadsInWebContent——它一出现就会让系统
           # 忽略 NSAllowsArbitraryLoads，回环代理与 http:// 流报 -1022（P0-15）。
-          VERSION="$(grep "MARKETING_VERSION" AdultAsianHD/project.yml | grep -oE '1\.[0-9]*\.[0-9]*' | head -1)"
-          BUILD_NUM="$(grep "CURRENT_PROJECT_VERSION" AdultAsianHD/project.yml | grep -oE '[0-9]+' | head -1)"
+          VERSION="$(awk -F': *' '/^[[:space:]]*MARKETING_VERSION:/ {gsub(/"/,"",$2); print $2; exit}' AdultAsianHD/project.yml)"
+          BUILD_NUM="$(awk -F': *' '/^[[:space:]]*CURRENT_PROJECT_VERSION:/ {gsub(/"/,"",$2); print $2; exit}' AdultAsianHD/project.yml)"
           if [ -z "$VERSION" ] || [ -z "$BUILD_NUM" ]; then
             echo "❌ project.yml 里没找到 MARKETING_VERSION 或 CURRENT_PROJECT_VERSION。"
             exit 1
@@ -231,7 +238,7 @@ jobs:
           fi
           echo "OK：二进制是 arm64。"
           echo "--- 二进制里的版本串（应与 MARKETING_VERSION 一致，否则构建用的还是旧代码，直接失败） ---"
-          EXPECTED_VERSION="$(grep "MARKETING_VERSION" AdultAsianHD/project.yml | grep -oE '1\.[0-9]*\.[0-9]*' | head -1)"
+          EXPECTED_VERSION="$(awk -F': *' '/^[[:space:]]*MARKETING_VERSION:/ {gsub(/"/,"",$2); print $2; exit}' AdultAsianHD/project.yml)"
           if [ -z "$EXPECTED_VERSION" ]; then
             echo "❌ project.yml 里没找到 MARKETING_VERSION，停止打包。"
             exit 1
@@ -259,6 +266,11 @@ jobs:
           else
             echo "OK：.app 未签名，符合预期（安装时由侧载工具重签）。"
           fi
+          if [ -d "$APP_PATH/_CodeSignature" ]; then
+            echo "❌ .app 含 _CodeSignature 目录（预期是未签名），停止打包。"
+            exit 1
+          fi
+          echo "OK：.app 无 _CodeSignature，确认未签名。"
           echo "--- AppIcon 检查（Assets.car 应在 .app 里，否则桌面图标空白） ---"
           if [ -f "$APP_PATH/Assets.car" ]; then
             echo "OK：Assets.car 在包里（AppIcon 已编入）。"
@@ -273,7 +285,7 @@ jobs:
             echo "❌ 源码版本不是锁定的 1.0.3（当前：$EXPECTED_VERSION），停止打包。"
             exit 1
           fi
-          BUILD_NUM="$(grep "CURRENT_PROJECT_VERSION" AdultAsianHD/project.yml | grep -oE '[0-9]+' | head -1)"
+          BUILD_NUM="$(awk -F': *' '/^[[:space:]]*CURRENT_PROJECT_VERSION:/ {gsub(/"/,"",$2); print $2; exit}' AdultAsianHD/project.yml)"
           if [ "$BUILD_NUM" != "4" ]; then
             echo "❌ 源码 build 不是锁定的 4（当前：$BUILD_NUM），停止打包。"
             exit 1
@@ -324,6 +336,35 @@ jobs:
             exit 1
           fi
           echo "OK：后台模式仅 fetch，无 audio。"
+          # ATS 硬断言（P0-15）：NSAllowsArbitraryLoads 必须为 true（取不到也算失败）；
+          # ATS 字典下只放行 NSAllowsArbitraryLoads 这一个键，其余任何键一律报错——
+          # 尤其 NSAllowsArbitraryLoadsInWebContent，一出现就会让系统忽略
+          # NSAllowsArbitraryLoads，回环代理与 http:// 流报 -1022。
+          # NSAllowsLocalNetworking 也不放行：project.yml 里没有配它，且 project.yml
+          # 注释明确禁加（任一 ATS 附加键都会让系统忽略 NSAllowsArbitraryLoads）。
+          ATS_LOADS="$(/usr/libexec/PlistBuddy -c "Print :NSAppTransportSecurity:NSAllowsArbitraryLoads" "$APP_PATH/Info.plist" 2>/dev/null || echo MISSING)"
+          if [ "$ATS_LOADS" != "true" ]; then
+            echo "❌ 包里 ATS 的 NSAllowsArbitraryLoads 不是 true（当前：$ATS_LOADS），停止打包。"
+            exit 1
+          fi
+          echo "OK：ATS 的 NSAllowsArbitraryLoads 是 true。"
+          ATS_KEYS="$(/usr/libexec/PlistBuddy -c "Print :NSAppTransportSecurity" "$APP_PATH/Info.plist" 2>/dev/null | sed -n 's/^[[:space:]]*\([A-Za-z][A-Za-z0-9]*\) =.*/\1/p' || true)"
+          for ATS_KEY in $ATS_KEYS; do
+            if [ "$ATS_KEY" != "NSAllowsArbitraryLoads" ]; then
+              echo "❌ 包里 ATS 出现未放行的键：$ATS_KEY（当前 ATS 键：$ATS_KEYS），停止打包。"
+              exit 1
+            fi
+          done
+          echo "OK：ATS 只含 NSAllowsArbitraryLoads，无其他 ATS 键。"
+          # iPad 方向硬断言：Duo 内屏按 iPad 形态走，必须含 4 个方向。
+          IPAD_ORIENTATIONS="$(/usr/libexec/PlistBuddy -c "Print :UISupportedInterfaceOrientations~ipad" "$APP_PATH/Info.plist" 2>/dev/null || echo MISSING)"
+          for WANT in UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight UIInterfaceOrientationPortraitUpsideDown; do
+            if ! echo "$IPAD_ORIENTATIONS" | grep -q "$WANT"; then
+              echo "❌ 包里 iPad 方向键缺 $WANT（当前：$IPAD_ORIENTATIONS），停止打包。"
+              exit 1
+            fi
+          done
+          echo "OK：iPad 方向键含 4 个方向。"
           # 最终 .app 内 0 个 .js（只查源码目录不够，必须查产物）。
           if find "$APP_PATH" -name '*.js' -print -quit | grep -q .; then
             echo "❌ 最终 .app 里发现 .js 文件："
@@ -356,3 +397,13 @@ jobs:
           name: AdultAsianHD-unsigned
           path: AdultAsianHD-unsigned.ipa
           retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload xcodebuild.log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ${{ env.BUILD_DIR }}/xcodebuild.log
+          retention-days: 7
+          if-no-files-found: warn
