@@ -139,7 +139,7 @@ jobs:
           set -eo pipefail
           if ! command -v xcodegen >/dev/null 2>&1; then
             echo "安装 xcodegen..."
-            brew install xcodegen
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
           fi
           xcodegen --version
           cd AdultAsianHD
@@ -187,8 +187,8 @@ jobs:
           # ATS 特别注意：只留 NSAllowsArbitraryLoads=true（在 info.properties 里），
           # 绝不能在这里补 NSAllowsArbitraryLoadsInWebContent——它一出现就会让系统
           # 忽略 NSAllowsArbitraryLoads，回环代理与 http:// 流报 -1022（P0-15）。
-          VERSION="$(awk -F': *' '/^[[:space:]]*MARKETING_VERSION:/ {gsub(/"/,"",$2); print $2; exit}' AdultAsianHD/project.yml)"
-          BUILD_NUM="$(awk -F': *' '/^[[:space:]]*CURRENT_PROJECT_VERSION:/ {gsub(/"/,"",$2); print $2; exit}' AdultAsianHD/project.yml)"
+          VERSION="$(awk -F': *' '/^[[:space:]]*MARKETING_VERSION:/ {sub(/[[:space:]]*#.*/,"",$2); gsub(/["'"'"'[:space:]]/,"",$2); print $2; exit}' AdultAsianHD/project.yml)"
+          BUILD_NUM="$(awk -F': *' '/^[[:space:]]*CURRENT_PROJECT_VERSION:/ {sub(/[[:space:]]*#.*/,"",$2); gsub(/["'"'"'[:space:]]/,"",$2); print $2; exit}' AdultAsianHD/project.yml)"
           if [ -z "$VERSION" ] || [ -z "$BUILD_NUM" ]; then
             echo "❌ project.yml 里没找到 MARKETING_VERSION 或 CURRENT_PROJECT_VERSION。"
             exit 1
@@ -228,17 +228,16 @@ jobs:
           echo "--- binary arch (expect arm64 only) ---"
           LIPO_INFO="$(lipo -info "$APP_PATH/$APP_NAME")"
           echo "$LIPO_INFO"
-          if ! echo "$LIPO_INFO" | grep -q 'arm64'; then
-            echo "❌ 二进制不是 arm64：$LIPO_INFO，停止打包。"
-            exit 1
-          fi
-          if echo "$LIPO_INFO" | grep -q 'x86_64'; then
-            echo "❌ 二进制混入 x86_64（应只含 arm64）：$LIPO_INFO，停止打包。"
+          # lipo -archs 只输出架构清单（如 arm64）；精确相等比较，子串 grep 会把
+          # arm64e 也放过（grep -q 'arm64' 命中 arm64e），且胖包 arm64+x86_64 需
+          # 两条 grep 才拦得住，这里一条精确比较全拦。
+          if [ "$(lipo -archs "$APP_PATH/$APP_NAME")" != "arm64" ]; then
+            echo "❌ 二进制架构不是仅 arm64：$LIPO_INFO，停止打包。"
             exit 1
           fi
           echo "OK：二进制是 arm64。"
           echo "--- 二进制里的版本串（应与 MARKETING_VERSION 一致，否则构建用的还是旧代码，直接失败） ---"
-          EXPECTED_VERSION="$(awk -F': *' '/^[[:space:]]*MARKETING_VERSION:/ {gsub(/"/,"",$2); print $2; exit}' AdultAsianHD/project.yml)"
+          EXPECTED_VERSION="$(awk -F': *' '/^[[:space:]]*MARKETING_VERSION:/ {sub(/[[:space:]]*#.*/,"",$2); gsub(/["'"'"'[:space:]]/,"",$2); print $2; exit}' AdultAsianHD/project.yml)"
           if [ -z "$EXPECTED_VERSION" ]; then
             echo "❌ project.yml 里没找到 MARKETING_VERSION，停止打包。"
             exit 1
@@ -285,7 +284,7 @@ jobs:
             echo "❌ 源码版本不是锁定的 1.0.3（当前：$EXPECTED_VERSION），停止打包。"
             exit 1
           fi
-          BUILD_NUM="$(awk -F': *' '/^[[:space:]]*CURRENT_PROJECT_VERSION:/ {gsub(/"/,"",$2); print $2; exit}' AdultAsianHD/project.yml)"
+          BUILD_NUM="$(awk -F': *' '/^[[:space:]]*CURRENT_PROJECT_VERSION:/ {sub(/[[:space:]]*#.*/,"",$2); gsub(/["'"'"'[:space:]]/,"",$2); print $2; exit}' AdultAsianHD/project.yml)"
           if [ "$BUILD_NUM" != "4" ]; then
             echo "❌ 源码 build 不是锁定的 4（当前：$BUILD_NUM），停止打包。"
             exit 1
@@ -319,7 +318,7 @@ jobs:
           # 支持方向：iPhone 必须含竖屏 + 左右横屏。
           ORIENTATIONS="$(/usr/libexec/PlistBuddy -c "Print :UISupportedInterfaceOrientations" "$APP_PATH/Info.plist" 2>/dev/null || echo MISSING)"
           for WANT in UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight; do
-            if ! echo "$ORIENTATIONS" | grep -q "$WANT"; then
+            if ! echo "$ORIENTATIONS" | grep -qw "$WANT"; then
               echo "❌ 包里方向键缺 $WANT（当前：$ORIENTATIONS），停止打包。"
               exit 1
             fi
@@ -327,11 +326,11 @@ jobs:
           echo "OK：方向键含 Portrait + LandscapeLeft + LandscapeRight。"
           # 后台模式：仅 fetch，严禁 audio（audio 会在灵动岛弹 Now Playing 大卡片）。
           BG_MODES="$(/usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$APP_PATH/Info.plist" 2>/dev/null || echo MISSING)"
-          if ! echo "$BG_MODES" | grep -q 'fetch'; then
+          if ! echo "$BG_MODES" | grep -qw 'fetch'; then
             echo "❌ 包里后台模式缺 fetch（当前：$BG_MODES），停止打包。"
             exit 1
           fi
-          if echo "$BG_MODES" | grep -q 'audio'; then
+          if echo "$BG_MODES" | grep -qw 'audio'; then
             echo "❌ 包里后台模式含 audio（当前：$BG_MODES），停止打包。"
             exit 1
           fi
@@ -348,7 +347,13 @@ jobs:
             exit 1
           fi
           echo "OK：ATS 的 NSAllowsArbitraryLoads 是 true。"
-          ATS_KEYS="$(/usr/libexec/PlistBuddy -c "Print :NSAppTransportSecurity" "$APP_PATH/Info.plist" 2>/dev/null | sed -n 's/^[[:space:]]*\([A-Za-z][A-Za-z0-9]*\) =.*/\1/p' || true)"
+          ATS_KEYS="$(/usr/libexec/PlistBuddy -c "Print :NSAppTransportSecurity" "$APP_PATH/Info.plist" 2>/dev/null | sed -n 's/^[[:space:]]*\([^[:space:]=][^[:space:]=]*\) =.*/\1/p' || true)"
+          # ATS_KEYS 为空说明 sed 一行都没匹配上（Print 输出格式变了或字典为空），
+          # 此时 for 循环会静默跳过、误报 OK，必须先拦下。
+          if [ -z "$ATS_KEYS" ]; then
+            echo "❌ 包里 ATS 键解析为空（ATS 字典异常或 Print 输出格式变了），停止打包。"
+            exit 1
+          fi
           for ATS_KEY in $ATS_KEYS; do
             if [ "$ATS_KEY" != "NSAllowsArbitraryLoads" ]; then
               echo "❌ 包里 ATS 出现未放行的键：$ATS_KEY（当前 ATS 键：$ATS_KEYS），停止打包。"
@@ -359,7 +364,7 @@ jobs:
           # iPad 方向硬断言：Duo 内屏按 iPad 形态走，必须含 4 个方向。
           IPAD_ORIENTATIONS="$(/usr/libexec/PlistBuddy -c "Print :UISupportedInterfaceOrientations~ipad" "$APP_PATH/Info.plist" 2>/dev/null || echo MISSING)"
           for WANT in UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight UIInterfaceOrientationPortraitUpsideDown; do
-            if ! echo "$IPAD_ORIENTATIONS" | grep -q "$WANT"; then
+            if ! echo "$IPAD_ORIENTATIONS" | grep -qw "$WANT"; then
               echo "❌ 包里 iPad 方向键缺 $WANT（当前：$IPAD_ORIENTATIONS），停止打包。"
               exit 1
             fi
