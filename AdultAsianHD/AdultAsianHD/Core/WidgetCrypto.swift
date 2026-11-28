@@ -13,8 +13,8 @@
 //   绝不静默返回 null/空串/原样数据。
 // - 总长度护栏 5MB；randomBytes n 限定 0..65536。
 // - CBC/ECB 用 CommonCrypto CCCrypt；CTR 用 ECB 加密计数器块 + XOR 手工实现
-//   （CCCryptorCreateWithMode 在 CommonCryptorSPI.h 里，Swift 侧 import CommonCrypto
-//   不暴露它；ECB+计数器是标准的 CTR 构造，用 NIST 测试向量验证）；
+//   （CCCryptorCreateWithMode 虽在公开头文件 CommonCryptor.h 里（Gemini 核实），
+//   但 ECB+计数器是标准的 CTR 构造，更简单、可验证，用 NIST 测试向量验证）；
 //   GCM 用 CryptoKit AES.GCM，SealedBox(nonce:ciphertext:tag:) 手工拆分
 //   （combined 只适用于 12 字节 nonce；16 字节 nonce 必须手工拆）。
 // - 空 Data 传 C API 可能为 nil 指针：入口用 1 字节 dummy 指针处理。
@@ -518,12 +518,28 @@ extension WidgetCrypto {
         // 读不到胶水时打日志（全构建，不只 DEBUG）——否则模块调 Widget.crypto 才报
         // "不可用"，根因难查。胶水评完后删掉全局上的 6 个原语：胶水已把它们收进闭包
         // 局部变量，删全局不影响胶水内部调用，但模块就调不到原语、绕不过胶水的校验。
+        // 无论胶水成没成，最后都删全局原语：成则胶水已收进闭包（删了不影响胶水内部调用）；
+        // 不成则不留半成品——Widget.crypto 不存在，模块调它会明确报“不可用”，而不是拿到
+        // 一个只有部分方法的对象。胶水是单个 IIFE，抛错就整段不挂载，不存在“挂一半”。
         if let url = Bundle.main.url(forResource: "WidgetCrypto", withExtension: "js.txt"),
            let glue = try? String(contentsOf: url, encoding: .utf8) {
             context.evaluateScript(glue, withSourceURL: URL(string: "host://WidgetCrypto.js.txt"))
-            context.evaluateScript("delete this.__fwCryptoAESEncrypt; delete this.__fwCryptoAESDecrypt; delete this.__fwCryptoXOR; delete this.__fwCryptoHash; delete this.__fwCryptoHMAC; delete this.__fwCryptoRandomBytes;")
         } else {
             print("[WidgetCrypto] WidgetCrypto.js.txt 读不到，Widget.crypto 不可用")
+        }
+        // 胶水评完检查 exception（全构建打日志，别只靠 WidgetHost 的 DEBUG 打印）。
+        if let exc = context.exception {
+            print("[WidgetCrypto] glue failed: \(exc)")
+            context.exception = nil
+        }
+        // 'use strict'：非严格模式下 delete 不可配置属性会静默失败；严格模式抛错，能被发现。
+        // 删完断言 6 个全局确实没了（模块里 typeof __fwCryptoHash 应为 'undefined'）。
+        context.evaluateScript("'use strict'; delete this.__fwCryptoAESEncrypt; delete this.__fwCryptoAESDecrypt; delete this.__fwCryptoXOR; delete this.__fwCryptoHash; delete this.__fwCryptoHMAC; delete this.__fwCryptoRandomBytes;")
+        if let exc = context.exception {
+            print("[WidgetCrypto] delete globals failed: \(exc)")
+            context.exception = nil
+        } else if let left = context.evaluateScript("typeof __fwCryptoAESEncrypt + ',' + typeof __fwCryptoAESDecrypt + ',' + typeof __fwCryptoXOR + ',' + typeof __fwCryptoHash + ',' + typeof __fwCryptoHMAC + ',' + typeof __fwCryptoRandomBytes")?.toString(), left != "undefined,undefined,undefined,undefined,undefined,undefined" {
+            print("[WidgetCrypto] globals not deleted: \(left)")
         }
     }
 }
