@@ -278,7 +278,16 @@ enum WidgetCrypto {
             throw CryptoError.invalidParameter("invalid GCM nonce: \(error)")
         }
         // SealedBox 手工拆分（不用 combined：16 字节 nonce 时 combined 为 nil）。
-        let box = AES.GCM.SealedBox(nonce: nonce, ciphertext: data, tag: tag)
+        // SealedBox(nonce:ciphertext:tag:) 是 throwing 初始化器（tag 长度不对就抛），
+        // 必须 try，不能裸调——裸调是编译错（ChatGPT R12 抓到的第二处真编译错）。
+        // 构造参数错与认证失败分开报：前者 invalidParameter，后者 CRYPTO_AUTH_FAILED。
+        // （tag 长度前面已校验过 16 字节，构造实际抛不出来，但编译器只认签名，必须 try。）
+        let box: AES.GCM.SealedBox
+        do {
+            box = try AES.GCM.SealedBox(nonce: nonce, ciphertext: data, tag: tag)
+        } catch {
+            throw CryptoError.invalidParameter("invalid GCM sealed box: \(error)")
+        }
         do {
             return try AES.GCM.open(box, using: symKey, authenticating: aad ?? Data())
         } catch {
